@@ -140,6 +140,15 @@ from auto_mode import CONFIG as AUTO_MODE_CONFIG, analyze_beats_auto
 from beatsync_fork.progress import EventKind, ProgressEvent
 from beatsync_fork.progress_view import ProgressView
 
+# [FORK] Digital-Union: visible version and running build id. `FORK_VERSION` is the ONE product
+# version in this repository and is reused rather than restated here; `build_identity` resolves
+# which local source revision this installation was loaded from. Both are read exactly once, in
+# `create_ui`, and neither reaches a render, a cache key or a Qwen request -- they are a label on
+# the screen. The resolution lives in the fork package because it needs a `git` child process and
+# `gui.py`'s `subprocess.run` site count is pinned at exactly two.
+from beatsync_fork import FORK_VERSION
+from beatsync_fork import build_identity as fork_build
+
 # [FORK] Digital-Union: creative variation seed (Phase A). Selection rule and seed normalisation
 # live in src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires them to widgets.
 from beatsync_fork import variation as fork_variation
@@ -603,6 +612,18 @@ CLIPS_GALLERY_CSS = """
 #clips-gallery .r5-rejected { border-color: #d02828; background: #26100f; }
 #clips-gallery .r5-rejected .r5-badge { color: #ff6b6b; }
 #clips-gallery .r5-empty { padding: 24px; color: #8a8a8a; font-style: italic; }
+"""
+
+# [FORK] Digital-Union: the running-build line under the title.
+#
+# Secondary information -- an operator reads it when they need to know which revision is on
+# screen, and should not have it competing with the heading the rest of the time. Deliberately two
+# inherited properties and no layout arithmetic: `font-size` and `opacity` degrade to "a slightly
+# plainer paragraph" if the theme changes the surrounding markup, whereas a negative margin tuned
+# against one Gradio version is the kind of rule that silently overlaps the title in the next one.
+# Scoped to its own class, so it can reach nothing else on the page.
+BUILD_ID_CSS = """
+.bs-build-id p { font-size: 0.85em; opacity: 0.72; }
 """
 
 # [FORK] Digital-Union (R5 Clips Preview Selector, P1): gallery interaction.
@@ -9041,6 +9062,576 @@ def _on_library_cache_report_click(probe_shared_folder=False):
         probe_shared_folder, configured_folder, sharing_enabled, local_default))
 
 
+# =============================================================================================
+# [FORK] Digital-Union (R14-A stage F-3, Option 1): the LOCAL-ONLY Media Library inventory.
+#
+# F-3 was the delta-review finding that A2 (`library_inventory`) and A3 (`library_cache_records`)
+# merged with NO user surface at all -- an AST census over every module under `src/` put
+# `inspect_library`, `inventory_lines`, `duplicate_basenames`, `forecast_destination`,
+# `diagnose_root`, `list_directory`, `classify_leaf` and `read_records` at zero call sites. The
+# owner resolved F-3 in favour of a small, read-only, LOCAL-only exposure of the two producers
+# that already exist, and chose two operational details explicitly:
+#
+#   * record reading is DEFAULT OFF and needs its own tick plus a deliberate Build click, and
+#   * the Discarded folder is OMITTED from this increment entirely -- not offered, not selectable.
+#
+# This block is a SEPARATE call graph from the A6 panel above, and the separation is a contract
+# rather than a tidiness preference:
+#
+#   * nothing here is named `_a6_`. `tests/test_library_cache_panel.py::test_k6` pins every
+#     `_a6_`-prefixed function into that suite's `A6_FUNCTIONS` tuple, whose structural bans
+#     forbid the record reader and the library scanner outright. A helper carrying that prefix
+#     would therefore either enter A6's bans or fail that test.
+#   * the arrow is one-way, and only this direction is safe. A6 must never be able to reach this
+#     handler (it would gain a record reader it is forbidden); this handler may read three PURE
+#     A6 helpers, and exactly three: the startup-snapshot parser, the supersession latch reader
+#     and the unambiguous-absolute-path gate. All three touch no disk, and sharing them is the
+#     same "one parser, not two that can disagree" argument A4 and A6 already make. A second
+#     copy of the path gate in particular would be two 100-line equivalence proofs to keep equal
+#     forever.
+#
+# What the shared analysis-cache folder's reach is, stated precisely -- and scoped, because an
+# unqualified version of this sentence was measurably false in two ways (R1 independent review,
+# finding F-1):
+#
+#   * the RECORD half never targets it. It uses the startup snapshot's folder TEXT for exactly
+#     one purpose -- establishing, lexically, that the folder it is about to read records from is
+#     not that folder -- and never reads, lists, counts or resolves the configured folder itself,
+#     nor reaches the folder-creating resolver. Where that cannot be established, the record pass
+#     is REFUSED rather than attempted.
+#   * the MEDIA half inspects whatever folder the operator types, including the shared folder if
+#     that is what they type. It is disclosed and operator-directed, but it is a listing and a
+#     count, so "this panel never lists the shared folder" is not a true sentence and is
+#     asserted nowhere in this feature's code, tests or documentation. The only places such a
+#     sentence appears at all are `tests/test_library_inventory_panel.py`'s own ban patterns and
+#     the counterexamples it assembles to prove the guard fires -- quoting a false sentence in
+#     order to forbid it is not asserting it. Stated this way because the R2 independent review
+#     (finding N-1) measured the earlier "is not written anywhere" to be false: the sentence had
+#     survived in that suite's module docstring, which the then-four-constant guard never read.
+#
+# And the record half's establishment is a comparison of NAMES, not of storage. Two different
+# names can denote one folder -- a junction, a symbolic link, the extended-length spelling, a
+# substituted or mapped drive letter, a short name -- and distinguishing those would mean
+# resolving the configured shared path, which the approved R-3 boundary forbids. So the residual
+# is DISCLOSED in the read-out (`F3_RECORDS_ALIAS_LIMIT`) rather than claimed away: a reverse
+# junction and an extended-length spelling of the same folder are known NOT to be refused.
+#
+# `_analysis_cache_location()` is FORBIDDEN here for the same reason it is forbidden to A6: it
+# routes to `analysis_cache.resolve_location`, whose `make_dirs` defaults to the real
+# `os.makedirs`, so it CREATES the configured folder. The local folder's path is composed from
+# `get_input_dir()` and the A6 directory-name constant instead, which is pure string work.
+#
+# A3 and A1 are imported INSIDE the helpers below, not at module scope. Two reasons, both
+# load-bearing: this file's module-level import order is load-bearing (see
+# `_analysis_cache_location` for the same local-import precedent), and the A6 import commentary
+# above states that A3 is not imported in that block -- a statement a module-scope import here
+# would quietly falsify.
+# =============================================================================================
+
+LABEL_LIBRARY_INVENTORY = 'Media Library inventory (local only)'
+LABEL_LIBRARY_INVENTORY_FOLDER = 'Media Library folder to inspect'
+LABEL_LIBRARY_INVENTORY_RECORDS = (
+    "Also read this installation's OWN LOCAL analysis-cache records (off by default; the record "
+    'pass never targets the shared analysis-cache folder, but it compares folder NAMES and so '
+    'cannot prove two names are not one folder - read the limit note in the read-out before '
+    'ticking this)')
+LABEL_LIBRARY_INVENTORY_BUILD = 'Build inventory'
+INFO_LIBRARY_INVENTORY = (
+    'A read-only read-out of one Media Library folder you name, and optionally of this '
+    "installation's own local analysis-cache records. Nothing here deletes, moves, creates or "
+    'changes any file or folder, nothing here is a recommendation to remove anything, and no '
+    'figure here is offered as reclaimable space.\n\n'
+    'Name the folder as a plain absolute path. A blank, relative, quoted or environment-'
+    'referencing path is **refused** rather than guessed at, because a path that is rewritten '
+    'before a folder is reached is not the folder this read-out would name.\n\n'
+    '**The Media Library half inspects the folder you supply, whichever folder that is.** It '
+    'does not recognise the shared analysis-cache folder and does not refuse it: if you type '
+    'that folder here, that folder is what gets listed and counted. Only the record half is '
+    'bound to this installation.\n\n'
+    "**Record reading is off by default.** Ticked, it targets this installation's own local "
+    'cache folder, accepted only after its typed and resolved paths are both compared against '
+    'the shared folder configured at startup. Those checks compare NAMES: they do not prove the '
+    'two folders are different storage. If your local and shared analysis-cache folders may be '
+    'two names for the same folder, do not tick the box.\n\n'
+    'The Discarded folder is not part of this read-out. Record reading is off until you tick '
+    'its own box **and** press the button below.')
+
+#: Observation stamp prefix. One stamp covers the whole pass, and it is offset-aware for the same
+#: reason A6's is: a naive local time is ambiguous twice a year and meaningless off this machine.
+F3_OBSERVED_PREFIX = 'this read-out began at '
+#: Said instead, when the clock itself could not be read. A time that was never established says
+#: so; it does not borrow a phrase that reads like a time.
+F3_WHEN_UNAVAILABLE = 'a time this read-out was unable to establish'
+
+F3_DISCARDED_OMITTED = (
+    'The Discarded folder is omitted from this increment: it is not inspected, not offered and '
+    'not selectable, and no figure below covers it.')
+F3_SCOPE_NOTE = (
+    'Every figure below is a bounded observation of a moment, not a continuing guarantee, and '
+    'anything that was not established is withheld rather than reported as zero.')
+
+# --- the Media Library half -------------------------------------------------------------------
+
+F3_MEDIA_HEADING = 'Media Library folder'
+#: The refusal, reusing A6's R-A gate verbatim rather than restating its reasoning. A blank field
+#: is the case that matters most: `os.path.abspath('')` is the process working directory, and
+#: inspecting the application's own directory because a box was empty is a defect this repository
+#: has shipped before.
+F3_ROOT_REFUSED = (
+    'NOT INSPECTED - no folder was inspected, because the text above does not have one '
+    'unambiguous absolute form. A blank field, a relative path, a quoted path, a leading "~", an '
+    'environment reference, a redundant separator, a component ending in a dot or a space, or a '
+    'reserved device name is rewritten before a folder is reached but not before it is '
+    'displayed, so the folder named here and the folder a scan would reach can be two different '
+    'folders. Nothing was contacted, and no count is offered. Type a plain absolute path.')
+#: A2 is Tier A only here: `diagnostics=False`, so no recursive diagnostic walk is entered. A
+#: refused or limited scan therefore publishes no count at all, which is what A2's own read-out
+#: already says in its own words.
+F3_MEDIA_TIER_NOTE = (
+    'One bounded authoritative scan of the folder named above, and nothing below it is counted '
+    'twice. No diagnostic walk is entered, so a refused or limited scan publishes NO count for '
+    'that folder rather than a smaller one.')
+F3_MEDIA_FAILED = (
+    'NOT INSPECTED - the inspection could not be completed, so no count for this folder is '
+    'offered: ')
+#: The media half's reach, said rather than left to be discovered (R1 independent review, F-1).
+#: This half has no notion of a shared folder at all: it inspects the one folder it was given.
+#: Claiming anywhere that this panel cannot contact the shared folder would therefore be false,
+#: and one operator keystroke is all it takes to disprove.
+F3_MEDIA_NAMED_FOLDER_NOTE = (
+    'This half inspects exactly the folder named above, whichever folder that is. It has no '
+    'notion of a shared analysis-cache folder: if the path above is the shared folder, then the '
+    'shared folder is what was listed and counted here. Only the record half below is bound to '
+    "this installation's own cache.")
+
+# --- the local record half --------------------------------------------------------------------
+
+F3_RECORDS_HEADING = 'Local analysis-cache records'
+F3_RECORDS_OFF = (
+    'NOT INSPECTED - the box above was not ticked, so no record file was opened, no directory '
+    'was listed and no record figure is offered. Ticking the box alone changes nothing: the '
+    'button has to be pressed afterwards.')
+#: Every refusal in this half is a positive statement that the pass did not happen, never an
+#: empty-looking result. An unproven identity is not a clean cache.
+F3_RECORDS_REFUSED_PREFIX = 'NOT INSPECTED - '
+F3_SHARED_UNKNOWN_SUPERSEDED = (
+    'the shared analysis-cache folder was reconfigured in Settings during this session, so this '
+    'read-out no longer knows which folder is the shared one and cannot prove the folder it '
+    'would read is NOT it. Nothing was read. Restart the application to read records again.')
+F3_SHARED_UNKNOWN_AMBIGUOUS = (
+    'the shared analysis-cache folder configured at startup does not have one unambiguous '
+    'absolute form, so it cannot be compared against the local folder without resolving it - and '
+    'resolving it would mean contacting it, which this read-out does not do. Nothing was read. '
+    'Save the shared folder in Settings as a plain absolute path.')
+F3_LOCAL_IS_SHARED = (
+    'the folder that would be read is the same folder as the shared analysis-cache folder '
+    'configured at startup. A shared folder is read by several installations, so it is outside '
+    "this read-out's remit entirely. Nothing was read.")
+F3_LOCAL_UNRESOLVED = (
+    'the local cache folder could not be resolved to one absolute location, so its identity '
+    'could not be established and nothing was read: {reason}')
+F3_LOCAL_RESOLVED_ELSEWHERE = (
+    'the local cache folder resolves to a different location, which is disclosed rather than '
+    'hidden because the records below came off the resolved storage: ')
+F3_RECORDS_BOUNDS_NOTE = (
+    'Reading is bounded, and the bounds charge work ATTEMPTED rather than results obtained. They '
+    'are not a wall-clock, peak-memory or exact-byte ceiling: the directory listing is '
+    'materialised in full before any per-entry ceiling can apply, and a record that grows while '
+    'it is being read can exceed its own size bound. Whichever bound was reached is named below.')
+F3_RECORDS_TRANSPORT_NOTE = (
+    'Reusability and copy-transport were NOT assessed and are not labelled as measured: the '
+    'delegated check re-opens every record from its path, which would roughly halve the records a '
+    'given budget covers and whose cost accounting is itself an open finding. No record was read '
+    'twice.')
+F3_RECORDS_MODE_NOTE = (
+    'Record completeness was NOT assessed, and that axis is withheld rather than counted as '
+    'zero: completeness is judged for one analysis mode, no mode is established outside a render, '
+    'and a completeness figure for a question nobody asked is not a figure.')
+F3_RECORDS_CONTRACT_UNAVAILABLE = (
+    'The analysis contract generation could not be read, so the configuration axis was NOT '
+    'assessed rather than reported as zero: ')
+F3_RECORDS_FAILED = (
+    'NOT INSPECTED - the record pass could not be completed, so no record figure is offered: ')
+#: Non-numeric truthfulness facts. A3 answers four separate questions and collapsing them is how
+#: a partial pass starts reading as a folder total, so all four are printed, by name, as words.
+F3_RECORDS_TRUTH_PREFIX = '  truthfulness: '
+F3_RECORDS_STATE_PREFIX = '  folder state: '
+F3_RECORDS_BOUND_PREFIX = '  bound reached: '
+F3_RECORDS_BOUND_NONE = 'none - no ceiling was reached and the pass was not asked to stop'
+F3_RECORDS_SCOPE_UNASSESSED = (
+    'No Media Library root was positively observed, so "a record whose source is outside this '
+    'library" was never established for any record and that axis is withheld.')
+#: The residual the identity proof cannot close, printed whenever the pass actually ran (R1
+#: independent review, F-1). The proof compares the local folder's typed and resolved paths
+#: against the configured shared TEXT, by exact normalised equality. That is a comparison of
+#: names. Closing it would mean resolving the configured shared path, which the approved R-3
+#: boundary forbids -- so the honest move is to state it, not to imply a physical guarantee the
+#: implementation does not establish. Two of the alias forms below were reproduced and are known
+#: NOT to be refused; the rest were reasoned about and are reported as untested rather than safe.
+F3_RECORDS_ALIAS_LIMIT = (
+    'LIMIT, stated rather than left to be found: this folder was accepted because its typed path '
+    'and its resolved path both differ from the shared folder configured at startup, compared as '
+    'exact normalised text. That compares NAMES, not storage. A junction, a symbolic link, the '
+    'extended-length "\\\\?\\" spelling, a substituted or mapped drive letter or a short name can '
+    'make two different names denote ONE folder, and establishing that they do not would mean '
+    'resolving the configured shared path - which this read-out deliberately does not do. A '
+    'configured shared folder that is itself a junction onto this folder, and the extended-'
+    'length spelling of the same folder, are known NOT to be refused; drive substitution, mapped '
+    'drives and short names were not all tested and are not claimed to be safe. So: if your '
+    'local and shared analysis-cache folders may be two names for one folder, untick the box '
+    'above - no figure below is offered as proof that they are not.')
+
+# --- the three location facts, deliberately not one -------------------------------------------
+
+F3_LOCATION_HEADING = 'Where the analysis cache is - three different facts, not one'
+F3_LOCATION_CONFIGURED = 'configured when this application started: {folder}'
+F3_LOCATION_CONFIGURED_NONE = (
+    'configured when this application started: no shared folder was configured')
+F3_LOCATION_CONFIGURED_SUPERSEDED = (
+    'configured when this application started: WITHHELD - a Settings save succeeded during this '
+    'session, so the snapshot this read-out may read is known to be stale, and a stale path shown '
+    'beside a warning is still a stale path shown')
+F3_LOCATION_SHARING_ON = 'sharing was switched on in that startup snapshot'
+F3_LOCATION_SHARING_OFF = (
+    'sharing was switched off in that startup snapshot, so the folder above is the stored setting')
+F3_LOCATION_SELECTED_NOT_INSPECTED = (
+    'the location a NEW analysis would select: NOT INSPECTED - establishing it takes a directory-'
+    'state observation of the shared folder, which this local-only read-out does not make. The '
+    'Library cache report above offers that observation behind its own default-off box.')
+F3_LOCATION_LAST_RUN_UNAVAILABLE = (
+    'the location the LAST completed analysis actually used: NOT AVAILABLE, and OUTSTANDING - the '
+    'analysis pass already produces this fact and returns it, but no part of the interface keeps '
+    'it. Delivering it would mean the analysis/render handler retaining the value it already '
+    'receives; this read-out would then only read what that handler kept, and it writes nothing '
+    'itself. That retention is deliberately not part of this increment, by owner decision, so '
+    'this third fact is NOT DELIVERED rather than complete. It is withheld rather than guessed, '
+    'and in particular no claim is made that any analysis has run.')
+F3_LOCATION_SCOPE_NOTE = (
+    'An out-of-process edit of the settings file is invisible to all three lines above: this '
+    'read-out opens no settings file.')
+
+# --- the bounds, as constants rather than widget limits ---------------------------------------
+#
+# Expressed as module constants deliberately. A numeric field offering an upper bound would put a
+# resource ceiling in the hands of the screen, and would additionally drag an upper-bound keyword
+# into a block that other suites slice raw source around.
+
+#: A2 keeps the EXISTING per-root classification ceiling, and it is passed by referencing A2's own
+#: module constant at the call site rather than being restated here, so this panel cannot drift
+#: from it. That is why there is no `F3_MEDIA_MAX_*` constant below.
+#:
+#: A3's five bounds for this first UI exposure, all well below A3's own defaults.
+F3_CACHE_MAX_ENTRIES = 4_000
+F3_CACHE_MAX_RECORDS = 2_000
+F3_CACHE_MAX_RECORD_BYTES = 1_000_000
+F3_CACHE_MAX_TOTAL_BYTES = 32_000_000
+F3_CACHE_MAX_REPORTED_NAMES = 100
+
+
+def _f3_observed_at():
+    """One offset-aware observation stamp, or ``''`` if the clock could not be read.
+
+    Returns a string rather than a number because A3 stamps its own window with ``str(clock())``,
+    so the window A5 then prints is readable instead of an epoch float.
+    """
+    try:
+        return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
+    except Exception:
+        return ''
+
+
+def _f3_shared_folder_keys():
+    """The shared analysis-cache folder as ONE comparison key, or a refusal. Pure text.
+
+    Returns ``(keys, refusal)``. Nothing here contacts either folder, opens any file or resolves
+    any path: the key is formed from the startup snapshot's text and only after A6's R-A gate has
+    established that that text is already strongly absolute and normalised, which is what makes
+    ``normcase`` a sound key **for that text**.
+
+    For that text, and no more. The gate is syntactic, so it admits the extended-length spelling
+    of a folder -- the question mark lands in the prefix segment, which is checked for empty
+    components and for trailing dots and spaces but not for forbidden characters -- and that
+    spelling does not ``normcase``-match the plain one. Measured, not assumed. The residual is
+    disclosed by ``F3_RECORDS_ALIAS_LIMIT``; see ``_f3_local_cache_identity``.
+
+    Two refusals, both fail-closed, and both mean "the record pass may not run":
+
+    * the snapshot was superseded by a successful Settings save this session, so which folder is
+      the shared one is no longer known at all; and
+    * the configured text has no single absolute form, so comparing it would need it resolved, and
+      resolving it would mean contacting it.
+
+    Refusing to read a legitimate local cache costs a read-out. Reading the shared folder because
+    its identity could not be compared costs the thing R-3 exists to protect.
+    """
+    if _a6_startup_snapshot_superseded():
+        return (frozenset(), F3_SHARED_UNKNOWN_SUPERSEDED)
+    configured, _enabled = _a6_shared_cache_startup_snapshot()
+    if not configured:
+        return (frozenset(), '')
+    if not _a6_configured_path_is_unambiguous(configured):
+        return (frozenset(), F3_SHARED_UNKNOWN_AMBIGUOUS)
+    return (frozenset({os.path.normcase(configured)}), '')
+
+
+def _f3_local_cache_identity(local_cache):
+    """Establish BY NAME that the folder about to be read is not the configured shared one, or
+    refuse.
+
+    "By name" is the whole scope and is stated first deliberately: an earlier version of this
+    docstring said "prove ... is this installation's own LOCAL cache", which claims more than a
+    text comparison can deliver. See the paragraph below.
+
+    Returns ``(resolved, refusal)``; a non-empty refusal means nothing may be read.
+
+    The comparison is on BOTH the typed absolute path and the resolved one, and on exact
+    normalised equality rather than a prefix test -- a prefix test makes ``C:\\Cache2`` part of
+    ``C:\\Cache``, which is the trap that has made a containment check wrong in this repository
+    before. Only the LOCAL side is resolved; the shared side is never touched.
+
+    A local folder that legitimately resolves somewhere else -- a junction onto a larger disk is a
+    supported setup -- is allowed and DISCLOSED, not refused on sight.
+
+    What this establishes, and what it deliberately does NOT (R1 independent review, F-1): both
+    comparisons are on NAMES. A refusal means the folder about to be read carries the same name as
+    the configured shared one, typed or resolved -- which is the FORWARD direction, and the only
+    one a name comparison can see. It does not establish that two surviving names denote different
+    storage. The shared side is never resolved, because resolving it would mean contacting it and
+    the approved R-3 boundary forbids that, so a configured shared TEXT that is itself a junction
+    onto this folder's real target, the extended-length spelling of the same folder, a substituted
+    or mapped drive letter and a short name are all NOT disproved here. The first two were
+    reproduced and are known not to be refused. The read-out states that residual itself
+    (``F3_RECORDS_ALIAS_LIMIT``) rather than letting the absence of a refusal read as a physical
+    guarantee.
+    """
+    shared_keys, refusal = _f3_shared_folder_keys()
+    if refusal:
+        return ('', refusal)
+    try:
+        typed = os.path.abspath(local_cache)
+        resolved = os.path.realpath(local_cache)
+    except (OSError, ValueError) as exc:
+        return ('', F3_LOCAL_UNRESOLVED.format(reason=exc))
+    if not resolved or not os.path.isabs(resolved):
+        return ('', F3_LOCAL_UNRESOLVED.format(
+            reason='the path did not resolve to one absolute location'))
+    if {os.path.normcase(typed), os.path.normcase(resolved)} & shared_keys:
+        return ('', F3_LOCAL_IS_SHARED)
+    return (resolved, '')
+
+
+def _f3_media_inventory(root_text):
+    """One bounded Tier-A inventory of ONE explicitly named folder. Reads only.
+
+    Returns ``(lines, verified_roots)``. The roots are handed on to the record half so that "is
+    this record's source inside the library I just inspected?" can be put at all, and they are
+    handed on **unfiltered**: `RootInventory.root` always carries a `RootState`, so filtering here
+    would mean this panel deciding which roots count. A3's `_root_is_verified` is the authority --
+    it admits only a root A1 positively observed and reports every other one as unverified, which
+    is a stricter test than a `verdict == PRESENT` check written here would be.
+
+    A1 and A2 are imported here rather than at module scope -- see the block comment above.
+
+    The broad catch is for an `OSError` the scanner raises rather than wrapping: `inspect_library`
+    converts only its two injected scan exceptions. It cannot swallow a `RenderCancelled`, because
+    nothing on this path holds a lifecycle or a cancellation token -- this is a read-out, not a
+    render -- and a failure here withholds every figure rather than publishing a smaller one.
+    """
+    from beatsync_fork import library_inventory as fork_inventory
+    from beatsync_fork.input_manager import InputScanLimitExceeded
+    try:
+        inventory = fork_inventory.inspect_library(
+            ((fork_inventory.LIBRARY_ROLE, root_text),),
+            suffixes=fork_clips.SERVABLE_SUFFIXES,
+            scan=scan_library_folder,
+            scan_error=InputScanError,
+            limit_error=InputScanLimitExceeded,
+            destinations=None,
+            include_rejected=False,
+            max_entries=fork_inventory.MAX_INVENTORY_ENTRIES_PER_ROOT,
+            diagnostics=False,
+        )
+    except Exception as exc:
+        return ([F3_MEDIA_FAILED + str(exc)], ())
+    roots = tuple(item.root for item in inventory.roots)
+    return (list(fork_inventory.inventory_lines(inventory)), roots)
+
+
+def _f3_record_truth_line(inventory):
+    """A3's truthfulness questions, as words: its four separate ones, plus the conservative
+    publication verdict they feed.
+
+    Four and not one, because collapsing them is the defect A3's own F-8 was: a pass can run to
+    the very end, hit no ceiling, and still have been unable to work out what some entry was.
+    Enumeration completeness and classification completeness are different facts.
+
+    None of these is a number, which is the point: every number in this half is A5's, carrying
+    its own unit, exactness and population.
+    """
+    def says(flag):
+        return 'yes' if flag else 'NO'
+    return (F3_RECORDS_TRUTH_PREFIX
+            + 'every entry classified: ' + says(inventory.entries_complete)
+            + '; every requested question answered: ' + says(inventory.assessments_complete)
+            + '; counts cover the whole folder: ' + says(inventory.counts_exact)
+            + '; detail lists exhaustive: ' + says(inventory.details_complete)
+            + '; may be published as folder totals: ' + says(inventory.authoritative))
+
+
+def _f3_record_lines(local_cache, verified_roots):
+    """The record half: ONE bounded pass over the proven-local cache folder, rendered by A5.
+
+    Four of A3's optional observations are deliberately NOT requested, and each absence is stated
+    in the read-out rather than left to be inferred from a missing line:
+
+    * ``looks_reusable`` and ``read_text`` are both ``None``, so no record is re-opened by a
+      delegated transport check and no alternative unbounded file transport exists;
+    * ``is_complete`` and ``require_ai`` are both ``None``, so record completeness stays
+      unassessed -- outside a render there is no established analysis mode to judge for.
+
+    The contract generation is passed IN from `video_analysis`, through the same deferred import
+    the cache Import handler already uses, so this panel restates no identity constant and cannot
+    drift from one. When it cannot be read, that axis is unassessed rather than zero.
+    """
+    from beatsync_fork import library_cache_records as fork_cache_records
+    lines: list = []
+    resolved, refusal = _f3_local_cache_identity(local_cache)
+    if refusal:
+        return [F3_RECORDS_REFUSED_PREFIX + refusal]
+
+    contract = None
+    contract_problem = ''
+    try:
+        from video_analysis import CACHE_CONTRACT_VERSION
+        contract = CACHE_CONTRACT_VERSION
+    except Exception as exc:
+        contract_problem = str(exc)
+
+    try:
+        inventory = fork_cache_records.read_records(
+            local_cache,
+            is_record_name=fork_analysis_cache.is_record_name,
+            contract=contract,
+            is_complete=None,
+            require_ai=None,
+            looks_reusable=None,
+            read_text=None,
+            inspection_roots=verified_roots,
+            clock=_f3_observed_at,
+            max_entries=F3_CACHE_MAX_ENTRIES,
+            max_records=F3_CACHE_MAX_RECORDS,
+            max_record_bytes=F3_CACHE_MAX_RECORD_BYTES,
+            max_total_bytes=F3_CACHE_MAX_TOTAL_BYTES,
+            max_reported_names=F3_CACHE_MAX_REPORTED_NAMES,
+        )
+    except Exception as exc:
+        # Same reasoning as the media half's catch: this is a read-out, so no cancellation can
+        # arrive here, and a failure withholds every record figure rather than publishing a
+        # partial one. A3 validates its five ceilings BEFORE any filesystem call, so a bad bound
+        # surfaces as this sentence rather than half way through a folder.
+        return [F3_RECORDS_FAILED + str(exc)]
+
+    lines.append('  folder: ' + local_cache)
+    if os.path.normcase(resolved) != os.path.normcase(os.path.abspath(local_cache)):
+        lines.append('  ' + F3_LOCAL_RESOLVED_ELSEWHERE + resolved)
+    lines.append(F3_RECORDS_STATE_PREFIX + str(inventory.state))
+    lines.append(F3_RECORDS_BOUND_PREFIX + (str(inventory.bound) or F3_RECORDS_BOUND_NONE))
+    lines.append(_f3_record_truth_line(inventory))
+    if inventory.detail:
+        lines.append('  detail: ' + str(inventory.detail))
+    lines.append('  ' + F3_RECORDS_BOUNDS_NOTE)
+    lines.append('  ' + F3_RECORDS_TRANSPORT_NOTE)
+    lines.append('  ' + F3_RECORDS_MODE_NOTE)
+    lines.append('  ' + F3_RECORDS_ALIAS_LIMIT)
+    if contract_problem:
+        lines.append('  ' + F3_RECORDS_CONTRACT_UNAVAILABLE + contract_problem)
+    if not inventory.scope_assessed:
+        lines.append('  ' + F3_RECORDS_SCOPE_UNASSESSED)
+    lines.append('')
+    # A5 owns every number. With no location and no category supplied it withholds the measured
+    # and cost axes by itself, and the subject it establishes is A3's own folder rather than a
+    # shared one -- which is why no A4 observation is bound in here: binding a SHARED selection
+    # beside a LOCAL record inventory would be two populations in one report.
+    lines.extend(fork_cache_report.report_lines(
+        fork_cache_report.estimate_reclaimable(
+            fork_cache_report.bind_observation(inventory=inventory))))
+    return lines
+
+
+def _f3_location_lines():
+    """The three location facts, each labelled separately and two of them explicitly unestablished.
+
+    Collapsing them is the misreading worth preventing: the folder a setting NAMES, the folder a
+    new analysis would SELECT and the folder the last analysis actually USED are three different
+    questions, and only the first is answerable from a snapshot this read-out may read.
+    """
+    lines = [F3_LOCATION_HEADING]
+    if _a6_startup_snapshot_superseded():
+        lines.append('  ' + F3_LOCATION_CONFIGURED_SUPERSEDED)
+    else:
+        configured, enabled = _a6_shared_cache_startup_snapshot()
+        if configured:
+            lines.append('  ' + F3_LOCATION_CONFIGURED.format(folder=configured))
+            lines.append('    ' + (F3_LOCATION_SHARING_ON if enabled
+                                   else F3_LOCATION_SHARING_OFF))
+        else:
+            lines.append('  ' + F3_LOCATION_CONFIGURED_NONE)
+    lines.append('  ' + F3_LOCATION_SELECTED_NOT_INSPECTED)
+    lines.append('  ' + F3_LOCATION_LAST_RUN_UNAVAILABLE)
+    lines.append('  ' + F3_LOCATION_SCOPE_NOTE)
+    return lines
+
+
+def _f3_inventory_lines(root_text, inspect_records, local_cache):
+    """The whole read-out, as lines.
+
+    ``inspect_records is not True`` rather than a truthy test, and the direction is fail-closed
+    for the same reason A6's opt-in gate is: a stray ``1`` or ``'false'`` arriving from anywhere
+    must not enable a filesystem pass the operator did not ask for.
+    """
+    observed = _f3_observed_at()
+    lines = [LABEL_LIBRARY_INVENTORY, '']
+    lines.append('  ' + F3_OBSERVED_PREFIX + (observed or F3_WHEN_UNAVAILABLE))
+    lines.append('  ' + F3_DISCARDED_OMITTED)
+    lines.append('  ' + F3_SCOPE_NOTE)
+    lines.append('')
+
+    lines.append(F3_MEDIA_HEADING)
+    text = root_text if isinstance(root_text, str) else ''
+    roots: tuple = ()
+    if not _a6_configured_path_is_unambiguous(text):
+        lines.append('  ' + F3_ROOT_REFUSED)
+    else:
+        lines.append('  ' + F3_MEDIA_TIER_NOTE)
+        lines.append('  ' + F3_MEDIA_NAMED_FOLDER_NOTE)
+        media_lines, roots = _f3_media_inventory(text)
+        lines.extend('  ' + line for line in media_lines)
+    lines.append('')
+
+    lines.append(F3_RECORDS_HEADING)
+    if inspect_records is not True:
+        lines.append('  ' + F3_RECORDS_OFF)
+    else:
+        lines.extend(_f3_record_lines(local_cache, roots))
+    lines.append('')
+
+    lines.extend(_f3_location_lines())
+    return lines
+
+
+def _on_library_inventory_click(root_text='', inspect_records=False):
+    """Build the local-only inventory. Both parameter defaults are the refusing ones, so a value
+    that never arrives cannot name a folder or enable a record pass.
+
+    This handler writes exactly one widget, its own read-out box. It is not a render: it takes no
+    render mutex, holds no lifecycle, joins no concurrency lane, touches no processing directory
+    and carries no session state. It starts no subprocess and installs no JavaScript. It writes
+    nothing, anywhere -- including no temporary file.
+    """
+    local_cache = os.path.join(get_input_dir(), A6_LOCAL_CACHE_DIRNAME)
+    return '\n'.join(_f3_inventory_lines(root_text, inspect_records, local_cache))
+
+
 def _on_reset_folder_prefs():
     """Clear the saved defaults. Removes no folder and no media -- only the remembered choices.
 
@@ -10909,8 +11500,16 @@ def create_ui() -> gr.Blocks:
         cuda_status = "⚠️  System CUDA (or not available)"
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
-    app = gr.Blocks(title='BeatSync Engine', theme='ocean',
-                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS)
+    # [FORK] Digital-Union: which build is on screen. Resolved ONCE here -- `create_ui` runs once
+    # per process and `cached_identity` memoises per root, so no browser event, tab selection or
+    # render ever spawns this `git` child. `ROOT_DIR` is the application root (the parent of
+    # `src/`), so an installed copy that is not a checkout reports `Build unknown` rather than
+    # borrowing the commit of some unrelated repository it happens to sit inside.
+    build_label = fork_build.cached_identity(ROOT_DIR).label()
+
+    app = gr.Blocks(title=UI_BROWSER_TITLE.format(version=FORK_VERSION, build=build_label),
+                    theme='ocean',
+                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS + BUILD_ID_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -10949,7 +11548,12 @@ def create_ui() -> gr.Blocks:
         # graph and asserts `copy.deepcopy(proposal) == proposal`.
         director_proposal_state = gr.State(None)
 
-        gr.Markdown(f"# {UI_TITLE}")
+        # [FORK] Digital-Union: the version rides in the heading, the running build on a quiet
+        # second line beneath it. Two `gr.Markdown` calls rather than one so the build line can be
+        # styled down without shrinking the title, and no component is named: both are static text
+        # written once at build time, read by nothing and written by no handler.
+        gr.Markdown(f"# {UI_TITLE_VERSIONED.format(title=UI_TITLE, version=FORK_VERSION)}")
+        gr.Markdown(UI_BUILD_LINE.format(build=build_label), elem_classes=['bs-build-id'])
         gr.Markdown(UI_MAIN_DESCRIPTION)
 
         # [FORK] Digital-Union (GUI Refresh A): three tabs instead of one long column.
@@ -12698,12 +13302,82 @@ def create_ui() -> gr.Blocks:
                                 variant='secondary',
                                 elem_id='library-cache-report-button',
                             )
+                            # [FORK] R14-A F-3 regression fix, measured against the pinned
+                            # `gradio==6.19.0`: `gr.Textbox` has NO `show_copy_button`
+                            # parameter there. It was removed in Gradio 6 in favour of
+                            # `buttons`, and passing it raises
+                            # `TypeError: Textbox.__init__() got an unexpected keyword
+                            # argument 'show_copy_button'` while `create_ui()` is building the
+                            # interface -- so the whole application failed to start. Nothing in
+                            # the suite caught it: `gradio` cannot be imported on a bare
+                            # interpreter, so every existing assertion about this widget is an
+                            # AST assertion about source text that the real library rejects.
+                            # The intent (an operator can copy the read-out) is preserved by the
+                            # replacement parameter rather than dropped.
                             library_cache_report_box = gr.Textbox(
                                 label=LABEL_LIBRARY_CACHE_REPORT,
                                 interactive=False,
                                 lines=20,
-                                show_copy_button=True,
+                                buttons=['copy'],
                                 elem_id='library-cache-report-box',
+                            )
+                        # [FORK] Digital-Union (R14-A stage F-3, Option 1): the local-only
+                        # Media Library inventory.
+                        #
+                        # A SIBLING of the drawer above, never part of it: a separate accordion,
+                        # a separate handler, a separate read-out box, and a call graph that
+                        # shares only three pure no-disk helpers with it. The owner chose this
+                        # increment over both leaving A2/A3 inert and building the historical
+                        # design, whose two source-state buckets have no producer at all.
+                        #
+                        # Placed between the drawer above and the preparation drawer below, which
+                        # is the one window that disturbs no pinned region: the section tab and
+                        # its container counts are unchanged, it sits ahead of the sample-policy
+                        # guard's region, and it sits ahead of the preparation drawer's region,
+                        # so neither of that region's two widget bans reaches it. An accordion is
+                        # count-pinned nowhere.
+                        #
+                        # Four widgets and no fifth: a folder box, a default-off tick, a button
+                        # and a read-only read-out. No numeric field (a resource ceiling belongs
+                        # in a constant, not in the operator's hands, and an upper-bound keyword
+                        # would additionally be dragged into a region other suites slice raw
+                        # source around), no option group, no browse helper -- which would add a
+                        # process launch to a file whose launch sites are count-pinned -- and no
+                        # Delete / Clean / Migrate / Repair control, because there is nothing
+                        # here to confirm.
+                        #
+                        # IMPORTANT, and the reason this comment describes tokens instead of
+                        # spelling them: several pinned regions elsewhere are sliced out of RAW
+                        # SOURCE by first-occurrence search, so naming a region's boundary token
+                        # in a COMMENT moves that boundary onto the comment. The neighbouring
+                        # change learned this the hard way and broke three structural tests that
+                        # merged main passes. `tests/test_library_inventory_panel.py` guards this
+                        # block against exactly that.
+                        with gr.Accordion(LABEL_LIBRARY_INVENTORY, open=False):
+                            gr.Markdown(INFO_LIBRARY_INVENTORY)
+                            library_inventory_folder = gr.Textbox(
+                                label=LABEL_LIBRARY_INVENTORY_FOLDER,
+                                placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                                elem_id='library-inventory-folder',
+                            )
+                            # DEFAULT-OFF, and the default IS the safety property: unticked, the
+                            # button opens no record file and lists no cache folder at all.
+                            library_inventory_records = gr.Checkbox(
+                                value=False,
+                                label=LABEL_LIBRARY_INVENTORY_RECORDS,
+                                elem_id='library-inventory-records',
+                            )
+                            library_inventory_btn = gr.Button(
+                                LABEL_LIBRARY_INVENTORY_BUILD,
+                                variant='secondary',
+                                elem_id='library-inventory-button',
+                            )
+                            library_inventory_box = gr.Textbox(
+                                label=LABEL_LIBRARY_INVENTORY,
+                                interactive=False,
+                                lines=24,
+                                buttons=['copy'],
+                                elem_id='library-inventory-box',
                             )
                         # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
                         # workflow, not part of the render flow. Nothing in here is wired to
@@ -14233,6 +14907,29 @@ def create_ui() -> gr.Blocks:
             fn=_on_library_cache_report_click,
             inputs=[library_cache_probe_shared],
             outputs=[library_cache_report_box],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+
+        # [FORK] Digital-Union (R14-A stage F-3, Option 1): the local-only inventory's one
+        # registration.
+        #
+        # `inputs` is the folder box then the tick, matching the handler's parameter order --
+        # Gradio passes handler arguments by position and the seam test pins that alignment.
+        # Neither widget registers a `.change()` of its own: naming a folder or ticking a box
+        # must not itself reach a disk, so only a deliberate Build click inspects anything.
+        #
+        # `outputs` is exactly the one read-out box, so this registration writes no existing
+        # widget: it cannot clear a confirmed source set, cannot move the preparation state
+        # machine, cannot disable the render button and cannot overwrite any other panel's text.
+        #
+        # No `concurrency_id`: a read-out is not a render and must never queue behind one.
+        # `concurrency_limit=None` for the measured S2-A R3 reason -- on the pinned gradio a full
+        # concurrency group leaves the event QUEUED rather than delivering or refusing it.
+        library_inventory_btn.click(
+            fn=_on_library_inventory_click,
+            inputs=[library_inventory_folder, library_inventory_records],
+            outputs=[library_inventory_box],
             show_progress='hidden',
             concurrency_limit=None,
         )

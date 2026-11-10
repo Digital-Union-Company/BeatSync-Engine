@@ -20,6 +20,334 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-09 (visible version and running build id)
+
+**The header now says which BeatSync this is and which source revision it was actually loaded
+from.** Two lines, built once at startup:
+
+```
+🎵 BeatSync Engine v0.1.0
+Running build: `e6a7c0cd` · Digital Union
+```
+
+and the same two facts in the browser tab title, so a screenshot of a window identifies what
+produced it. The version alone could not distinguish two machines on the same release running two
+different commits, which is the situation this was hard to diagnose from.
+
+**The version is the existing `FORK_VERSION`, reused and not restated.** There is deliberately no
+second version constant: a product version is a release decision, and two places to state it is how
+the screen and this record start disagreeing. The three display templates live in `ui_content.py`
+with every other string in the app; `0.1.0` appears in neither `gui.py` nor `ui_content.py`.
+
+**The build identity is resolved by one new stdlib-only fork module,
+`src/beatsync_fork/build_identity.py`** — read-only, bounded, windowless, and injectable, so every
+branch is executed on a bare interpreter with no `git` and no repository. It lives in the fork
+package rather than in `gui.py` because it needs a `git` child process and `gui.py`'s
+`subprocess.run` site count is pinned at exactly two; that count, the three authorised
+`app.load(js=…)` installers, the ten `gr.Tab`s and the `gr.Blocks` keyword set are all unchanged.
+
+Four properties, each of which is the honest answer rather than the convenient one:
+
+| Situation | Reported |
+|---|---|
+| this root is a git worktree, tracked files clean | `e6a7c0cd` |
+| tracked files differ from that commit | `e6a7c0cd (modified)` |
+| commit known, modification state **not measurable** | `e6a7c0cd (unverified)` |
+| no git, no metadata, a foreign worktree, or a non-commit answer | `Build unknown` |
+
+* **A worktree is believed only when it IS the application root, and only when the environment
+  cannot move it.** `--show-toplevel` is compared — resolved, case-folded, exact equality, never a
+  prefix in either direction — against `ROOT_DIR`. A portable install dropped inside an unrelated
+  repository would otherwise have reported *that* repository's commit as BeatSync's own; measured
+  against a real nested checkout, it reports `Build unknown` instead. The path comparison alone was
+  **not sufficient**, which independent review measured and which is corrected below.
+* **`(unverified)` is a genuine third state and is never collapsed into clean.** That is the one
+  direction that would turn a modified build into a confident-looking clean one.
+* **Nothing is ever invented.** Not a placeholder SHA, not the version, and in particular not
+  `UPSTREAM_BASELINE_COMMIT` — a real 40-character id sitting in the same package that would look
+  entirely plausible in the header while answering a different question. Untracked content is not a
+  modification either (`--untracked-files=no`), because `bin/`, `input/` and `output/` are runtime
+  directories and a fresh install is full of them.
+* **It is the LOCAL revision.** No network request, no remote, no `fetch` or `ls-remote`, and
+  GitHub's current `main` is never substituted — which is wrong in exactly the case the feature
+  exists for, a machine running something that was never pushed. No branch name is read either
+  (no `symbolic-ref`, no `--abbrev-ref`), which is what makes a detached HEAD work by construction;
+  verified against a real detached checkout and a real linked worktree.
+
+**Resolved once per process.** `create_ui` calls the memoised `cached_identity(ROOT_DIR)` exactly
+once; no handler, browser event, tab selection or render can reach it, asserted over every function
+in the module. The label is a string on the screen: it reaches no render path, no cache key, no
+Qwen request and no `beat_info`, and the module computes no identity of any kind — no `hashlib`, no
+contract constant. Nothing is created, written, moved or deleted, and the operator's media,
+input/output directories, shared analysis cache and configuration are not read.
+
+`BUILD_ID_CSS` styles the second line down with two inherited properties and no layout arithmetic,
+scoped to its own class.
+
+**The git child environment is isolated, because the ownership check above was defeatable through
+it.** Independent review measured that the first version of `_run_git` handed the child
+`dict(os.environ)`, and `git` reads its own behaviour out of its environment. With an inherited
+`GIT_DIR`, `rev-parse HEAD` answered out of a **different repository** while `--show-toplevel`
+still named the application root — so the ownership check passed and the header stated a foreign
+commit with no disclosure, which is precisely the confident lie this feature exists to prevent. It
+needed no file corruption, no administrator and no write access to the checkout, because `git`
+exports repository locators into the children it launches. Which locator, and whether it bites, was
+measured per context on git 2.53.0 for Windows rather than assumed:
+
+* `filter-branch --index-filter` exported an absolute `GIT_DIR` — the vector that borrows a foreign
+  commit outright.
+* A `post-commit` hook exported `GIT_INDEX_FILE`, which was enough to mislabel a clean checkout.
+* `submodule foreach` exported a **relative** `GIT_DIR=.git`, benign in the measured invocation.
+* `rebase --exec` and `bisect run` exported no harmful repository locator in the measured cases.
+
+Those are measurements of one git version on one platform and are not generalised to every git.
+What they establish is the finding that matters: an ordinary operator can inherit a Git-specific
+variable without malice, corruption or privilege, such a variable can make the reported build
+identity wrong, and the sweep below prevents that measured failure. The ordinary launch path was
+never affected — nothing in this repository sets a `GIT_*` variable, and `run.bat` introduces no
+`GIT_*` repository locator.
+
+The child environment is now built by **dropping every inherited variable whose name begins with
+`GIT_`** (case-insensitively) and then reinstating this module's own two settings by name. Measured
+against git 2.53.0, `GIT_DIR` borrowed the commit outright, `GIT_WORK_TREE` moved the toplevel so a
+legitimate install read `Build unknown`, and `GIT_COMMON_DIR` / `GIT_OBJECT_DIRECTORY` /
+`GIT_INDEX_FILE` broke `status` so a clean tree read `(unverified)`. It is deliberately a **prefix
+rather than a list of the variables that bite today**: the `GIT_CONFIG_*` family is inert for these
+three commands in that version and is swept anyway, because enumerating known offenders leaves the
+next one to be discovered in production. The sweep is equally deliberately narrow in the other
+direction — `PATH`, `SystemRoot` and `USERPROFILE` still arrive, or `git` would stop being
+findable; a nonstandard install depending on an inherited `GIT_EXEC_PATH` now answers
+`Build unknown` rather than a wrong commit, which is the correct direction to fail in. The caller's
+own environment is never modified.
+
+Twelve hostile environments are pinned as regression tests, the original defect is reproduced
+permanently against the policy that shipped, and a mutation control asserts the sweep is
+load-bearing: disabling it brings the borrowed commit straight back, so the new tests cannot
+quietly become vacuous. One consequence is recorded rather than hidden — `(unverified)` is no
+longer reachable by breaking `status` through the environment, so that branch stays pinned by the
+injected-runner test where it belongs.
+
+**Known limitation, deliberately not fixed here.** This base revision still carries the
+`show_copy_button` keyword that gradio 6.19.0 removed, so the full `create_ui()` does not build
+under the pinned Gradio. That is an unrelated, separately tracked blocker and silently fixing it was
+out of scope. Consequently the verification for this change is **source-level**: the keyword
+`elem_classes` was measured as declared by `gr.Markdown.__init__` in the installed gradio 6.19.0
+(which takes no `**kwargs`, so the check is real) and `title` as declared by `gr.Blocks.__init__`.
+The live GUI was **not** started and the header has **not** been seen rendered; it becomes visible
+only after a separately authorised deployment and restart.
+
+Touched: `src/beatsync_fork/build_identity.py` (new), `src/ui_content.py` (three templates, purely
+additive), `src/gui.py` (one import, one CSS constant, the `gr.Blocks` title, one resolution and two
+header lines), `tests/test_build_identity.py` (new).
+
+### Added — 2026-11-08 (R14-A F-3, Option 1: the local-only Media Library inventory)
+
+**A2 and A3 merged with no user surface at all.** An AST census over every module under `src/`
+put `inspect_library`, `inventory_lines`, `duplicate_basenames`, `forecast_destination`,
+`diagnose_root`, `list_directory`, `classify_leaf` and `read_records` at **zero call sites**: two
+heavily-tested stages were reachable only from their own suites. F-3 asked what to do about it,
+and the owner chose Option 1 — a small, read-only, **local-only** exposure of the producers that
+already exist — over both leaving them inert and building the broader historical design, whose
+source-state buckets have no producer at all.
+
+One new sibling accordion in Prepare & Verify, between the Library cache report and the
+preparation section. Four widgets and no fifth: a folder box, a default-off tick, one Build
+button and one read-only read-out. It publishes
+
+* **bounded Tier-A media facts** for one explicitly named folder, through A2's own
+  `inspect_library` / `inventory_lines` over the existing authoritative scanner, with
+  `diagnostics=False` (no recursive diagnostic walk) and A2's own existing per-root ceiling;
+* **local analysis-cache record facts**, behind the separate default-off tick, through A3's
+  `read_records` rendered by A5; and
+* **three separately labelled location facts.** Only the first is answered: the folder configured
+  at startup. The folder a **new** analysis would select is `NOT INSPECTED` — establishing it
+  takes a directory-state observation of the shared folder, which this local-only read-out does
+  not make. The folder the **last** analysis actually used is `NOT AVAILABLE, and OUTSTANDING`:
+  `OWNER_ACCEPTED_DEFERRED_FOR_THIS_INCREMENT; THIRD_LOCATION_FACT_NOT_DELIVERED`, see the
+  outstanding item below. Neither is guessed, and the third is **not** complete and is not
+  reported as a pass.
+
+**The owner's two operational choices are structural, not defaults.** Record reading needs the
+tick *and* the click: the gate is `inspect_records is not True`, so a stray `1` or `'false'`
+arriving from anywhere cannot start a filesystem pass. The Discarded folder is **omitted** — not
+offered, not selectable, not inspected; only one root is ever supplied and `include_rejected` is
+always `False`.
+
+**The shared analysis-cache folder's reach, stated precisely and scoped to what the
+implementation establishes.** The two halves of the panel differ and must not be described
+together:
+
+* **The record half never targets it.** It uses the startup snapshot's folder *text* for exactly
+  one purpose: establishing, lexically, that the folder it is about to read records from is
+  **not** that folder. It never reads, lists, counts or resolves the configured folder itself,
+  and never reaches the folder-creating resolver. Where the check cannot be made the record pass
+  is **refused**, and three conditions do so — the local folder resolving onto the shared one, a
+  Settings save having superseded the snapshot this session (so which folder is shared is no
+  longer known), and a configured folder with no single absolute form (so comparing it would mean
+  resolving it, which would mean contacting it). The comparison is exact normalised equality on
+  both the typed and the resolved local path, never a prefix test, so `…\VideoAnalysis2` is not
+  part of `…\VideoAnalysis`. A local cache legitimately junctioned onto a larger disk is followed
+  and **disclosed**, because the records came off the resolved storage.
+* **The media half inspects whatever folder the operator names** — including the shared folder,
+  if that is the path they type. It has no notion of a shared folder, does not recognise one and
+  does not refuse one. That is disclosed in the panel's own text and in the read-out.
+
+**And the record half's check is a comparison of NAMES, not of storage — a bounded limitation,
+disclosed rather than claimed away.** Two different names can denote one folder: a junction, a
+symbolic link, the extended-length `\\?\` spelling, a substituted or mapped drive letter, a short
+name. Distinguishing those would mean resolving the configured shared path, which the approved
+R-3 boundary forbids, so they are **not disproved**. A configured shared folder that is itself a
+junction onto the local cache's real target, and the extended-length spelling of the same folder,
+were reproduced and are known **not** to be refused; drive substitution, mapped drives and short
+names were **not** measured and are not claimed safe. The read-out states this where the records
+are reported, and the operator is told the practical precaution: if the local and shared folders
+may be two names for one folder, do not enable record reading. **No claim of physical
+shared-cache non-contact is asserted anywhere in this feature's code, tests or documentation** —
+the only places such a sentence appears at all are the regression guard's own ban patterns and the
+counterexamples it assembles to prove it fires, and quoting a false sentence in order to forbid it
+is not asserting it. The gate's behaviour is unchanged by this wording — the limitation was always
+there and is now written down.
+
+**Four of A3's optional observations are deliberately not requested, and each absence is stated
+in the read-out rather than inferred from a missing line.** `looks_reusable` and `read_text` are
+both `None`, so no record is re-opened by the delegated transport check and no alternative file
+transport exists; `is_complete` and `require_ai` are both `None`, so record completeness stays
+unassessed — outside a render there is no established analysis mode to judge for, and a figure for
+a question nobody asked is not a figure. The contract generation is passed **in** from
+`video_analysis` through the deferred import the cache Import handler already uses, and when it
+cannot be read that axis is unassessed rather than zero.
+
+Reading is bounded well below A3's own defaults — 4 000 entries, 2 000 records, 1 MB per record,
+32 MB in total, 100 reported names — expressed as module constants rather than widget limits, so
+no resource ceiling is in the operator's hands. The bounds charge work **attempted**, they are not
+a wall-clock, peak-memory or exact-byte ceiling, and whichever one was reached is named.
+
+**No number in this panel is its own.** A2's and A5's read-outs own every figure, each with its
+unit, its exactness and the population it answers for; what the panel writes is labels, states,
+refusals and words. A refused or limited pass publishes **no** count rather than a smaller one, no
+bucket is summed, nothing unestablished is rendered as a zero, and no A4 observation is bound
+beside a local record inventory — that would put two populations in one report.
+
+Separate call graph from the A6 panel by contract: no helper carries the `_a6_` prefix (every such
+name is pinned into A6's own ban tuple), A6 cannot reach this handler, and this handler reads
+exactly three **pure, no-disk** A6 helpers — the startup-snapshot parser, the supersession latch
+reader and the unambiguous-absolute-path gate — rather than keeping a second copy of a gate whose
+equivalence to the resolver is already proved over a measured table.
+
+**Outstanding, by owner decision, and named rather than buried.** *The location the last analysis
+actually used* is **NOT DELIVERED** in this increment. `video_analysis` already produces the fact
+and returns it per invocation; no part of the interface keeps it, so delivering it would mean the
+**analysis/render handler retaining the value it already receives**, after which this read-out
+would only read what that handler kept — the panel writes nothing itself and no render-path change
+is part of this increment. The line therefore reads `NOT AVAILABLE, and OUTSTANDING`, and the
+three-location-fact requirement is recorded as
+`OWNER_ACCEPTED_DEFERRED_FOR_THIS_INCREMENT; THIRD_LOCATION_FACT_NOT_DELIVERED`.
+
+Touched: `src/gui.py` (new constants, **eight** new `_f3_*` helpers plus the click handler — nine
+new functions, of which eight carry the prefix — one accordion, one registration),
+`tests/test_library_inventory_panel.py` (new).
+
+#### Corrections applied after independent review (R2)
+
+The R1 independent review of this candidate returned `CHANGES_REQUIRED` on five findings, all of
+them about what the increment *claimed* plus two coverage gaps. No behaviour changed: the gate,
+the comparison, the bounds, the call sites and the widget set are what they were, and the only
+executable addition is two `lines.append` calls that emit new disclosure text.
+
+* **The unqualified isolation sentence is gone** (above). It was false two ways, both reproduced:
+  typing the shared folder into the media box enumerates it — one operator keystroke, no alias
+  needed — and a configured shared *text* reaching the local cache's storage under a different
+  name is not refused.
+* **A repository-carried, opt-in runtime check now exists**: `tests/test_gradio_runtime_compat.py`.
+  It skips unless `BEATSYNC_TEST_GRADIO=1`; opted in, an absent or mismatched `gradio==6.19.0` is
+  a **failure, not a skip**. It censuses every `gr.*` call in `src/gui.py` against the real
+  `inspect.signature`, and it builds `create_ui()` once in a child process with `LOCALAPPDATA`
+  and `BEATSYNC_SHARED_CONFIG` redirected into a task-local directory. A build is **not** a
+  live-server smoke and not user acceptance; nothing calls `.launch()` or binds a port.
+* **Two proven test vacuities are fixed.** `test_e6` built a look-alike fixture, never used it as
+  the local cache and ended in a tautology; it now configures the shared folder as a strict
+  string prefix of the local cache path, in both realistic spellings, and asserts the pass runs
+  once on the intended folder. A new `test_e13` covers the **typed** arm of the comparison, which
+  had none. Each was measured RED under the matching mutation of the shipped source and GREEN
+  with it restored byte-for-byte.
+* **The mutation accounting is corrected.** The suite carries **ten** distinct mutators, all of
+  them used, referenced **thirteen** times across **twelve** call sites, and they mutate
+  **AST-extracted copies of function bodies, in memory**:
+  `src/gui.py` is never written to and therefore never restored. The earlier "seven mutations …
+  restored byte-identically" conflated this with a separate external file-mutation harness, whose
+  results are distinct evidence.
+
+#### Corrections applied after the second independent review (R3)
+
+The R2 independent review of the remediated candidate closed F-2, F-3, F-4 and F-5 on its own
+measurements and returned `CHANGES_REQUIRED` on two further findings, both of them about the claim
+R1 had already ruled out. No behaviour changed: the AST delta of `src/gui.py` against the R2 head
+is **zero executable function bodies**, and the only `src/gui.py` edit is inside one block comment.
+
+* **A seventh location was carrying the sentence, and this record denied it (N-1).** The R2 sweep
+  corrected the checkbox label, the panel info text, the `gui.py` block comment, two `gui.py`
+  docstrings, the read-out and this file — but `tests/test_library_inventory_panel.py`'s own module
+  docstring still stated, unchanged since the R1 head, that *this panel never reads, lists, counts,
+  measures or resolves the shared folder*. That paragraph is now scoped the same way the rest of
+  the increment is: the record half never **targets** the folder and compares **names**, the media
+  half inspects whatever it is given, and the alias residual is named with its measured,
+  unverified and unmeasured cases kept apart. Two universal statements that the surviving
+  docstring had falsified — this file's "no claim … is made anywhere" and the `gui.py` comment's
+  "is not written anywhere" — are corrected to say **asserted**, and both now name the one
+  legitimate exception: a regression guard necessarily quotes the sentence it forbids.
+* **The guard that was supposed to prevent this could not see the repository's own wording (N-2).**
+  `test_e16` banned four literal substrings in four constants; the phrasing above differs from one
+  of them by the single inserted word *measures*, and the review proved the blind spot was about
+  the phrasing rather than the file by planting that exact sentence into `INFO_LIBRARY_INVENTORY`
+  — an operator-facing constant the test guards — and watching `test_e16` still pass. The literal
+  pins are kept, and a **structural** matcher is added beside them: a negation that directly
+  governs a *list* of contact verbs, which catches the R1 wording, the `measures` variant, the
+  passive form and the original pronoun-object form alike. It runs over a widened surface — every
+  `F3_*`/`LABEL_LIBRARY_INVENTORY*`/`INFO_LIBRARY_INVENTORY` constant, the eight F-3 docstrings,
+  the F-3 block comment **and this suite's own module docstring**, the surface whose absence let
+  N-1 survive. Scoped statements and quoted counterexamples are exempt by construction, because a
+  guard that forbade *"the record half never reads, lists, counts or resolves the configured
+  folder itself"* or the media half's affirmative disclosure would make the honest text
+  unsayable; `test_e16b` asserts exactly that, and `test_e16a` asserts every matcher can fire,
+  from claims assembled at runtime so no banned literal sits in the file for a scanner to find.
+  The extraction is deliberately scoped to the F-3 block: `gui.py` carries a **pre-existing**
+  `main` comment about A6's unticked default-off report that a whole-file scan would flag.
+
+Touched: `src/gui.py` (one block comment), `tests/test_library_inventory_panel.py` (module
+docstring, `test_e16` strengthened, `test_e16a`/`test_e16b` added), `CHANGELOG-FORK.md`.
+
+### Fixed — 2026-11-08 (the application did not start on the pinned Gradio)
+
+**`gr.Textbox` has no `show_copy_button` parameter on `gradio==6.19.0`.** Gradio 6 replaced it
+with `buttons`, so the keyword raises
+
+```
+TypeError: Textbox.__init__() got an unexpected keyword argument 'show_copy_button'
+```
+
+while `create_ui()` is building the interface — the whole application failed to start. Measured
+against pristine `main` `2a7dcb01e0f1b247a4b8bd91033b799592aa8e89` (`src/gui.py` blob
+`171ab573a9d6b06ecf9d47c1dff997583952b30b`) on the real library.
+
+It went unnoticed because `gradio` cannot be imported on a bare interpreter, so every existing
+assertion about that widget is an AST assertion about source text the real library rejects. The
+intent — an operator can copy the read-out — is preserved by the replacement parameter rather
+than dropped. Production is unaffected: it runs `e6a7c0cd255c527c83b651e43c893bfc98418943`, which
+predates the widget.
+
+**Pinned two ways, both of them now in the repository.** A bare-CPython AST assertion on keyword
+names catches this one parameter returning; `tests/test_gradio_runtime_compat.py` — opt-in behind
+`BEATSYNC_TEST_GRADIO=1` — catches the *class* of defect, because it checks every `gr.*` keyword
+in the file against the real signature and builds `create_ui()` on the real library. The first
+version of this entry claimed the second half while it existed only as a local verification step
+outside the repository; that is corrected, and the check is committed and has been executed.
+Measured on the pinned runtime: 571 `gr.*` calls, 1183 keywords validated against a signature, 43
+accepted only by the runtime across six named `callee.keyword` pairs, nothing unknown and nothing
+dynamic; pristine `main` fails the build with the `TypeError` above, this tree builds 544 blocks.
+
+Touched: `src/gui.py` (one keyword, in the R14-A A6 read-out box),
+`tests/test_gradio_runtime_compat.py` (new, opt-in).
+
 ### Fixed — 2026-11-08 (Short-Source Eligibility R1: a segment is only given a source that can fill it)
 
 **The owner's render stopped with three failed clips, and the planner was the one at fault.** Clip 5
