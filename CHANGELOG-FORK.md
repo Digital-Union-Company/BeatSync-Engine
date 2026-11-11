@@ -20,6 +20,84 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-12 (R14-R1: building the interface no longer creates the shared cache folder)
+
+**Starting the GUI materialised a configured shared analysis-cache folder.** Nothing had to be
+clicked. `analysis_cache.resolve_location` creates the configured folder when its parent exists —
+correct for an analysis, wrong for a read-out — and the Cache Management category list is built at
+**UI construction time** precisely so a shared folder can be *named* in its description. So
+resolving the location in order to describe it also made it.
+
+Reproduced on `2b414ae7` in fresh processes, with `BEATSYNC_SHARED_CONFIG` pointing at a synthetic
+configuration and a task-owned folder whose parent existed and whose leaf did not:
+
+```
+import logger / paths / video_analysis / gui        -> NOT created
+gui._analysis_category_explanation()                -> CREATED
+gui.create_ui()                                     -> CREATED
+```
+
+**The chain in the report that prompted this was named slightly wrong, and the real one is one
+function longer.** There is no `_resolved_cache_location` in `gui.py`; what runs is
+`create_ui()` → `_analysis_category_explanation()` → `_cache_categories()` →
+`_analysis_cache_location()` → `video_analysis.resolve_cache_location()` →
+`analysis_cache.resolve_location()` → `os.makedirs`. The `_cache_categories` hop matters, because
+it is also what Inspect and Clear reach, which is why the fix had to land there rather than at the
+single construction-time call site.
+
+**The correction is to separate resolving from creating, not to add a second resolver.**
+`resolve_cache_location` gained a keyword-only `make_dirs` that it forwards verbatim;
+`analysis_cache.resolve_location` has always accepted one, and its own default is the real
+`os.makedirs`, so **`None` means unchanged**. A read-only caller now passes a refusing `make_dirs`
+through the new one-line `gui._analysis_cache_location_readonly()`. The refusal is
+`library_cache_location.RefuseDirectoryCreation` — the mechanism R14-A stage A4 already injects for
+exactly this reason, **reused rather than re-implemented**, and constructed per call because it
+records being asked. There is still exactly **one** resolver: a caller computing the location for
+itself could show one folder while Stage 5 wrote to another, which remains the most misleading
+thing this feature could do.
+
+**Four read paths moved; two deliberately did not.** `_cache_categories`, `_analysis_cache_notes`
+and `_on_inspect_shared_cache` resolve read-only, which also covers the construction-time
+description and Cache Management's Inspect and Clear. Moving `_cache_categories` as a unit is what
+stops Inspect and Clear disagreeing — had only one refused, the first click would have materialised
+the folder the other had just reported absent. `_on_save_shared_cache` and
+`_on_import_analysis_cache` keep the creating resolver: Save is the operator explicitly configuring
+the folder, and Import must have a destination to copy records into. Both are pinned by test so the
+scope of this hotfix stays visible.
+
+**A refused creation narrows what the result may be read for, and that is handled rather than
+hoped.** The resolver still returns `available=True` and the configured path for a folder it was
+refused permission to create — the right answer to *"where would the next analysis write?"* and the
+wrong answer to *"does it exist now?"*. So presence is never taken from it: both read-outs render
+from an independent measurement, and the **existing** wording already reports absence truthfully
+(`nothing cached yet` from `cache_admin.report_lines`, `This folder does not exist yet. It is
+created the first time an analysis runs.` from `STATUS_SHARED_CACHE_MISSING`). **No operator-visible
+string was added or changed**, and the shared-cache warning is unchanged: the category description
+is byte-identical to `INFO_CACHE_ANALYSIS_SHARED.format(path=…)`, asserted by test.
+
+**Nothing else moved.** Verified by comparing docstring-stripped executable bodies against
+`2b414ae7`: exactly `resolve_cache_location` in `video_analysis.py` and `_analysis_cache_location`
+plus the three read paths in `gui.py` changed; `_cache_path`, `_video_signature`,
+`_cache_entry_is_complete`, `_checkpoint_cache`, `_save_cache`, `_shared_cache_report`,
+`_analysis_category_explanation`, `_on_inspect_cache`, `_on_clear_cache` and `cleanup_on_startup`
+are untouched. `CACHE_CONTRACT_VERSION = "stage5_cache_v3"` and
+`ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"` are unchanged, `make_dirs` appears
+in no identity primitive, both Stage-5 entry points still call the resolver with **no** argument and
+therefore still create the folder, the local fallback expression is unchanged, and the PR #100
+`gradio_uploads` startup protection is untouched. **No cache record was read, written, moved or
+deleted, and no cache was cleaned or migrated.**
+
+`tests/test_cache_creation_side_effect.py` (29 tests) executes the real `gui.py` and
+`video_analysis.py` bodies against a synthesised namespace over the real fork modules and the real
+`ui_content.py` strings, asserting **filesystem state** rather than a mocked call, with a `mkdir`
+spy patched onto `os` itself — because "the folder is absent" and "creation was never attempted" are
+different findings. It covers the existing-folder, absent-leaf-with-live-parent, disconnected-storage
+and unreadable-configuration shapes, and repeated construction. Group F is the **negative control**:
+it rewrites the three fixed call sites back to `_analysis_cache_location()` and requires the folder
+to be created again — and that rewrite was proven **byte-identical, on executable statements, to the
+committed `2b414ae7` source** for all three functions, so the control reproduces the real defect
+rather than an approximation of it.
+
 ### Added — 2026-11-11 (R14-B S2: twenty confirmed-missing paths, so the figure can be checked)
 
 **S1's count was believable and unverifiable, which is the same thing as unusable.** The owner's
