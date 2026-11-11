@@ -9402,6 +9402,61 @@ F3_SOURCES_NOT_A_RECOMMENDATION = (
     'records, and nothing here distinguishes the two. No deletion, quarantine, rename or move is '
     'offered or performed anywhere in this panel.')
 
+# --- R14-B S2: the bounded sample of confirmed-missing paths -----------------------------------
+#
+# [FORK] Digital-Union (R14-B S2). S1 made the source axis answerable; the owner's first real run
+# on a 5,741-file library then showed why a count alone is not yet usable: "at least 50 records
+# with confirmed-missing source paths" is believable and unverifiable. There is nothing to check
+# by hand, so nothing can be trusted enough to act on later.
+#
+# S2 shows up to twenty of those paths. It adds **no classification and no measurement**: the
+# population is the finalised verdict tuple S1 already produced, filtered by A1's own
+# `confirmed_missing`, which reads :attr:`LeafVerdict.published` -- so UNKNOWN, provisional,
+# access-denied, unreachable and uninspected are excluded by that function rather than by a second
+# rule written here. Out-of-scope paths cannot appear at all, because only `SCOPE_IN` records were
+# ever probed. No new filesystem call, no second record read, no new widget, no higher ceiling.
+#
+# It reports PATHS; A5 reports RECORDS. They are deliberately different numbers -- several records
+# may name one source -- and conflating them is the one mistake this section could make that would
+# look like a finding. Every aggregate, exactness label and lower bound stays A5's.
+
+#: Display ceilings. Twenty is a sample a person can actually read; the per-line bound exists
+#: because a record's `video_file` is untrusted text, not because a real path is ever that long.
+F3_SAMPLE_MAX_PATHS = 20
+F3_SAMPLE_PATH_MAX_CHARS = 400
+
+F3_SAMPLE_HEADING = 'Confirmed-missing source paths - a bounded sample, for checking by hand'
+F3_SAMPLE_NONE = (
+    'none to show: the pass above finalised no confirmed-missing verdict, so there is no path to '
+    'list. That is not a claim that every source is present - read the figure below for what was '
+    'and was not established.')
+F3_SAMPLE_INTRO = (
+    '{distinct} DISTINCT source paths were confirmed missing by the pass above (from {records} '
+    'confirmed-missing verdicts - several records may name one path, so this is a count of PATHS '
+    'and is NOT the record figure A5 reports below; the two are not interchangeable). Showing '
+    '{shown}, ordered by path, so the same pass always shows the same ones.')
+F3_SAMPLE_SCOPE = (
+    'Every path below came from a record whose recorded source A3 placed INSIDE the folder '
+    'inspected above, and whose verdict was finalised as confirmed missing. Nothing out of scope, '
+    'unknown, provisional, access-denied, unreachable or unresolved can appear here.')
+F3_SAMPLE_BOUND = (
+    'BOUNDED SAMPLE: {hidden} further distinct paths are not listed, because this display stops '
+    'at {limit}. This is a sample and never a complete list.')
+F3_SAMPLE_REWRITTEN_MARK = '   <- rewritten for display'
+F3_SAMPLE_REWRITTEN = (
+    '{count} of the paths above could not be shown verbatim: the recorded text was longer than '
+    '{limit} characters or contained control characters, which a real Windows path cannot, so it '
+    'was collapsed and truncated for display. Those lines are marked, and they are NOT safe to '
+    'copy as paths - the record contains something unexpected.')
+F3_SAMPLE_NOT_DELETABLE = (
+    'A missing source path does NOT authorize deletion of its cache record. The file may have '
+    'been renamed or moved rather than deleted, more than one installation may use these records, '
+    'and nothing in this panel distinguishes those cases. There is no delete, clean, migrate or '
+    'repair control here, and this sample is not an instruction to build one.')
+F3_SAMPLE_FAILED = (
+    'NOT SHOWN - the sample could not be rendered, so no path is listed. The figure below is '
+    'unaffected, because it is not derived from this display: ')
+
 # --- the three location facts, deliberately not one -------------------------------------------
 
 F3_LOCATION_HEADING = 'Where the analysis cache is - three different facts, not one'
@@ -9678,6 +9733,66 @@ def _f3_source_verdicts(records, roots):
     return (tuple(finalised), notes)
 
 
+def _f3_missing_sample(source_verdicts):
+    """[FORK] Digital-Union (R14-B S2): up to twenty confirmed-missing paths, as lines.
+
+    Returns ``(lines, rewritten)``. **Pure display.** It makes no filesystem call, re-reads no
+    record, and decides nothing: the admission test is A1's own :func:`confirmed_missing`, which
+    reads :attr:`LeafVerdict.published` and therefore excludes UNKNOWN, provisional, access-denied,
+    unreachable and uninspected without a second rule being written here.
+
+    Four choices carry the safety:
+
+    * **The population is S1's finalised tuple, nothing wider.** Only `SCOPE_IN` records were ever
+      probed, so a path from outside the inspected folder cannot reach this function -- it is
+      excluded upstream rather than filtered out here, which is why no containment test appears.
+    * **Distinct PATHS, counted as paths.** Deduplicated on ``normcase`` because that is what
+      Windows means by "the same name", keeping the first spelling seen. The count reported is of
+      paths and says so; A5's figure counts records and remains the only aggregate authority.
+    * **Deterministic order**, by the normalised key, so two runs over the same library show the
+      same twenty regardless of the order records happened to be read in.
+    * **Untrusted text is bounded before it is printed.** ``video_file`` comes out of a JSON file
+      this application did not write in any guaranteed way, so each line goes through
+      `ffmpeg_diagnostics.bound`, which collapses control characters and whitespace and truncates
+      with an ellipsis. A line that came back changed is MARKED rather than silently rewritten: a
+      real Windows path contains no control character, so a rewritten line means the record holds
+      something unexpected and the text is not safe to use as a path.
+    """
+    from beatsync_fork import ffmpeg_diagnostics as fork_diagnostics
+    from beatsync_fork import library_inventory as fork_inventory
+
+    found = fork_inventory.confirmed_missing(tuple(source_verdicts))
+    distinct = {}
+    for path in found:
+        text = str(path or '')
+        key = os.path.normcase(text)
+        if key and key not in distinct:
+            distinct[key] = text
+    if not distinct:
+        return ([F3_SAMPLE_NONE], 0)
+
+    ordered = [distinct[key] for key in sorted(distinct)]
+    shown = ordered[:F3_SAMPLE_MAX_PATHS]
+    lines = [F3_SAMPLE_INTRO.format(distinct=len(ordered), records=len(found), shown=len(shown)),
+             F3_SAMPLE_SCOPE]
+    rewritten = 0
+    for text in shown:
+        safe = fork_diagnostics.bound(text, F3_SAMPLE_PATH_MAX_CHARS)
+        if safe == text:
+            lines.append('  ' + safe)
+        else:
+            rewritten += 1
+            lines.append('  ' + safe + F3_SAMPLE_REWRITTEN_MARK)
+    if len(ordered) > len(shown):
+        lines.append(F3_SAMPLE_BOUND.format(hidden=len(ordered) - len(shown),
+                                            limit=F3_SAMPLE_MAX_PATHS))
+    if rewritten:
+        lines.append(F3_SAMPLE_REWRITTEN.format(count=rewritten,
+                                                limit=F3_SAMPLE_PATH_MAX_CHARS))
+    lines.append(F3_SAMPLE_NOT_DELETABLE)
+    return (lines, rewritten)
+
+
 def _f3_record_truth_line(inventory):
     """A3's truthfulness questions, as words: its four separate ones, plus the conservative
     publication verdict they feed.
@@ -9786,6 +9901,20 @@ def _f3_record_lines(local_cache, verified_roots, inspect_sources=False):
         lines.append('  ' + F3_SOURCES_NOT_A_RECOMMENDATION)
         for note in source_notes:
             lines.append('  ' + note)
+
+        # [FORK] Digital-Union (R14-B S2): the bounded sample, rendered from the SAME finalised
+        # verdicts and nothing else. Inside this branch only, so the paths cannot appear while
+        # either box is unticked. Guarded for the reason every half of this read-out is: a
+        # display that raised would replace a real answer -- including A5's figure below, which
+        # does not depend on this display at all -- with a traceback.
+        lines.append('')
+        lines.append('  ' + F3_SAMPLE_HEADING)
+        try:
+            sample_lines, _sample_rewritten = _f3_missing_sample(source_verdicts)
+        except Exception as exc:
+            sample_lines = [F3_SAMPLE_FAILED + str(exc)]
+        for line in sample_lines:
+            lines.append('    ' + line)
 
     lines.append('')
     # A5 owns every number. With no location and no category supplied it withholds the measured

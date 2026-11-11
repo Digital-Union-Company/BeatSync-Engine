@@ -94,6 +94,10 @@ CLOCK_FN = "_f3_observed_at"
 #: R14-B S1: the source-state evidence gatherer. Registered here, which is what subjects it to
 #: every structural ban below — see `test_i10`, which now pins the tuple in BOTH directions.
 SOURCES_FN = "_f3_source_verdicts"
+#: [FORK] Digital-Union (R14-B S2): the bounded missing-path sample renderer. Registered here
+#: because every structural ban in this suite is only ever as wide as `F3_FUNCTIONS` -- see
+#: `test_i10`'s reverse pin, which exists because exactly this registration was once forgotten.
+SAMPLE_FN = "_f3_missing_sample"
 
 BUTTON = "library_inventory_btn"
 FOLDER_BOX = "library_inventory_folder"
@@ -106,7 +110,7 @@ REPORT_BOX = "library_inventory_box"
 #: this tuple. `test_s7` pins the tuple itself against `gui.py`, so a new `_f3_*` function cannot
 #: be added to the panel without either entering these bans or failing that test.
 F3_FUNCTIONS = (HANDLER, LINES_FN, MEDIA_FN, RECORD_FN, IDENTITY_FN, SHARED_KEYS_FN, LOCATION_FN,
-                TRUTH_FN, CLOCK_FN, SOURCES_FN)
+                TRUTH_FN, CLOCK_FN, SOURCES_FN, SAMPLE_FN)
 
 #: The three PURE A6 helpers this panel is permitted to read, and the only three. All touch no
 #: disk. Sharing them is the "one parser, not two that can disagree" argument A4 and A6 make; a
