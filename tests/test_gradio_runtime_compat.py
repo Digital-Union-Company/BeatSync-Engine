@@ -95,9 +95,11 @@ HANDLER = "_on_library_inventory_click"
 A6_REPORT_BOX = "library-cache-report-box"
 F3_FOLDER_BOX = "library-inventory-folder"
 F3_RECORDS_BOX = "library-inventory-records"
+#: R14-B S1: the second default-off tick.
+F3_SOURCES_BOX = "library-inventory-sources"
 F3_BUTTON = "library-inventory-button"
 F3_REPORT_BOX = "library-inventory-box"
-F3_ELEM_IDS = (F3_FOLDER_BOX, F3_RECORDS_BOX, F3_BUTTON, F3_REPORT_BOX)
+F3_ELEM_IDS = (F3_FOLDER_BOX, F3_RECORDS_BOX, F3_SOURCES_BOX, F3_BUTTON, F3_REPORT_BOX)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get(OPT_IN) != "1",
@@ -505,21 +507,26 @@ def test_c1_create_ui_builds_the_real_interface_and_the_panel_is_what_it_claims(
     for elem_id in F3_ELEM_IDS:
         assert elem_id in components, (elem_id, sorted(components))
     folder, records = components[F3_FOLDER_BOX], components[F3_RECORDS_BOX]
+    sources = components[F3_SOURCES_BOX]
     button, report = components[F3_BUTTON], components[F3_REPORT_BOX]
     assert folder["type"] == "Textbox", folder
     assert records["type"] == "Checkbox" and records["value"] is False, records
+    # R14-B S1: the source-state tick is default-off on the REAL built interface, not merely in
+    # the source text. Both ticks are asserted the same way and for the same reason.
+    assert sources["type"] == "Checkbox" and sources["value"] is False, sources
     assert button["type"] == "Button", button
     assert report["type"] == "Textbox" and report["interactive"] is False, report
     assert report["buttons"] == ["copy"], report
 
     panel_ids = [i for i in components if i.startswith("library-inventory-")]
     assert sorted(panel_ids) == sorted(F3_ELEM_IDS), (
-        f"the panel built {len(panel_ids)} identified widgets; four and no fifth are expected")
+        f"the panel built {len(panel_ids)} identified widgets; five and no sixth are expected")
 
     deps = result["handler_dependencies"]
     assert len(deps) == 1, deps
     only = deps[0]
-    assert only["inputs"] == [F3_FOLDER_BOX, F3_RECORDS_BOX], only
+    # Positional contract: the R14-B input is APPENDED, so the two pre-existing indices hold.
+    assert only["inputs"] == [F3_FOLDER_BOX, F3_RECORDS_BOX, F3_SOURCES_BOX], only
     assert only["outputs"] == [F3_REPORT_BOX], only
     assert only["concurrency_limit"] is None, only
     assert only["concurrency_id"] != result["render_concurrency_id"], only

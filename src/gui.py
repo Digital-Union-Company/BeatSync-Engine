@@ -9135,6 +9135,18 @@ LABEL_LIBRARY_INVENTORY_RECORDS = (
     'pass never targets the shared analysis-cache folder, but it compares folder NAMES and so '
     'cannot prove two names are not one folder - read the limit note in the read-out before '
     'ticking this)')
+#: [FORK] Digital-Union (R14-B S1). The SECOND default-off tick, and deliberately a second one
+#: rather than more work hidden behind the first: reading this installation's own records and
+#: going out to look for the operator's media are different questions about different folders,
+#: and a box that silently acquired the second meaning would be the opposite of this panel's
+#: whole design. It is subordinate to the record tick -- source state is a question ABOUT
+#: records -- and that dependency is stated in the label rather than enforced by greying it out,
+#: because a disabled control explains nothing.
+LABEL_LIBRARY_INVENTORY_SOURCES = (
+    'Also check whether each in-scope record still has its source file (off by default; needs '
+    'the record box too). Looks only inside the Media Library folder named above: one directory '
+    'listing per folder and one status read per file. It opens no media, changes nothing, and a '
+    'record whose source is gone is still never a record this read-out says you may remove.')
 LABEL_LIBRARY_INVENTORY_BUILD = 'Build inventory'
 INFO_LIBRARY_INVENTORY = (
     'A read-only read-out of one Media Library folder you name, and optionally of this '
@@ -9280,6 +9292,72 @@ F3_RECORDS_ALIAS_LIMIT = (
     'drives and short names were not all tested and are not claimed to be safe. So: if your '
     'local and shared analysis-cache folders may be two names for one folder, untick the box '
     'above - no figure below is offered as proof that they are not.')
+
+# --- R14-B S1: the source-state preview ------------------------------------------------------
+#
+# [FORK] Digital-Union (R14-B S1). A5 has always been able to answer "which of these records
+# names a source that is confirmed missing?" -- `bind_observation` takes `source_verdicts` and
+# `library_roots`, and the source axis joins on
+# `library_inventory.LeafVerdict.published == MISSING_CONFIRMED`. F-3 supplied neither, so that
+# axis reported `not assessed` on every run and no preview of possible cleanup existed at all.
+# This increment supplies them. It adds NO judgement of its own: every figure, every exactness
+# label and every withholding below is still A5's.
+#
+# Four properties are the whole safety argument, and none of them is new code:
+#
+#   * ONLY `SCOPE_IN` records are looked for. A record whose source lies outside the folder the
+#     operator named is never probed, so a library nobody selected is never discovered, and the
+#     offline-drive record -- the case R14-B names explicitly -- stays `scope_out` and is
+#     reported as "outside the folders inspected" rather than as an orphan.
+#   * `classify_leaf` cannot publish a missing claim on its own: it answers MISSING_PROVISIONAL,
+#     and only `retract_subtree` finalises it. That is also what TAKES ONE BACK if the root went
+#     away during the pass, which is precisely the removable-drive hazard.
+#   * the pass is bounded by its own two ceilings, and whichever was reached is named.
+#   * nothing here deletes, quarantines, renames or moves anything, and A5's own
+#     `MISSING_SOURCE_SENTENCE` keeps saying so next to the figure.
+
+#: Ceilings for the source pass, as module constants rather than widget limits -- the same rule
+#: the record bounds follow, so no resource ceiling is in the operator's hands. They charge work
+#: ATTEMPTED: a refused listing costs what a good one costs.
+F3_SOURCE_MAX_RECORDS = 2_000
+F3_SOURCE_MAX_DIRECTORIES = 500
+
+F3_SOURCES_HEADING = 'Source state of the records read above'
+F3_SOURCES_OFF = (
+    'NOT ASSESSED - the source-state box was not ticked, so no source file was looked for, no '
+    'directory was listed for one, and every record above keeps its source state unestablished.')
+F3_SOURCES_NEEDS_RECORDS = (
+    'NOT ASSESSED - source state is a question ABOUT records, and no record was read. Tick the '
+    'record box as well, and read its limit note first.')
+F3_SOURCES_NO_ROOT = (
+    'NOT ASSESSED - no Media Library root was positively observed, so there is no folder a '
+    'missing finding could be anchored to. A file cannot be called missing from a folder nobody '
+    'managed to read.')
+F3_SOURCES_NONE_IN_SCOPE = (
+    'no record named a source inside the folder that was inspected, so there was nothing to look '
+    'for. That is not a finding about any record: a record whose source lies elsewhere is '
+    'reported below as out of scope, never as missing.')
+F3_SOURCES_BOUND_RECORDS = (
+    'BOUND REACHED: the pass stopped after {limit} records, so records beyond that were not '
+    'looked for and are reported with their source state unestablished rather than as present.')
+F3_SOURCES_BOUND_DIRECTORIES = (
+    'BOUND REACHED: the pass stopped after listing {limit} folders, so records in further '
+    'folders were not looked for and are reported with their source state unestablished rather '
+    'than as present.')
+F3_SOURCES_FAILED = (
+    'NOT ASSESSED - the source-state pass could not be completed, so no source figure is offered: ')
+F3_SOURCES_NOTE = (
+    'What this pass did: for each record whose recorded source lies inside the folder inspected '
+    'above, it listed that file\'s own parent folder once and read that one file\'s status. It '
+    'opened no media and no record a second time, and it wrote nothing. A "confirmed missing" '
+    'finding additionally requires the library root to have still been reachable when the pass '
+    'ENDED - if it went away in the middle, every such finding is taken back to unknown rather '
+    'than left standing.')
+F3_SOURCES_NOT_A_RECOMMENDATION = (
+    'A record whose source is gone is NOT a record this read-out says you may delete: the source '
+    'may have been renamed or moved, this installation is not the only one that may use these '
+    'records, and nothing here distinguishes the two. No deletion, quarantine, rename or move is '
+    'offered or performed anywhere in this panel.')
 
 # --- the three location facts, deliberately not one -------------------------------------------
 
@@ -9457,6 +9535,106 @@ def _f3_media_inventory(root_text):
     return (list(fork_inventory.inventory_lines(inventory)), roots)
 
 
+def _f3_source_verdicts(records, roots):
+    """[FORK] Digital-Union (R14-B S1): is each IN-SCOPE record's source file still there?
+
+    Returns ``(verdicts, notes)`` -- A1 ``LeafVerdict`` objects for A5 to join, and any bound
+    this pass reached. It decides **nothing**: it establishes evidence and hands it on.
+
+    Three choices carry the safety:
+
+    * **`SCOPE_IN` only.** A3 already decided which records name a source inside a root A1
+      positively observed, so this reuses that verdict instead of writing a second containment
+      test. A record outside it is never probed -- which is what keeps the pass inside the folder
+      the operator typed, and what stops a disconnected drive's records from being touched at all.
+    * **Grouped by the root that scoped them**, through A3's own ``scope_root`` key, so a verdict
+      is only ever finalised against the root whose listing produced it. ``retract_subtree``
+      refuses another root's evidence anyway; matching here means it never has to.
+    * **`retract_subtree` is mandatory, not a tidy-up.** ``classify_leaf`` answers
+      ``MISSING_PROVISIONAL`` and :attr:`LeafVerdict.published` renders that as ``UNKNOWN``, so a
+      missing claim literally cannot escape this function unfinalised -- and if the root went away
+      mid-pass, the same call takes every such finding back instead of leaving a subtree of
+      confirmed deletions behind.
+    * **and it is settled against an observation taken AFTER the evidence** -- finding F-7 of the
+      independent review. ``retract_subtree`` reads :attr:`RootState.positively_observed`, which is
+      a frozen field on a snapshot, so handing it the root ``inspect_library`` probed *before* any
+      record was read establishes only that the folder was there when the read-out STARTED. The
+      mid-pass-disconnect guard above, and the end-of-pass sentence this panel prints to the
+      operator, both need the later observation, so each root with findings is observed once more
+      when its own sub-pass finishes. A re-observation that cannot be taken, or that no longer
+      resolves to the same location, leaves every finding unfinalised rather than confirmed:
+      ``retract_subtree`` declines jurisdiction and :attr:`LeafVerdict.published` renders the
+      result ``UNKNOWN``, which is the fail-closed direction.
+
+    The broad catch is deliberate and matches both existing halves: a read-out that raised would
+    replace a real answer with a traceback, and a failure here withholds the source axis rather
+    than publishing a smaller one. Nothing on this path holds a lifecycle, so no cancellation can
+    arrive to be swallowed.
+    """
+    from beatsync_fork import library_inventory as fork_inventory
+    from beatsync_fork import library_cache_records as fork_cache_records
+
+    verified = tuple(root for root in roots
+                     if getattr(root, 'positively_observed', False))
+    if not verified:
+        return ((), [F3_SOURCES_NO_ROOT])
+
+    eligible = [record for record in records
+                if getattr(record, 'scope', '') == fork_cache_records.SCOPE_IN
+                and getattr(record, 'source_path', '')]
+    if not eligible:
+        return ((), [F3_SOURCES_NONE_IN_SCOPE])
+
+    finalised = []
+    notes = []
+    bound = ''
+    examined = 0
+    listed = 0
+    for root in verified:
+        root_key = os.path.normcase(str(getattr(root, 'real', '') or ''))
+        listings = {}
+        pending = []
+        for record in eligible:
+            if os.path.normcase(str(record.scope_root or '')) != root_key:
+                continue
+            if examined >= F3_SOURCE_MAX_RECORDS:
+                bound = bound or F3_SOURCES_BOUND_RECORDS.format(limit=F3_SOURCE_MAX_RECORDS)
+                break
+            parent = os.path.dirname(os.path.abspath(record.source_path))
+            parent_key = os.path.normcase(parent)
+            if parent_key not in listings:
+                if listed >= F3_SOURCE_MAX_DIRECTORIES:
+                    bound = bound or F3_SOURCES_BOUND_DIRECTORIES.format(
+                        limit=F3_SOURCE_MAX_DIRECTORIES)
+                    break
+                listings[parent_key] = fork_inventory.list_directory(parent, root=root)
+                listed += 1
+            examined += 1
+            pending.append(fork_inventory.classify_leaf(record.source_path, listings[parent_key]))
+        # Clause (d2). The ONLY place a missing finding may become final, and the only place one
+        # is taken back. Never publish `pending` directly.
+        #
+        # F-7: and never settle it against the OPENING snapshot. `positively_observed` is a frozen
+        # field, so the root is observed again here -- after this root's listings and status reads,
+        # which is the window the end-of-pass promise is about. Only when there is something to
+        # finalise, so an unticked or empty pass costs nothing. A refused or differently-resolving
+        # re-observation is handed on as-is: `retract_subtree` then declines jurisdiction and
+        # every provisional finding publishes as UNKNOWN.
+        at_end = root
+        if pending:
+            try:
+                at_end = fork_inventory.probe_root(
+                    str(getattr(root, 'typed', '') or getattr(root, 'real', '')))
+            except Exception as exc:
+                at_end = fork_inventory.RootState(
+                    detail='the folder could not be observed again when the pass ended: '
+                           + str(exc))
+        finalised.extend(fork_inventory.retract_subtree(tuple(pending), at_end))
+    if bound:
+        notes.append(bound)
+    return (tuple(finalised), notes)
+
+
 def _f3_record_truth_line(inventory):
     """A3's truthfulness questions, as words: its four separate ones, plus the conservative
     publication verdict they feed.
@@ -9478,7 +9656,7 @@ def _f3_record_truth_line(inventory):
             + '; may be published as folder totals: ' + says(inventory.authoritative))
 
 
-def _f3_record_lines(local_cache, verified_roots):
+def _f3_record_lines(local_cache, verified_roots, inspect_sources=False):
     """The record half: ONE bounded pass over the proven-local cache folder, rendered by A5.
 
     Four of A3's optional observations are deliberately NOT requested, and each absence is stated
@@ -9547,14 +9725,41 @@ def _f3_record_lines(local_cache, verified_roots):
         lines.append('  ' + F3_RECORDS_CONTRACT_UNAVAILABLE + contract_problem)
     if not inventory.scope_assessed:
         lines.append('  ' + F3_RECORDS_SCOPE_UNASSESSED)
+
+    # [FORK] Digital-Union (R14-B S1): the source-state evidence, gathered only on an explicit
+    # second opt-in. `is not True` for the same fail-closed reason the record gate uses.
+    source_verdicts = ()
+    lines.append('')
+    lines.append(F3_SOURCES_HEADING)
+    if inspect_sources is not True:
+        lines.append('  ' + F3_SOURCES_OFF)
+    else:
+        try:
+            source_verdicts, source_notes = _f3_source_verdicts(
+                inventory.records, verified_roots)
+        except Exception as exc:
+            source_verdicts, source_notes = (), [F3_SOURCES_FAILED + str(exc)]
+        lines.append('  ' + F3_SOURCES_NOTE)
+        lines.append('  ' + F3_SOURCES_NOT_A_RECOMMENDATION)
+        for note in source_notes:
+            lines.append('  ' + note)
+
     lines.append('')
     # A5 owns every number. With no location and no category supplied it withholds the measured
     # and cost axes by itself, and the subject it establishes is A3's own folder rather than a
     # shared one -- which is why no A4 observation is bound in here: binding a SHARED selection
     # beside a LOCAL record inventory would be two populations in one report.
+    #
+    # [FORK] Digital-Union (R14-B S1): `source_verdicts` and `library_roots` are the hand-off.
+    # Both are EMPTY on every path that did not gather evidence, and an empty pair is measured
+    # byte-identical to the pre-R14-B single-argument call -- so the default read-out is
+    # unchanged, and this stays ONE `bind_observation` call site rather than two.
     lines.extend(fork_cache_report.report_lines(
         fork_cache_report.estimate_reclaimable(
-            fork_cache_report.bind_observation(inventory=inventory))))
+            fork_cache_report.bind_observation(
+                inventory=inventory,
+                source_verdicts=source_verdicts,
+                library_roots=verified_roots if source_verdicts else ()))))
     return lines
 
 
@@ -9582,12 +9787,17 @@ def _f3_location_lines():
     return lines
 
 
-def _f3_inventory_lines(root_text, inspect_records, local_cache):
+def _f3_inventory_lines(root_text, inspect_records, local_cache, inspect_sources=False):
     """The whole read-out, as lines.
 
     ``inspect_records is not True`` rather than a truthy test, and the direction is fail-closed
     for the same reason A6's opt-in gate is: a stray ``1`` or ``'false'`` arriving from anywhere
     must not enable a filesystem pass the operator did not ask for.
+
+    [FORK] Digital-Union (R14-B S1): ``inspect_sources`` is a SECOND, independent gate held to the
+    same identity test, and it is **subordinate** -- with records unread there is nothing for a
+    source state to be a fact about, so it reports that rather than going looking anyway. Ticking
+    it alone therefore cannot reach the filesystem at all.
     """
     observed = _f3_observed_at()
     lines = [LABEL_LIBRARY_INVENTORY, '']
@@ -9611,17 +9821,25 @@ def _f3_inventory_lines(root_text, inspect_records, local_cache):
     lines.append(F3_RECORDS_HEADING)
     if inspect_records is not True:
         lines.append('  ' + F3_RECORDS_OFF)
+        # [FORK] Digital-Union (R14-B S1): said HERE, because `_f3_record_lines` is the only
+        # place that renders the source heading and it never runs on this path. Without this the
+        # section would simply vanish when the record box is unticked, and a missing section
+        # reads as "nothing to report" rather than "the question was not put".
+        lines.append('')
+        lines.append(F3_SOURCES_HEADING)
+        lines.append('  ' + (F3_SOURCES_NEEDS_RECORDS if inspect_sources is True
+                             else F3_SOURCES_OFF))
     else:
-        lines.extend(_f3_record_lines(local_cache, roots))
+        lines.extend(_f3_record_lines(local_cache, roots, inspect_sources))
     lines.append('')
 
     lines.extend(_f3_location_lines())
     return lines
 
 
-def _on_library_inventory_click(root_text='', inspect_records=False):
-    """Build the local-only inventory. Both parameter defaults are the refusing ones, so a value
-    that never arrives cannot name a folder or enable a record pass.
+def _on_library_inventory_click(root_text='', inspect_records=False, inspect_sources=False):
+    """Build the local-only inventory. Every parameter default is the refusing one, so a value
+    that never arrives cannot name a folder, enable a record pass or enable a source pass.
 
     This handler writes exactly one widget, its own read-out box. It is not a render: it takes no
     render mutex, holds no lifecycle, joins no concurrency lane, touches no processing directory
@@ -9629,7 +9847,8 @@ def _on_library_inventory_click(root_text='', inspect_records=False):
     nothing, anywhere -- including no temporary file.
     """
     local_cache = os.path.join(get_input_dir(), A6_LOCAL_CACHE_DIRNAME)
-    return '\n'.join(_f3_inventory_lines(root_text, inspect_records, local_cache))
+    return '\n'.join(_f3_inventory_lines(root_text, inspect_records, local_cache,
+                                         inspect_sources))
 
 
 def _on_reset_folder_prefs():
@@ -13337,14 +13556,20 @@ def create_ui() -> gr.Blocks:
                         # so neither of that region's two widget bans reaches it. An accordion is
                         # count-pinned nowhere.
                         #
-                        # Four widgets and no fifth: a folder box, a default-off tick, a button
-                        # and a read-only read-out. No numeric field (a resource ceiling belongs
-                        # in a constant, not in the operator's hands, and an upper-bound keyword
-                        # would additionally be dragged into a region other suites slice raw
-                        # source around), no option group, no browse helper -- which would add a
-                        # process launch to a file whose launch sites are count-pinned -- and no
-                        # Delete / Clean / Migrate / Repair control, because there is nothing
-                        # here to confirm.
+                        # FIVE widgets and no sixth: a folder box, TWO default-off ticks, a
+                        # button and a read-only read-out. R14-B S1 raised this from four, and
+                        # the raise is the deliberate part: the second tick asks about a
+                        # different folder (the operator's media, not this installation's
+                        # records), so folding it into the first would have changed what an
+                        # already-shipped control does. Everything the original four excluded is
+                        # still excluded: no numeric field (a resource ceiling belongs in a
+                        # constant, not in the operator's hands, and an upper-bound keyword would
+                        # additionally be dragged into a region other suites slice raw source
+                        # around), no option group, no browse helper -- which would add a process
+                        # launch to a file whose launch sites are count-pinned -- and no Delete /
+                        # Clean / Migrate / Repair control, because there is still nothing here
+                        # to confirm: R14-B S1 added a PREVIEW, and a preview with no actuator is
+                        # how it stays one.
                         #
                         # IMPORTANT, and the reason this comment describes tokens instead of
                         # spelling them: several pinned regions elsewhere are sliced out of RAW
@@ -13366,6 +13591,16 @@ def create_ui() -> gr.Blocks:
                                 value=False,
                                 label=LABEL_LIBRARY_INVENTORY_RECORDS,
                                 elem_id='library-inventory-records',
+                            )
+                            # [FORK] Digital-Union (R14-B S1): the second DEFAULT-OFF tick. It is
+                            # a separate box rather than extra work behind the first because it
+                            # asks about a different folder -- the operator's media, not this
+                            # installation's records -- and because the first box's measured
+                            # behaviour must not change for anyone who ticks only it.
+                            library_inventory_sources = gr.Checkbox(
+                                value=False,
+                                label=LABEL_LIBRARY_INVENTORY_SOURCES,
+                                elem_id='library-inventory-sources',
                             )
                             library_inventory_btn = gr.Button(
                                 LABEL_LIBRARY_INVENTORY_BUILD,
@@ -14928,7 +15163,11 @@ def create_ui() -> gr.Blocks:
         # concurrency group leaves the event QUEUED rather than delivering or refusing it.
         library_inventory_btn.click(
             fn=_on_library_inventory_click,
-            inputs=[library_inventory_folder, library_inventory_records],
+            # [FORK] Digital-Union (R14-B S1): APPENDED last, so every pre-existing parameter
+            # keeps its index. Gradio passes these positionally, so the order here and
+            # `_on_library_inventory_click`'s parameter order are one contract.
+            inputs=[library_inventory_folder, library_inventory_records,
+                    library_inventory_sources],
             outputs=[library_inventory_box],
             show_progress='hidden',
             concurrency_limit=None,
