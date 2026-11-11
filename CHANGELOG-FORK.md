@@ -20,6 +20,69 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-11 (a failed upload retirement is no longer permission to delete)
+
+**A normal start deleted the operator's uploaded music and printed that it had kept it.** On
+2026-11-11, during an authorized deployment restart, `cleanup_on_startup` emitted its only line:
+
+```
+⚠️  Could not set aside the previous uploads, so they were left alone:
+    [WinError 5] Access is denied:
+    '…\input\gradio_uploads' -> '…\input\retired_uploads\20261111_212009'
+```
+
+and then hard-deleted a **114,522,906-byte** browser-uploaded MP3. No Recycle Bin trace;
+`input\retired_uploads` stayed empty, so nothing was retired. The loss was zero bytes only because
+a byte-identical original existed on another volume and had been SHA256-compared **before** the
+restart — a precaution, not a mechanism.
+
+**R8 protected the retirement's destination and left its source unprotected.** `protected_dirs`
+was `{audio, video, video_analysis_cache, retired_uploads}`; `gradio_uploads` was not in it, and
+the sweep immediately after the retirement is `shutil.rmtree(..., ignore_errors=True)` over
+everything else. So the failure path of the function that exists to *preserve* uploads was the
+only path on which the folder was still there to be deleted — and `ignore_errors=True` made it
+silent. The two halves of the bug were a bare `'gradio_uploads'` literal in two unrelated places:
+the retirement's source, and a protected set that never mentioned it.
+
+**The fix is one name and one set member.** `GRADIO_UPLOADS_DIR_NAME` is now a module constant
+beside `RETIRED_UPLOADS_DIR_NAME`, read by both the retirement and the sweep, and it is in
+`protected_dirs` **unconditionally**. Unconditional rather than only-on-failure is deliberate and
+costs nothing: a successful retirement has already renamed the folder away, so the name is simply
+not in `os.listdir(input_base)` when the sweep runs. There is no outcome to inspect, no value to
+thread back from the retirement, and therefore no way for the two to disagree. The recreation of
+the active uploads folder still runs on both paths.
+
+**What it is not:** no recovery path, no retry, no copy, no relocation, no new upload or cleanup
+coordinator, no fourth `os.rename`, and no new exception handling — the two `except` clauses are
+untouched, so an unexpected failure is still reported rather than swallowed. `processing/` and
+stray top-level files in `input/` are still swept, and the other four protected directories are
+unchanged. **The operating-system refusal behind the `WinError 5` was never identified and nothing
+here guesses at it** — an unexplained refusal is precisely the case that must not escalate into a
+deletion.
+
+**Why the existing tests did not catch it, which is the part worth keeping.** Two assertions
+covered this area and both stayed green through the incident:
+`test_the_upload_retirement_is_a_move_and_never_a_deletion` asserts no delete call is reachable
+*inside* `_retire_previous_uploads` — true then and true now, because the deletion was in the
+caller — and it asserts `cleanup_on_startup` mentions `RETIRED_UPLOADS_DIR_NAME`, i.e. that the
+*destination* is protected. Nothing asserted anything about the source surviving.
+
+`tests/test_upload_retirement.py` (new, 18 tests) therefore executes the **real** bodies of both
+functions against a synthetic `input/` tree with a shimmed `os`/`shutil`, injects the incident's
+own `OSError(EACCES, winerror=5)` on the rename, and inspects the bytes left on disk. On
+`143191933f32` eight of them fail, including the plain statement of the incident: *"the uploaded
+file was destroyed after the retirement failed"*, printed alongside the "left alone" message. It
+also pins the successful retirement (moved, not copied; no-replace on a name collision with the
+clock frozen), the unreadable-folder early return, three consecutive failed starts, a real
+Windows **junction** standing in for the uploads folder (its target must lose nothing), that
+`processing/` is still swept on both paths, that the sweep still contains both disposal calls so
+the protection cannot be a blanket skip, a mutation control proving the new protected entry is
+what saves the files, and a cross-module pin that the protected name is still the folder
+`paths.GRADIO_TEMP_DIR` actually sends uploads to.
+
+Touched: `src/gui.py` (one constant, one set member, two literals replaced by it, docstrings),
+`tests/test_upload_retirement.py` (new).
+
 ### Added — 2026-11-11 (R14-B S1: the read-only source-state preview)
 
 **R14-B's first increment is a hand-off, not an engine, and that is the whole point.** A5

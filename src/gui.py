@@ -7617,6 +7617,16 @@ def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
 RETIRED_UPLOADS_DIR_NAME = 'retired_uploads'
 RETIRED_UPLOADS_DIR = os.path.join(ROOT_DIR, 'input', RETIRED_UPLOADS_DIR_NAME)
 
+#: [FORK] Digital-Union (2026-11-11 upload-retirement hotfix): the live browser-upload folder,
+#: as ONE name that both the retirement and the startup sweep read.
+#:
+#: It was a bare `'gradio_uploads'` literal in two unrelated places, and that is the exact shape
+#: of the incident: :func:`_retire_previous_uploads` named it as the folder it *moves*, while
+#: `cleanup_on_startup`'s `protected_dirs` did not name it at all -- so a retirement that failed
+#: left the folder standing, and the sweep immediately after it deleted the uploads the
+#: retirement exists to preserve. One constant cannot drift from itself.
+GRADIO_UPLOADS_DIR_NAME = 'gradio_uploads'
+
 
 def _retire_previous_uploads(input_base: str) -> None:
     """Move the last session's `gradio_uploads` aside instead of deleting it.
@@ -7636,11 +7646,23 @@ def _retire_previous_uploads(input_base: str) -> None:
     it is, which is the safe direction: a session that reuses it writes alongside, and the next
     start tries again.
 
+    **That last paragraph was true of this function and false of the startup, which is the
+    2026-11-11 incident.** `cleanup_on_startup` sweeps `input/` immediately after calling this,
+    and :data:`GRADIO_UPLOADS_DIR_NAME` was absent from its `protected_dirs` -- so the one case
+    this function's failure path exists to protect was precisely the case where the folder was
+    still there to be deleted. A real `WinError 5` on the directory rename therefore printed "so
+    they were left alone" and then destroyed a 114,522,906-byte uploaded MP3. The protection now
+    lives in the caller's protected set, keyed on the same constant this function reads, and
+    `tests/test_upload_retirement.py` asserts the surviving bytes rather than this docstring.
+
+    The operating-system refusal behind that `WinError 5` was never identified, and nothing here
+    guesses at it: an unexplained refusal is exactly the case that must not escalate.
+
     The folder is bounded only by the operator's own clearing, which is a real trade: it grows one
     subdirectory per start that had uploads. That is why it is a first-class Cache Management
     category with its size on screen, rather than something that silently accumulates.
     """
-    uploads = os.path.join(input_base, 'gradio_uploads')
+    uploads = os.path.join(input_base, GRADIO_UPLOADS_DIR_NAME)
     try:
         if not os.path.isdir(uploads) or not os.listdir(uploads):
             return                                   # nothing uploaded last time: nothing to keep
@@ -7674,9 +7696,29 @@ def cleanup_on_startup():
     behaviour one run later. Everything else about this function is unchanged: `processing/` is
     genuinely disposable scratch from a finished render and is still removed, and `audio`,
     `video` and the Stage-5 analysis cache are still protected.
+
+    [FORK] Digital-Union (2026-11-11 upload-retirement hotfix): and
+    :data:`GRADIO_UPLOADS_DIR_NAME` joins it too, **unconditionally**.
+
+    R8 protected the retirement's *destination* and left its *source* unprotected, so the sweep
+    below treated a failed retirement as permission to delete the very files the retirement
+    exists to keep. A real `WinError 5` on the directory rename printed "so they were left alone"
+    and then deleted a 114,522,906-byte uploaded MP3. **A retirement that did not happen is not
+    authorisation to delete anything.**
+
+    Protecting it unconditionally rather than only on the failure path is deliberate and costs
+    nothing: a successful retirement has already renamed the folder away, so the name is simply
+    not in `os.listdir(input_base)` by the time the sweep runs. There is no outcome to inspect, no
+    value to thread back from the retirement, and so no way for the two to disagree. The
+    recreation below still runs on both paths, so an active uploads folder always exists.
+
+    What this deliberately does NOT do: recover, retry, copy or relocate anything. The folder is
+    simply left where it is for the next start to try again, which is what
+    :func:`_retire_previous_uploads` already promised.
     """
     input_base = get_input_dir()
-    protected_dirs = {'audio', 'video', 'video_analysis_cache', RETIRED_UPLOADS_DIR_NAME}
+    protected_dirs = {'audio', 'video', 'video_analysis_cache', RETIRED_UPLOADS_DIR_NAME,
+                      GRADIO_UPLOADS_DIR_NAME}
 
     try:
         os.makedirs(get_audio_input_dir(), exist_ok=True)
@@ -7701,8 +7743,9 @@ def cleanup_on_startup():
                 except Exception as e:
                     print(f"   ⚠️  Could not clean {item}: {e}")
 
-        # Recreate runtime temp upload folder after cleanup.
-        os.makedirs(os.path.join(input_base, 'gradio_uploads'), exist_ok=True)
+        # Recreate runtime temp upload folder after cleanup. Still unconditional, and still
+        # `exist_ok=True`: on the protected path the folder is already there and this is a no-op.
+        os.makedirs(os.path.join(input_base, GRADIO_UPLOADS_DIR_NAME), exist_ok=True)
 
     except Exception as e:
         print(f"   ⚠️  Warning during startup cleanup: {e}")
