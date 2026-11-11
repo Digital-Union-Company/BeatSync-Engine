@@ -20,6 +20,74 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-11 (R14-B S2: twenty confirmed-missing paths, so the figure can be checked)
+
+**S1's count was believable and unverifiable, which is the same thing as unusable.** The owner's
+first real run of the source-state preview — `J:\New folder\Cuts`, 5,741 media files,
+122,334,222,752 bytes, 1,546 duplicate basenames (names, *not* verified content duplicates), the
+record pass stopping on its 2,000-record ceiling — reported *"at least 50 records with
+confirmed-missing source paths"*, alongside 42 records with no matching source verdict, 8
+unresolved, at least 734 out of scope and at least 587 from another cache-contract generation.
+Every one of those is a floor, deliberately. None of them can be checked by hand, so none of them
+can be trusted enough to act on later.
+
+S2 prints up to **twenty** of those paths in the same read-out. That is the whole feature.
+
+**It is display only, and the absences are the design.** The population is the finalised verdict
+tuple S1 already produced; the admission test is A1's own `library_inventory.confirmed_missing`,
+which reads `LeafVerdict.published` — so `MISSING_PROVISIONAL`, a non-final `MISSING_CONFIRMED`,
+`UNKNOWN`, `ACCESS_DENIED`, `ROOT_UNREACHABLE`, `NOT_INSPECTED` and `PRESENT` are all excluded by
+**that function** rather than by a second rule written in `gui.py`. Out-of-scope paths cannot reach
+the renderer at all, because only `SCOPE_IN` records were ever probed — which is why it contains no
+containment test to get wrong. No new classification, **no new filesystem call, no second record
+read, no new widget, no new event, no raised ceiling**, and nothing written anywhere.
+
+**Paths, not records.** Several records may name one source — the owner's library has 1,546
+duplicate basenames, so this is not hypothetical — so the sample deduplicates on `normcase` and
+reports a count of *distinct paths*, stating in the same sentence that this is **not** the record
+figure A5 reports below and that the two are not interchangeable. Measured live on a synthetic
+library: `25 DISTINCT source paths … (from 27 confirmed-missing verdicts)`, with A5 independently
+reporting `at least 27 records (lower_bound)`. **A5 remains the only authority for every aggregate,
+exactness label and lower bound**, and a test asserts its report block is *byte-identical* with the
+sample removed — if it were not, the display would be feeding the engine instead of reading it.
+
+**Bounded, deterministic, and labelled as a sample.** `F3_SAMPLE_MAX_PATHS = 20`; the remainder is
+named (`BOUNDED SAMPLE: 5 further distinct paths are not listed … never a complete list`). Ordering
+is by the normalised path, so the same pass shows the same twenty whatever order the records
+happened to be read in — pinned by feeding the renderer a reversed verdict tuple and requiring
+identical output.
+
+**Untrusted record text cannot corrupt the read-out.** `video_file` comes out of a JSON file this
+application has no guarantee of having written, so every line goes through
+`ffmpeg_diagnostics.bound` — the existing, tested helper that collapses control characters and
+whitespace and truncates with an ellipsis — rather than a new escaper. A line that came back
+changed is **marked**, because a real Windows path contains no control character: a rewritten line
+means the record holds something unexpected and the text is not safe to use as a path. The residual
+is stated rather than overclaimed: with the control characters gone the injected text is inert, but
+it is still text and can still *read* like a heading — it simply cannot start a line, since every
+sample path is indented and no newline survives.
+
+**And it still refuses to authorise anything:** *"A missing source path does NOT authorize deletion
+of its cache record."* The file may have been renamed or moved rather than deleted, more than one
+installation may use these records, and nothing in the panel distinguishes those cases. There is
+still no delete, clean, migrate or repair control, and the sample is not an instruction to build
+one.
+
+`tests/test_library_missing_sample.py` (new, 32 tests) covers: several records naming one source;
+the twenty-path cap with the remainder named; order independence from verdict order; out-of-scope
+exclusion (asserted over the filesystem spy's calls, not just the text); every non-qualifying
+verdict kind including disconnected and inaccessible storage; mid-pass root disappearance, where
+S1's end-of-pass check retracts the findings and the sample must print nothing; both default-off
+gates, where no path text appears at all; A5's block byte-identical with the sample stripped out;
+nothing written on any gate combination; and the renderer naming no filesystem function. Two
+negative controls keep it honest — removing the sample makes the path assertions fail, and
+bypassing `confirmed_missing` makes a provisional path appear.
+
+Touched: `src/gui.py` (one new `_f3_*` renderer, eleven constants, one guarded call site),
+`tests/test_library_missing_sample.py` (new), `tests/test_library_inventory_panel.py` (the renderer
+registered in `F3_FUNCTIONS`, so every structural ban in that suite covers it — the reverse pin
+added in S1 requires this), `ROADMAP.md`.
+
 ### Fixed — 2026-11-11 (a failed upload retirement is no longer permission to delete)
 
 **A normal start deleted the operator's uploaded music and printed that it had kept it.** On
