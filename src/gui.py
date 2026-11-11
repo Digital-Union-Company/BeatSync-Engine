@@ -8259,7 +8259,7 @@ def _folder_prefs_status(headline: str) -> str:
 # BESIDE the poster cache and are why the poster subdirectory is named rather than its parent).
 # =============================================================================================
 
-def _analysis_cache_location():
+def _analysis_cache_location(*, make_dirs=None):
     """[FORK] Digital-Union (FUN Shared Analysis Cache): the resolved Stage-5 cache location.
 
     One resolver for the whole GUI, and it is the **same** one Stage 5 itself uses —
@@ -8270,14 +8270,44 @@ def _analysis_cache_location():
 
     Total: anything that goes wrong resolving the configuration falls back to this installation's
     own local folder, which is the pre-feature behaviour.
+
+    [FORK] Digital-Union (R14-R1): ``make_dirs`` is forwarded to that one resolver and nothing
+    else. `None` is the unchanged real `os.makedirs`, so every caller that does not ask for
+    anything behaves exactly as before; `_analysis_cache_location_readonly` below is the opt-in.
     """
     local = os.path.join(get_input_dir(), 'video_analysis_cache')
     try:
         from video_analysis import resolve_cache_location
-        return resolve_cache_location(local)
+        return resolve_cache_location(local, make_dirs=make_dirs)
     except Exception:
         return fork_analysis_cache.CacheLocation(
             path=local, source=fork_analysis_cache.SOURCE_LOCAL)
+
+
+def _analysis_cache_location_readonly():
+    """[FORK] Digital-Union (R14-R1): resolve the cache location WITHOUT creating anything.
+
+    The defect this closes: `analysis_cache.resolve_location` creates the configured folder when
+    its parent exists — correct for an analysis, wrong for a read-out — and the Cache Management
+    category list is built at **UI construction time** to name a shared folder in its description.
+    So merely launching the app materialised a configured shared analysis-cache folder, before the
+    operator had started an analysis or pressed any Cache Management button. Reproduced on
+    `2b414ae7`: imports alone created nothing; `_analysis_category_explanation()` and
+    `create_ui()` each created the folder.
+
+    It is the SAME resolver with a refusing `make_dirs`, not a second one, and the refusal is
+    `library_cache_location.RefuseDirectoryCreation` — the mechanism R14-A stage A4 already injects
+    for exactly this reason, reused rather than re-implemented. The instance is per call because it
+    *remembers being asked*; sharing one would accumulate attempts across unrelated read-outs.
+
+    **Presence must never be read off this result.** A refused creation still returns
+    `available=True` and the configured path, which answers "where would the next analysis write?"
+    and not "does that folder exist?". Both callers below render from an independent measurement
+    (`cache_admin.measure` / `analysis_cache.measure`), each of which reports an absent folder as
+    absent — `nothing cached yet` and `This folder does not exist yet` respectively — so no
+    read-out here can report a missing folder as present, empty or usable.
+    """
+    return _analysis_cache_location(make_dirs=fork_cache_location.RefuseDirectoryCreation())
 
 
 def _cache_categories() -> list:
@@ -8298,8 +8328,16 @@ def _cache_categories() -> list:
     Containment is unchanged and still `cache_admin`'s: it proves by `realpath` + `commonpath`
     that nothing outside the directory it is handed is touched. Handing it a different directory
     does not weaken that — it is still exactly one named root, never a discovered one.
+
+    [FORK] Digital-Union (R14-R1): the resolution is **read-only**. This function builds the
+    category *list* — it is reached by the construction-time description, by Inspect and by Clear,
+    and not one of those three needs a directory created: `cache_admin.measure` reports a missing
+    root as `nothing cached yet`, and `cache_admin.clear` treats one as "nothing to do, and that is
+    not a failure". Resolving read-only here is also what keeps Inspect and Clear from disagreeing
+    — if only one of them refused creation, the first click would materialise the folder the other
+    had just reported absent.
     """
-    location = _analysis_cache_location()
+    location = _analysis_cache_location_readonly()
     analysis_info = (
         INFO_CACHE_ANALYSIS_SHARED.format(path=location.path) if location.shared
         else INFO_CACHE_ANALYSIS)
@@ -8331,8 +8369,11 @@ def _analysis_cache_notes() -> list:
     on the machine -- including the production install the operator is not currently looking at.
     An unreachable shared folder is reported too, for the same reason Stage 5 reports it: an
     operator about to clear a cache should know they are looking at the fallback.
+
+    [FORK] Digital-Union (R14-R1): read-only resolution, for the same reason as `_cache_categories`
+    — these are the lines a read-out prints, and printing them must not create a folder.
     """
-    location = _analysis_cache_location()
+    location = _analysis_cache_location_readonly()
     notes = []
     if location.shared:
         notes.extend(['', INFO_CACHE_ANALYSIS_SHARED.format(path=location.path)])
@@ -8455,8 +8496,14 @@ def _shared_cache_report(location) -> str:
 
 
 def _on_inspect_shared_cache():
-    """Measure the resolved cache folder. Reads only — creates nothing, deletes nothing."""
-    return _shared_cache_report(_analysis_cache_location())
+    """Measure the resolved cache folder. Reads only — creates nothing, deletes nothing.
+
+    [FORK] Digital-Union (R14-R1): that sentence is now true. The resolution is read-only, so
+    Check no longer creates the folder it is about to describe; a configured folder that does not
+    exist yet renders through the existing `STATUS_SHARED_CACHE_MISSING` wording, which already
+    says it is created the first time an analysis runs.
+    """
+    return _shared_cache_report(_analysis_cache_location_readonly())
 
 
 def _on_save_shared_cache(folder, enabled):

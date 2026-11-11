@@ -728,14 +728,30 @@ def test_f_the_worker_artifacts_stay_in_the_local_folder():
 
 def test_f_the_gui_reaches_the_same_resolver():
     """A Settings panel that computed the location independently could show one folder while the
-    renderer used another — the most misleading thing this feature could do."""
+    renderer used another — the most misleading thing this feature could do.
+
+    **R14-R1 repair.** This used to require the literal text `_analysis_cache_location()` in
+    `_cache_categories`, which R14-R1 changed to `_analysis_cache_location_readonly()` so that
+    building the category list stops creating the configured folder. The *intent* — one resolver,
+    reached rather than re-derived — is unchanged and is now asserted structurally instead of by
+    one exact call string: the category resolution must route through `_analysis_cache_location`,
+    and the read-only wrapper must itself delegate to it rather than resolving for itself. That is
+    a stronger statement than the string was, not a relaxation of it.
+    """
     body = _body(_GUI, "_analysis_cache_location")
     assert "resolve_cache_location" in body
     # and the clearable-cache category now points at the resolved folder, so Inspect and Clear
     # act on what is really in use
     categories = _body(_GUI, "_cache_categories")
-    assert "_analysis_cache_location()" in categories
+    assert "_analysis_cache_location" in categories, (
+        "the category list must reach the one GUI resolver")
+    assert "resolve_location" not in categories and "load_config" not in categories, (
+        "the category list must not resolve or read configuration for itself")
     assert "location.path" in categories
+    readonly = _body(_GUI, "_analysis_cache_location_readonly")
+    assert "_analysis_cache_location(make_dirs=" in readonly, (
+        "the read-only wrapper must delegate to the one GUI resolver, not become a second one")
+    assert "resolve_location" not in readonly and "config_path" not in readonly
 
 
 def test_f_clearing_a_shared_cache_warns_that_it_is_shared():

@@ -110,6 +110,44 @@ the specific outcome the owner asked to be *told* about. The notice names the co
 the local fallback, and says what the fallback costs ("sources analysed before will be analysed
 again"). A permission failure is reported with its reason rather than swallowed.
 
+### Resolving is not creating, and a read-out may only resolve (R14-R1)
+
+The creation above is correct for an analysis and wrong for a description of one. It was welded to
+resolution, so **building the Gradio interface created the configured folder** — the Cache
+Management category list is constructed at UI-construction time precisely so a shared folder can be
+*named* in its description, and resolving it to describe it also made it. Nothing had to be clicked.
+Reproduced on `2b414ae7`: imports created nothing; `_analysis_category_explanation()` and
+`create_ui()` each created the folder.
+
+```
+resolve_cache_location(local, make_dirs=None)      -> the real os.makedirs. UNCHANGED. Stage 5.
+resolve_cache_location(local, make_dirs=refusal)   -> resolves, creates nothing. Every read-out.
+```
+
+`make_dirs` is forwarded verbatim and `None` means *unchanged*, so it is not a second policy. There
+is still exactly **one** resolver — a caller computing the location itself could show one folder
+while Stage 5 wrote to another. The refusal is `library_cache_location.RefuseDirectoryCreation`,
+A4's existing mechanism, reused rather than re-implemented, and constructed **per call** because it
+remembers being asked.
+
+`gui._analysis_cache_location_readonly()` is the one opt-in. It serves `_cache_categories`,
+`_analysis_cache_notes` and `_on_inspect_shared_cache` — and therefore the construction-time
+description, Inspect and Clear. **Move `_cache_categories` as a unit or not at all**: if only one of
+Inspect and Clear refused creation, the first click would materialise the folder the other had just
+reported absent. `_on_save_shared_cache` and `_on_import_analysis_cache` deliberately keep the
+creating resolver (Save is the operator configuring the folder; Import needs a destination), pinned
+by test.
+
+**Never read presence off a refused resolution.** It still answers `available=True` with the
+configured `path` — correct for *"where would the next analysis write?"*, wrong for *"does it exist
+now?"*. Both read-outs therefore render from an independent measurement, and the pre-existing
+wording already reports absence truthfully: `nothing cached yet` (`cache_admin.report_lines`) and
+`This folder does not exist yet. It is created the first time an analysis runs.`
+(`STATUS_SHARED_CACHE_MISSING`). R14-R1 added and changed **no** operator-visible string, and the
+shared-cache warning is byte-identical. `tests/test_cache_creation_side_effect.py` asserts
+filesystem state with a `mkdir` spy on `os` itself, and its negative control is proven
+byte-identical on executable statements to the committed pre-fix source.
+
 ## Record recognition is by shape, never by exclusion
 
 A record filename is `{8 hex}_{24 hex}.json` — two truncated lowercase SHA-1 digests from
@@ -222,7 +260,8 @@ shared_cache_status      the ONLY output of all three handlers
 
 ### Cache Management now acts on the resolved folder, and warns when it is shared
 
-`_cache_categories()` points the analysis category at `_analysis_cache_location().path`, so Inspect
+`_cache_categories()` points the analysis category at the resolved path — since R14-R1 via
+`_analysis_cache_location_readonly()`, so building the list creates nothing — so Inspect
 reports what is really in use and Clear acts on it. When a shared folder is in force the category's
 description is replaced by `INFO_CACHE_ANALYSIS_SHARED`, which **names the folder and says other
 installations read it** — clearing a local cache costs one installation some re-analysis; clearing a
