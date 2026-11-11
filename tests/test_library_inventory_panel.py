@@ -91,17 +91,22 @@ SHARED_KEYS_FN = "_f3_shared_folder_keys"
 LOCATION_FN = "_f3_location_lines"
 TRUTH_FN = "_f3_record_truth_line"
 CLOCK_FN = "_f3_observed_at"
+#: R14-B S1: the source-state evidence gatherer. Registered here, which is what subjects it to
+#: every structural ban below — see `test_i10`, which now pins the tuple in BOTH directions.
+SOURCES_FN = "_f3_source_verdicts"
 
 BUTTON = "library_inventory_btn"
 FOLDER_BOX = "library_inventory_folder"
 RECORDS_BOX = "library_inventory_records"
+#: R14-B S1: the second default-off tick, appended last everywhere it appears.
+SOURCES_BOX = "library_inventory_sources"
 REPORT_BOX = "library_inventory_box"
 
 #: The whole F-3 call graph, in one place, because every structural ban below is only as wide as
 #: this tuple. `test_s7` pins the tuple itself against `gui.py`, so a new `_f3_*` function cannot
 #: be added to the panel without either entering these bans or failing that test.
 F3_FUNCTIONS = (HANDLER, LINES_FN, MEDIA_FN, RECORD_FN, IDENTITY_FN, SHARED_KEYS_FN, LOCATION_FN,
-                TRUTH_FN, CLOCK_FN)
+                TRUTH_FN, CLOCK_FN, SOURCES_FN)
 
 #: The three PURE A6 helpers this panel is permitted to read, and the only three. All touch no
 #: disk. Sharing them is the "one parser, not two that can disagree" argument A4 and A6 make; a
@@ -1744,7 +1749,11 @@ def test_g7_no_a4_observation_is_bound_beside_a_local_record_inventory():
     sites = _call_sites("bind_observation")
     assert len(sites) == 1, f"{len(sites)} bind_observation call sites"
     kw = _kwargs(sites[0])
-    assert set(kw) == {"inventory"}, kw
+    # R14-B S1 added the two LOCAL-evidence keywords and nothing else. The ban list below is the
+    # actual subject of this test and is unchanged: what must never be bound here is A4's SHARED
+    # selection. `source_verdicts` and `library_roots` describe the operator's own media folder,
+    # which is the same population the inventory already describes, not a second one.
+    assert set(kw) == {"inventory", "source_verdicts", "library_roots"}, kw
     bodies = _f3_bodies()
     for forbidden in ("inspect_location", "fork_cache_location", "CacheLocationReport",
                       "flat_measurement", "categories="):
@@ -1828,10 +1837,12 @@ def _panel_with() -> ast.With:
     raise AssertionError("the F-3 accordion was not found in gui.py")
 
 
-def test_i1_the_registration_is_two_inputs_and_exactly_one_output():
+def test_i1_the_registration_is_three_inputs_and_exactly_one_output():
+    """R14-B S1 appended one input. The OUTPUT count is the load-bearing half and is unchanged:
+    this handler still writes exactly its own read-out box and nothing else."""
     call = _click(BUTTON)
     kw = {k.arg: k.value for k in call.keywords}
-    assert [ast.unparse(e) for e in kw["inputs"].elts] == [FOLDER_BOX, RECORDS_BOX]
+    assert [ast.unparse(e) for e in kw["inputs"].elts] == [FOLDER_BOX, RECORDS_BOX, SOURCES_BOX]
     assert [ast.unparse(e) for e in kw["outputs"].elts] == [REPORT_BOX]
     assert ast.unparse(kw["fn"]) == HANDLER
     assert ast.unparse(kw["concurrency_limit"]) == "None"
@@ -1845,8 +1856,8 @@ def test_i2_the_inputs_list_matches_the_handler_parameter_order():
     params = [a.arg for a in _func(HANDLER).args.args]
     inputs = [ast.unparse(e) for e in
               {k.arg: k.value for k in _click(BUTTON).keywords}["inputs"].elts]
-    assert params == ["root_text", "inspect_records"], params
-    assert inputs == [FOLDER_BOX, RECORDS_BOX], inputs
+    assert params == ["root_text", "inspect_records", "inspect_sources"], params
+    assert inputs == [FOLDER_BOX, RECORDS_BOX, SOURCES_BOX], inputs
 
 
 def test_i3_the_panel_writes_no_existing_widget_and_joins_no_gate_collection():
@@ -1898,11 +1909,18 @@ def test_i5_the_panel_adds_no_subprocess_and_no_javascript_installer():
         assert forbidden not in code
 
 
-def test_i6_the_four_widgets_are_the_whole_panel():
+def test_i6_the_five_widgets_are_the_whole_panel():
+    """R14-B S1 raised the checkbox count from one to two, and nothing else moved.
+
+    The pin is kept EXACT rather than relaxed to ">= 1": its job is to catch widget creep, and a
+    lower bound would catch none. The second checkbox is the R14-B source-state opt-in; see
+    `test_s*` for the behaviour that justifies it. Every other count, and every banned widget
+    type, is unchanged from F-3.
+    """
     panel = _panel_with()
     calls = [ast.unparse(n.func) for n in ast.walk(panel) if isinstance(n, ast.Call)]
     assert calls.count("gr.Accordion") == 1, calls
-    assert calls.count("gr.Checkbox") == 1, calls
+    assert calls.count("gr.Checkbox") == 2, calls
     assert calls.count("gr.Button") == 1, calls
     assert calls.count("gr.Textbox") == 2, calls
     for forbidden in ("gr.Radio", "gr.Slider", "gr.Number", "gr.DownloadButton", "gr.File",
@@ -1910,7 +1928,7 @@ def test_i6_the_four_widgets_are_the_whole_panel():
         assert forbidden not in calls, f"{forbidden} appeared inside the F-3 panel"
     assigned = {t.id for n in ast.walk(panel) if isinstance(n, ast.Assign)
                 for t in n.targets if isinstance(t, ast.Name)}
-    assert assigned == {FOLDER_BOX, RECORDS_BOX, BUTTON, REPORT_BOX}, assigned
+    assert assigned == {FOLDER_BOX, RECORDS_BOX, SOURCES_BOX, BUTTON, REPORT_BOX}, assigned
     rendered = ast.unparse(panel)
     for word in ("delete", "clean", "migrate", "rename", "repair", "clear", "sweep"):
         assert word not in rendered.lower(), f"the F-3 panel names a mutating action: {word}"
@@ -1976,6 +1994,13 @@ def test_i10_no_f3_helper_carries_the_a6_prefix():
     for name in F3_FUNCTIONS:
         assert name in declared, name
         assert not name.startswith("_a6_"), name
+    # R14-B S1 closed a measured blind spot: the tuple was pinned in ONE direction only, so a new
+    # `_f3_*` helper could be added to `gui.py` and silently sit outside every structural ban in
+    # this suite — the bans are only ever as wide as `F3_FUNCTIONS`. `_f3_source_verdicts` was
+    # written and the whole suite stayed green before it was registered. Pin both directions.
+    assert {n for n in declared if n.startswith("_f3_")} == set(F3_FUNCTIONS) - {HANDLER}, (
+        "a `_f3_`-prefixed function exists in gui.py that F3_FUNCTIONS does not name, so the "
+        "structural bans in this suite do not cover it")
     assert {n for n in declared if n.startswith("_a6_")} == set(A6_SHARED_HELPERS) | {
         A6_MARK_FN, "_a6_cache_report_lines", "_a6_state_sentence", "_a6_uninspected_lines"}, (
         "the set of _a6_ functions changed; A6's own tuple pin needs re-reading")

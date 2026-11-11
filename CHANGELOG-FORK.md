@@ -20,6 +20,98 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-11 (R14-B S1: the read-only source-state preview)
+
+**R14-B's first increment is a hand-off, not an engine, and that is the whole point.** A5
+(`library_cache_report`) has accepted `source_verdicts` and `library_roots` since it was written,
+and its source axis joins on `library_inventory.LeafVerdict.published == MISSING_CONFIRMED`. F-3
+supplied neither, so that axis answered
+
+```
+D source confirmed missing: not assessed -- no finalised source verdict was supplied,
+                            so nothing is known about any source file
+```
+
+on **every** run. There was therefore no preview of possible cleanup anywhere in the application:
+not a withheld one, not a partial one — the question was never put. This increment puts it, by
+gathering the evidence A5 was already waiting for. It adds no second measurement, no second
+classifier, no cleanup engine and no actuator, and it does not duplicate Cache Management, whose
+Inspect button measures *this application's own caches* and answers a different question.
+
+**One new widget: a second default-off tick.** The panel is now five widgets and no sixth — a
+folder box, **two** default-off ticks, one Build button and one read-only read-out. Raising it
+from four was deliberate: reading this installation's own records and going out to look for the
+operator's media are questions about two different folders, so folding the second into the first
+would have changed what an already-shipped control does for anyone who ticks only it. The new tick
+is **subordinate** — source state is a question *about* records — and ticking it alone reaches no
+filesystem at all, reporting that no record was read instead of going looking anyway.
+
+**Four properties carry the safety, and none of them is new code.**
+
+- **`SCOPE_IN` only.** A3 already decided which records name a source inside a root A1 positively
+  observed, so the new helper reuses that verdict rather than writing a second containment test.
+  A record whose source lies elsewhere is **never probed**, which is what keeps the pass inside
+  the folder the operator typed and means a library nobody selected is never discovered. The
+  record on a disconnected drive — the case R14-B names explicitly — stays `scope_out` and is
+  reported as *"describes a source outside the folders inspected"*, never as an orphan. A test
+  asserts its path reaches no filesystem call at all.
+- **A missing finding cannot escape unfinalised.** `classify_leaf` answers `MISSING_PROVISIONAL`
+  and `LeafVerdict.published` renders that as `UNKNOWN`; only `retract_subtree` settles clause
+  (d2). That same call is the **mid-pass-disconnect guard**: if the library root went away during
+  the pass, every provisional *and* every already-confirmed finding is taken back to `UNKNOWN`
+  rather than leaving a subtree of confirmed deletions behind. The helper returns the finalised
+  tuple and never `pending`, pinned structurally.
+- **Bounded, and a reached bound is named.** `F3_SOURCE_MAX_RECORDS = 2000` and
+  `F3_SOURCE_MAX_DIRECTORIES = 500`, as module constants rather than widget values — the same rule
+  the record bounds follow, so no resource ceiling is in the operator's hands. They charge work
+  **attempted**. Records beyond a bound are reported with their source state *unestablished*, never
+  as present.
+- **It decides nothing.** Every figure, exactness label and withholding below the heading is still
+  A5's. On the measured fixture A5 publishes `source confirmed missing: at least 1 records
+  (lower_bound)` with its own population breakdown, its own `limitation: 1 eligible records had no
+  supplied source verdict`, and its own floor note — and it still prints *"No reclaimable-space
+  figure is offered, and nothing here is a recommendation to remove any file."* **No byte total is
+  produced by this increment**, because A5 refuses one at that exactness, and no invented total
+  replaces it.
+
+**The default path is measurably unchanged.** `bind_observation` keeps exactly **one** call site;
+it gained two keyword arguments whose values are empty tuples on every path that gathered no
+evidence, and `bind_observation(inventory=i)`, `bind_observation(inventory=i, source_verdicts=(),
+library_roots=())` and `bind_observation(inventory=i, source_verdicts=(), library_roots=(root,))`
+were measured to produce **byte-identical** report lines. So an operator who never ticks the new
+box sees what they saw before.
+
+**A measured blind spot in the F-3 test contract was closed on the way through.**
+`test_i10` pinned `F3_FUNCTIONS ⊆ gui.py`'s declared functions but **not** the reverse — and every
+structural ban in that suite (no subprocess, no shared-cache contact, no mutating vocabulary, the
+`bind_observation` call-site count) is only ever as wide as that tuple. `_f3_source_verdicts` was
+written, and the entire 106-test suite stayed green, **before** it was registered: the new helper
+sat outside every ban and nothing said so. The tuple is now pinned in both directions, so the next
+`_f3_*` helper cannot repeat it. This is the same class of defect as F-3's own N-1 and N-2
+findings, and it is recorded rather than quietly fixed.
+
+**What this still does not claim.** A record whose source is gone is **not** a record the read-out
+says may be deleted: the source may have been renamed or moved, more than one installation may use
+these records, and nothing here distinguishes those from a deletion — the read-out says exactly
+that, next to the figure. No deletion, quarantine, rename, move or migration is offered or
+performed. The **R-1 creation hazard is untouched and unexpanded**: it lives in `create_ui()` →
+`_resolved_cache_location()` → `video_analysis.resolve_cache_location`, which creates a configured
+shared-cache folder at UI build time; this increment calls no resolver, and both R14-A panels
+continue to report `configured_not_created` and *"this report created nothing"*. The alias
+limitation on the record half, and the still-outstanding third location fact
+(`THIRD_LOCATION_FACT_NOT_DELIVERED`), are unchanged.
+
+Touched: `src/gui.py` (one new `_f3_*` helper, nine new constants, one new checkbox, one appended
+registration input, two signatures, one block comment), `tests/test_library_source_preview.py`
+(new, 31 tests), `tests/test_library_inventory_panel.py` (four pinned counts updated, the tuple
+pinned in both directions), `tests/test_gradio_runtime_compat.py` (the fifth elem id and the third
+input).
+
+**Verification status, stated rather than implied.** The 31 new tests, the 106-test F-3 suite and
+the opt-in real-Gradio build all pass, and the panel was driven in a real browser against a
+task-owned server on synthetic fixtures. That is **not** owner acceptance, and no real library or
+production cache was inspected at any point.
+
 ### Fixed — 2026-11-10 (final assembly no longer dies on a constant: FUN R11 Assembly Budget)
 
 **A 1h59m render was discarded 81 seconds from completion.** Final assembly ran under a
