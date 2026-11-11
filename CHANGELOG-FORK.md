@@ -60,7 +60,9 @@ filesystem at all, reporting that no record was read instead of going looking an
   (d2). That same call is the **mid-pass-disconnect guard**: if the library root went away during
   the pass, every provisional *and* every already-confirmed finding is taken back to `UNKNOWN`
   rather than leaving a subtree of confirmed deletions behind. The helper returns the finalised
-  tuple and never `pending`, pinned structurally.
+  tuple and never `pending`, pinned structurally — **and it settles clause (d2) against an
+  observation taken after the evidence**, which is the correction described under *Fixed on
+  independent review* below.
 - **Bounded, and a reached bound is named.** `F3_SOURCE_MAX_RECORDS = 2000` and
   `F3_SOURCE_MAX_DIRECTORIES = 500`, as module constants rather than widget values — the same rule
   the record bounds follow, so no resource ceiling is in the operator's hands. They charge work
@@ -101,16 +103,43 @@ continue to report `configured_not_created` and *"this report created nothing"*.
 limitation on the record half, and the still-outstanding third location fact
 (`THIRD_LOCATION_FACT_NOT_DELIVERED`), are unchanged.
 
+**Fixed on independent review — F-7: clause (d2) was settled on a stale observation.** The first
+published version of this increment handed `retract_subtree` the `RootState` that
+`inspect_library` had probed *before* any record was read. `RootState.positively_observed` is a
+frozen field, not a live probe, so that established only that the library folder was there when the
+read-out **started** — while `F3_SOURCES_NOTE` told the operator, in words, that a confirmed-missing
+finding "additionally requires the library root to have still been reachable when the pass ENDED".
+`test_s10` had pinned the *call* to `retract_subtree` and said so explicitly ("the behavioural case
+needs a disk that disappears"), which is exactly the assurance the call alone does not give: the
+guard is only as fresh as the state it is handed. Reproduced by substituting A1's own
+`probe_root` answer for any observation taken after the first listing — the read-out went on
+publishing `source confirmed missing: at least 1 records` with the root unreachable. Each root with
+findings is now observed **once more** when its own sub-pass finishes, and clause (d2) is settled
+against that. A re-observation that cannot be taken, or that no longer resolves to the same
+location, is handed on as-is: `retract_subtree` then declines jurisdiction and every provisional
+finding publishes as `UNKNOWN` — the fail-closed direction. Cost is one directory listing of the
+root per pass, only when there is something to finalise. Pinned by `test_s20` (the observation
+happens after the listings, and exactly once per root, so it cannot become a per-record probe) and
+`test_s21` (both `ROOT_UNREACHABLE` and a plain hold retract the finding, because
+`positively_observed` wants a positive verdict and not merely a reachable anchor — A1's own F-2).
+**No other behaviour changed**: with the root genuinely present the figures are identical, and the
+unticked read-out is byte-for-byte what it was.
+
 Touched: `src/gui.py` (one new `_f3_*` helper, nine new constants, one new checkbox, one appended
 registration input, two signatures, one block comment), `tests/test_library_source_preview.py`
-(new, 31 tests), `tests/test_library_inventory_panel.py` (four pinned counts updated, the tuple
+(new, 35 tests), `tests/test_library_inventory_panel.py` (four pinned counts updated, the tuple
 pinned in both directions), `tests/test_gradio_runtime_compat.py` (the fifth elem id and the third
 input).
 
-**Verification status, stated rather than implied.** The 31 new tests, the 106-test F-3 suite and
-the opt-in real-Gradio build all pass, and the panel was driven in a real browser against a
-task-owned server on synthetic fixtures. That is **not** owner acceptance, and no real library or
-production cache was inspected at any point.
+**Verification status, stated rather than implied.** The 35 new tests, the F-3 suite, the adjacent
+A1/A3/A5 suites and the opt-in real-Gradio 6.19.0 build all pass, and the served interface was
+driven through all four gate combinations against a task-owned server on synthetic fixtures: 546
+components (exactly one widget more than before), both ticks `value=False` as served, the Build
+dependency's inputs exactly `[folder, records, sources]`, two genuinely-missing sources published
+as `at least 2 records (lower_bound)`, the offline-drive record reported as out of scope with its
+path absent from the read-out entirely, and two identical clicks producing one identical read-out.
+That is **not** owner acceptance, and no real library or production cache was inspected at any
+point.
 
 ### Fixed — 2026-11-10 (final assembly no longer dies on a constant: FUN R11 Assembly Budget)
 

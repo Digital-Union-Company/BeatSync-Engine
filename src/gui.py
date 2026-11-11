@@ -9555,6 +9555,16 @@ def _f3_source_verdicts(records, roots):
       missing claim literally cannot escape this function unfinalised -- and if the root went away
       mid-pass, the same call takes every such finding back instead of leaving a subtree of
       confirmed deletions behind.
+    * **and it is settled against an observation taken AFTER the evidence** -- finding F-7 of the
+      independent review. ``retract_subtree`` reads :attr:`RootState.positively_observed`, which is
+      a frozen field on a snapshot, so handing it the root ``inspect_library`` probed *before* any
+      record was read establishes only that the folder was there when the read-out STARTED. The
+      mid-pass-disconnect guard above, and the end-of-pass sentence this panel prints to the
+      operator, both need the later observation, so each root with findings is observed once more
+      when its own sub-pass finishes. A re-observation that cannot be taken, or that no longer
+      resolves to the same location, leaves every finding unfinalised rather than confirmed:
+      ``retract_subtree`` declines jurisdiction and :attr:`LeafVerdict.published` renders the
+      result ``UNKNOWN``, which is the fail-closed direction.
 
     The broad catch is deliberate and matches both existing halves: a read-out that raised would
     replace a real answer with a traceback, and a failure here withholds the source axis rather
@@ -9603,7 +9613,23 @@ def _f3_source_verdicts(records, roots):
             pending.append(fork_inventory.classify_leaf(record.source_path, listings[parent_key]))
         # Clause (d2). The ONLY place a missing finding may become final, and the only place one
         # is taken back. Never publish `pending` directly.
-        finalised.extend(fork_inventory.retract_subtree(tuple(pending), root))
+        #
+        # F-7: and never settle it against the OPENING snapshot. `positively_observed` is a frozen
+        # field, so the root is observed again here -- after this root's listings and status reads,
+        # which is the window the end-of-pass promise is about. Only when there is something to
+        # finalise, so an unticked or empty pass costs nothing. A refused or differently-resolving
+        # re-observation is handed on as-is: `retract_subtree` then declines jurisdiction and
+        # every provisional finding publishes as UNKNOWN.
+        at_end = root
+        if pending:
+            try:
+                at_end = fork_inventory.probe_root(
+                    str(getattr(root, 'typed', '') or getattr(root, 'real', '')))
+            except Exception as exc:
+                at_end = fork_inventory.RootState(
+                    detail='the folder could not be observed again when the pass ended: '
+                           + str(exc))
+        finalised.extend(fork_inventory.retract_subtree(tuple(pending), at_end))
     if bound:
         notes.append(bound)
     return (tuple(finalised), notes)

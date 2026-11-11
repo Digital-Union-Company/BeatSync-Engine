@@ -278,6 +278,26 @@ def test_s14_a_reached_bound_is_named_in_the_read_out(lib, contract_module):
     assert str(1) in text
 
 
+def test_s14b_the_directory_ceiling_is_effective_and_named_separately(lib, contract_module):
+    """The second ceiling, which `test_s14` does not reach: with the folder budget at zero the
+    pass cannot list anything, and must say which bound stopped it rather than reporting the
+    unexamined records as present.
+
+    Pinned separately because the two limits fail differently -- one stops after N records, the
+    other after N directory listings -- and a single test could only ever exercise whichever
+    triggered first.
+    """
+    ns = ns_for(lib)
+    ns["F3_SOURCE_MAX_DIRECTORIES"] = 0
+    text = ns[HANDLER](lib["media"], True, True)
+    assert ns["F3_SOURCES_BOUND_DIRECTORIES"].format(limit=0) in text, text[-2500:]
+    assert ns["F3_SOURCES_BOUND_RECORDS"].format(limit=ns["F3_SOURCE_MAX_RECORDS"]) not in text, (
+        "the folder bound was reported as the record bound")
+    # Nothing was examined, so nothing may be published as missing or present.
+    axis = [ln for ln in text.splitlines() if "source confirmed missing:" in ln]
+    assert axis and "not assessed" in axis[0], axis
+
+
 # ===========================================================================
 # GROUP S6 — nothing is modified, on any path
 # ===========================================================================
@@ -358,3 +378,97 @@ def test_s19_both_gates_are_identity_tests_never_truthy_ones():
                        "if not inspect_sources:", "bool(inspect_sources)"):
             assert truthy not in body, (fn, truthy)
     assert seen == 2, f"only {seen} gate(s) carried the parameter; the pin would be weak"
+
+
+# ===========================================================================
+# GROUP S8 — clause (d2) is settled on an END-OF-PASS observation (finding F-7)
+# ===========================================================================
+#
+# The independent review of this increment found that `test_s10` above pinned the *call* to
+# `retract_subtree` and stopped there -- and that the call alone is not the mid-pass-disconnect
+# guard. `retract_subtree` reads `RootState.positively_observed`, which is a frozen field on a
+# snapshot, so settling clause (d2) against the root `inspect_library` probed BEFORE any record
+# was read says only that the folder was there when the read-out STARTED. `F3_SOURCES_NOTE`
+# promised the operator the stronger thing in words. The tests below are what make it true.
+
+def _reobservation_spy(monkeypatch, *, verdict):
+    """Patch A1 so a probe taken AFTER the first listing answers ``verdict``.
+
+    The real `probe_root` still answers the inventory's own opening probe, so the fixture library
+    is observed honestly; only a *later* observation is substituted. That is exactly the window
+    F-7 is about, and it is the only way to reach it without a disk to unplug.
+    """
+    from beatsync_fork import library_inventory as fork_inventory
+
+    real_probe = fork_inventory.probe_root
+    real_list = fork_inventory.list_directory
+    seen = {"listings": 0, "late_probes": 0}
+
+    def spy_list(directory, **kw):
+        seen["listings"] += 1
+        return real_list(directory, **kw)
+
+    def spy_probe(path, **kw):
+        if seen["listings"]:
+            seen["late_probes"] += 1
+            return fork_inventory.RootState(
+                typed=str(path), real=os.path.realpath(str(path)), anchor="", verdict=verdict,
+                anchor_reachable=False, exists=True,
+                detail="injected: this root was re-observed after the leaf evidence")
+        return real_probe(path, **kw)
+
+    monkeypatch.setattr(fork_inventory, "list_directory", spy_list)
+    monkeypatch.setattr(fork_inventory, "probe_root", spy_probe)
+    return seen
+
+
+def test_s20_the_root_is_re_observed_after_the_leaf_evidence(lib, monkeypatch):
+    """The ordering F-7 is about: an observation of the root must be taken after the listings.
+
+    A snapshot taken before the records were even read cannot answer "was it still there when the
+    pass ended", however many times it is consulted.
+    """
+    from beatsync_fork import library_inventory as fork_inventory
+
+    seen = _reobservation_spy(monkeypatch, verdict=fork_inventory.ROOT_UNREACHABLE)
+    ns = ns_for(lib)
+    ns[HANDLER](lib["media"], True, True)
+    assert seen["listings"] >= 1, "the source pass listed nothing; the fixture is wrong"
+    assert seen["late_probes"] >= 1, (
+        "the root was never observed again after the leaf evidence was gathered, so clause (d2) "
+        "was settled on a stale snapshot and F3_SOURCES_NOTE's end-of-pass promise is words only")
+    # And ONCE for the one root, not once per record: the re-observation is a listing of the root
+    # folder, so a per-record probe would turn a bounded pass into a quadratic one.
+    assert seen["late_probes"] == 1, (
+        f"the root was re-observed {seen['late_probes']} times for one root; the end-of-pass "
+        f"check must be per root, not per record")
+
+
+@pytest.mark.parametrize("verdict_name", ["ROOT_UNREACHABLE", "UNKNOWN"])
+def test_s21_a_root_lost_during_the_pass_takes_its_findings_back(lib, contract_module,
+                                                                 monkeypatch, verdict_name):
+    """And the behavioural half: with the end-of-pass observation answering "not positively
+    observed", the confirmed-missing finding must be HELD, not published.
+
+    Both a reachability failure and a plain hold are tried, because
+    `RootState.positively_observed` requires a positive verdict and not merely a reachable
+    anchor -- A1's own finding F-2.
+    """
+    from beatsync_fork import library_inventory as fork_inventory
+
+    honest = ns_for(lib)
+    before = honest[HANDLER](lib["media"], True, True)
+    assert any("1 record" in ln for ln in before.splitlines()
+               if "source confirmed missing:" in ln), (
+        "the fixture does not produce a confirmed-missing finding in the first place, so this "
+        "test could not tell a retraction from a no-op:\n" + before[-2500:])
+
+    _reobservation_spy(monkeypatch, verdict=getattr(fork_inventory, verdict_name))
+    ns = ns_for(lib)
+    after = ns[HANDLER](lib["media"], True, True)
+
+    axis = [ln for ln in after.splitlines() if "source confirmed missing:" in ln]
+    assert axis, after[-2500:]
+    assert not any("1 record" in ln for ln in axis), (
+        "a confirmed-missing finding survived a root that was not positively observed when the "
+        "pass ended: " + " | ".join(axis))
