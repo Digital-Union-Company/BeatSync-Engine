@@ -108,10 +108,25 @@ repaint deliverable, the R14 inventory panels, the PR #100 startup upload protec
 voice-pair keys and the Raw Cutter's own handoff wording — which is exactly what makes them controls
 rather than coverage.
 
-Two things worth recording about *how* it was verified. First, `create_ui()` is never executed by
+Three things worth recording about *how* it was verified. First, `create_ui()` is never executed by
 the suite, so an orphaned widget reference would surface only as a `NameError` in the operator's
 browser; a scoped undefined-name walk over the real `create_ui` body confirms all **802** distinct
-Name loads resolve. Second, two of the new guards were themselves written wrong first and say so in
+Name loads resolve.
+
+Second, the whole Blocks tree is then **actually built against the real pinned Gradio 6.19.0**, from
+the production portable interpreter, read-only, with no server started and nothing written to the
+production installation. That hazard fails silently *toward* production — `python313._pth` lists
+`..\..\src`, which resolves to the production `src` — so `logger.__file__`, `ROOT_DIR`, `INPUT_DIR`,
+`OUTPUT_DIR`, `gui.__file__` and `ui_content.__file__` are all **asserted inside the sandbox before
+anything else runs**, and the script aborts having built nothing if any of them is not.
+**513 components, every removed `elem_id` absent and every kept one present** — against a base
+control that makes the delta measured rather than inferred: the same build on the pristine parent
+gives **546**, with `audio-gallery` and `audio-confirm-button` both *present*. The −33 is the 18
+removed widgets plus the containers and static blocks that went with them, and 546 also matches the
+running production app's own `/config` count. This is a construction test and **not** a served-page
+smoke test; the two are not conflated, and no served GUI smoke was performed.
+
+Third, two of the new guards were themselves written wrong first and say so in
 their docstrings: a substring check for `audio_library_browse = gr.` matched the *surviving*
 `pref_audio_library_browse = gr.Button(`, and a `protected_dirs` source slice landed inside the
 comment explaining the protection. Both now resolve over the syntax tree — both are instances of the
