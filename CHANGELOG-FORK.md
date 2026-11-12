@@ -20,6 +20,82 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-13 (R15-C / F-3 and F-4: two lifecycle races that moved files)
+
+**Revoking the page was necessary and was not sufficient.** R15-C's retirement revokes the owner's
+registry session, which closed the case where a Confirm is *submitted* after a handoff. Two orderings
+survived it, and a bounded remediation cycle reproduced **both** on `534cdb6f` with `threading.Event`
+barriers — never sleeps, never a probabilistic race — and **both moved real files.**
+
+**F-4 (MAJOR) — a read cannot gate a mutation.** `_audio_page_is_live` is a read, and between it and
+the first `os.rename` the real code merges the payload, plans the sort, renders a gallery and
+validates both destinations against the filesystem. A handoff landing anywhere in that window revoked
+the page *after* the read and the sort moved the clips regardless: three left folder A under a
+terminal frame reading `✅ Sorted all 3 clip(s).` This is R13's own F-1 lesson, which
+`.claude/rules/video-review-transfer.md` already states — *"a read cannot refuse anything, because
+what it reports may change before the caller acts on it."*
+
+**F-3 (MAJOR) — and the previous review's classification of it was wrong.** A scan of folder A that
+finished after a handoff to folder B published A as a **live page with tiles** while the folder box
+named B, and a Confirm on it moved all three files. The R15-C review recorded this as
+"presentation-only, authority is consistent". It was not: the republished page carried a fresh, live
+registry session, so it was fully actionable. The earlier wording is corrected in place above rather
+than quietly dropped.
+
+**The corrections reuse what already exists; no new coordinator, lock or thread was added.**
+
+*F-4 is closed by claiming the page instead of reading it.* `ClipRegistry.claim_page` is one locked
+test-and-set: it verifies the page is live, retires it, and hands back its entries.
+`_audio_confirm_core` calls it **after every refusal and immediately before `_audio_sort`**, so a
+refused destination or an unarmed sweep still leaves the page usable — and a collision failure still
+leaves the clips retryable on screen, because the handler re-scans afterwards (verified live). The
+registry lock is **not** held across the renames: the entries come back and the filesystem work
+happens outside, because a lock held across a batch would stall every other session's media request.
+A set comparison against the view's own clip ids follows the claim as defence in depth.
+
+*F-3 is closed by a per-owner page epoch inside the registry.* The first attempt put a
+`ScanCoordinator` generation *beside* the registry and checked `is_current` in `_audio_load_view`
+before `_audio_publish` — and **a barrier between that check and the mint reproduced F-3 a second
+time**, because the two live under different locks. So `revoke_owner` now advances a per-owner epoch
+*and* revokes the sessions in one locked step, and every event that can publish — Scan, a page turn,
+and the re-scan a successful sort performs — reads `owner_epoch` at its **start** and threads it to
+`new_session(expected_epoch=…)`, which compares it **in the same `with self._lock` block that mints
+the session**. `_audio_load_view` deliberately does not check it: a check there would be one more
+check-then-act. `expected_epoch=None` is the default, so every pre-existing Clips Preview call site
+is byte-identical, and `revoke_owner` is called only by the audio retirement.
+
+**The admitted-batch policy is now explicit, because the task required it be.** A batch that *wins*
+the claim finishes and reports truthfully. The operator pressed Confirm on a page they held;
+abandoning the batch half-way is the one outcome with no honest description. Nothing is left
+actionable afterwards — the claim retired the page — and the handoff never claims to have prevented
+it. Measured as a third ordering alongside the two unsafe ones.
+
+**One honesty defect was fixed with them.** A superseded scan used to lead with "Found 3 audio
+clip(s) under:" and then state a page count of zero. The supersession note is now the whole report.
+
+**Verification.** 10 new tests, of which **9 fail against `534cdb6f`** (the tenth,
+`test_no_new_coordinator_was_introduced`, is a preservation control that must pass on both sides).
+The behavioural proof is tree-agnostic: one harness, run against both trees, measured files moving on
+the baseline and not moving on the candidate, with positive controls — ordinary Confirm, the two-step
+sweep, a normal scan *after* a handoff, a refused handoff, and cross-owner isolation — holding
+throughout. Focused regression across every suite that touches the registry, plus the startup and
+cache-safety seams: **1815 passed, 5 skipped.** The 10,918-pass full suite was not repeated, as
+instructed.
+
+**Served-page GUI smoke, in a task-owned sandbox on port 7882** with the production interpreter as a
+read-only dependency provider (no runtime copy; `cleanup_on_startup()` never called; 28 isolation
+assertions passed): the handoff filled the exact run folder and scanned nothing; the retired page's
+media route went `206` with real bytes → **`403 unknown_session`**; a Confirm on it refused; **a new
+scan of that same folder afterwards worked normally**, which is the control proving the epoch fences
+only an in-flight scan; the two-step sweep moved nothing until Proceed and then exactly 1 kept / 2
+swept; all three collisions were refused with occupants byte-identical at unchanged mtimes and the
+clips still retryable; and **cross-owner isolation was proven with two real browser sessions** —
+owner B's handoff left owner A's page live at `206`.
+
+**What is still not claimed.** The in-flight orderings are proven by deterministic barriers offline,
+**not** raced in a browser: response ordering at the client boundary was not established, and this
+entry does not pretend otherwise.
+
 ### Changed — 2026-11-12 (R15-C: one place to review exported audio)
 
 **Two surfaces reviewed exported audio clips, and now there is one.** The Raw Audio Cutter carried
@@ -101,13 +177,11 @@ head the delayed Confirm moves the files; against the corrected tree it refuses 
 in both trees an **ordinary** Confirm with no handoff still sorts correctly (1 kept, 2 discarded),
 so the gate is not simply refusing everything.
 
-**One residual is left open and stated narrowly [F-3].** A *scan* already in flight finishes by
-minting a fresh session for the folder it was scanning, so it can still republish that folder as a
-live page after the handoff; this surface has no generation counter to order the two, and adding one
-would be the forbidden second notion of the current page. The residual is bounded to presentation:
-the republished page is live, is the page the gallery is actually showing, and its own report names
-the folder it scanned, so a later Confirm acts on what is on screen. **Authority is consistent; the
-folder textbox can be stale.**
+**One residual was left open here and has since been closed — see the 2026-11-13 entry.** It was
+recorded as "bounded to presentation", and **that classification was wrong**: a follow-up cycle
+reproduced the stale scan republishing folder A as a live page *with tiles* and a Confirm on it
+moving all three files. The correct account, and the correction, are in
+*Fixed — 2026-11-13 (R15-C / F-3 and F-4)* below.
 
 **Navigation is still not an action.** The handoff scans nothing, classifies nothing, sorts nothing
 and moves nothing; the one filesystem question it asks is a single `isdir`, asked at press time

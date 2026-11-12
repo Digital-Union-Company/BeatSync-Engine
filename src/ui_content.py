@@ -2372,6 +2372,18 @@ AUDIO_HANDOFF_MISSING_TEXT = (
 #: from a refusal is that something half-happened. It must also not blame them: pressing Confirm and
 #: then the handoff is a perfectly ordinary pair of clicks, and before this refusal existed that
 #: pair silently sorted the folder they had just left.
+#: [FORK] Digital-Union (R15-C / F-3): a scan, page turn or post-sort re-scan finished after
+#: something newer had already retired the page, so it published nothing. Appended to that event's
+#: own report rather than replacing it, because the event did happen -- it just has no page to show.
+#:
+#: It says what to do next and does not imply an error: being superseded by your own handoff is
+#: ordinary, and the honest state afterwards is "no current page", never a live gallery for a folder
+#: the box no longer names.
+AUDIO_PAGE_SUPERSEDED_NOTE = (
+    "\n\n⚠️  This folder was not loaded: the review page was replaced while it was being read, "
+    "which happens when “Open results in Media Library” loads a different folder meanwhile.\n"
+    "Nothing was moved, renamed or deleted. Press Scan Folder to read the folder now in the box."
+)
 AUDIO_PAGE_RETIRED_TEXT = (
     "⚠️  Nothing was moved — this review page is no longer the current one.\n"
     "It was replaced while that press was on its way to the server, which happens when "

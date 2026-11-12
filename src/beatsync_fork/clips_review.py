@@ -251,15 +251,50 @@ class ClipRegistry:
         #: owner is looked up HERE, so no owner identity is ever taken from a request. A browser
         #: cannot name a session it was not given, and cannot claim to be another owner.
         self._session_owner: dict[str, str] = {}
+        #: [FORK] Digital-Union (R15-C / F-3) owner -> page epoch, bumped **only** by an explicit
+        #: `revoke_owner`. It exists so that "has this owner's page been retired since my event
+        #: started?" can be answered in the SAME locked step that mints a new session, which is the
+        #: only way to stop a scan that is already enumerating from publishing afterwards.
+        #:
+        #: It lives here rather than in a `ScanCoordinator` on purpose. A generation held in a
+        #: second object cannot be checked atomically with a mint that happens under *this* lock,
+        #: and that gap is precisely the defect: measured on `534cdb6f`, a scan suspended between
+        #: the check and the mint published folder A as a live page after a handoff to folder B,
+        #: and a Confirm on it moved all three files. One authority, one lock.
+        #:
+        #: Not bumped by `new_session`'s own revocation of previous sessions, nor by eviction:
+        #: re-scanning is not a retirement, and an owner evicted for capacity has not been retired.
+        self._epochs: dict[str, int] = {}
         self.serve_count = 0
         self.refusals: list[tuple[str, str]] = []
 
     # ---- lifecycle -------------------------------------------------------------------
 
-    def new_session(self, owner: Any, scan_id: str = "") -> str:
-        """Open a review session for ``owner``, revoking that owner's previous sessions only."""
+    def owner_epoch(self, owner: Any) -> int:
+        """This owner's current page epoch. `0` for an owner nobody has retired.
+
+        [FORK] Digital-Union (R15-C / F-3). Read at the START of an event that will publish a page
+        and handed back to :meth:`new_session` as ``expected_epoch``; see that parameter.
+        """
         key = _require_owner(owner)
         with self._lock:
+            return self._epochs.get(key, 0)
+
+    def new_session(self, owner: Any, scan_id: str = "",
+                    expected_epoch: int | None = None) -> str:
+        """Open a review session for ``owner``, revoking that owner's previous sessions only.
+
+        [FORK] Digital-Union (R15-C / F-3) ``expected_epoch``: refuse `409 superseded_scan` if the
+        owner's page has been retired since the caller read the epoch. The comparison happens inside
+        the same ``with self._lock`` block that mints the session, so a retirement cannot land
+        between the two -- which is the whole point, and what an equivalent check outside this
+        method could not promise. ``None`` means "do not care" and leaves every pre-existing call
+        site behaving exactly as before.
+        """
+        key = _require_owner(owner)
+        with self._lock:
+            if expected_epoch is not None and self._epochs.get(key, 0) != int(expected_epoch):
+                raise Refusal(409, "superseded_scan")
             sessions = self._owners.get(key)
             if sessions is None:
                 sessions = OrderedDict()
@@ -340,10 +375,63 @@ class ClipRegistry:
             return token, entries
 
     def revoke_owner(self, owner: Any) -> None:
+        """Retire every session this owner holds, and advance their page epoch.
+
+        [FORK] Digital-Union (R15-C / F-3): the epoch bump is what makes the retirement visible to a
+        scan that is **already running**. Revoking the sessions alone was not enough -- a scan does
+        not reuse a revoked session, it mints a fresh one, so the page came straight back live.
+        """
         key = _require_owner(owner)
         with self._lock:
+            self._epochs[key] = self._epochs.get(key, 0) + 1
             for session in self._owners.pop(key, OrderedDict()).values():
                 self._mark_revoked(session)
+
+    def claim_page(self, session_id: Any, page_token: Any) -> list[ClipEntry]:
+        """**Take** this page: verify it is live and retire it in one locked step.
+
+        [FORK] Digital-Union (R15-C / F-4). A *claim*, not a check, and the distinction is the whole
+        reason this method exists. ``page_entries`` is a **read**, and
+        ``.claude/rules/video-review-transfer.md`` already states why a read cannot gate a mutation:
+        *"a read cannot refuse anything, because what it reports may change before the caller acts
+        on it."* Audio Review's Confirm read ``page_entries`` and then did real work -- merging the
+        payload, planning, rendering, validating both destinations -- before its first ``os.rename``.
+        A handoff landing anywhere in that window revoked the page **after** the read, and the sort
+        moved the files anyway: three clips measured leaving a retired folder under a terminal frame
+        reading ``✅ Sorted all 3 clip(s).``
+
+        Taking the page is what closes it. Afterwards the page is revoked and holds no identities, so
+        a second press, a stale press and the media route all refuse, and a retirement that arrives
+        later finds nothing to revoke rather than racing the mover.
+
+        **The lock is held only for the test-and-set.** The entries are returned and the caller does
+        its filesystem work outside, because holding a registry lock across a batch of renames would
+        block every other session's media request for the duration -- see the same rule's warning
+        about lock scope.
+
+        Returns the page's entries, so the caller can prove the page it claimed is the page its view
+        describes. Raises :class:`Refusal` exactly as ``resolve`` and ``page_entries`` do, with the
+        same codes, so a caller cannot tell "retired" from "never existed" and does not need to.
+        """
+        if not _valid_token(page_token):
+            raise Refusal(403, "malformed_token")
+        with self._lock:
+            session = self._session_by_id(session_id)
+            page = session.pages.get(page_token)
+            if page is None or page.revoked:
+                raise Refusal(403, "unknown_or_expired_page")
+            if not secrets.compare_digest(page.page_token, page_token):
+                raise Refusal(403, "page_token_mismatch")
+            claimed = list(page.clips.values())
+            # The same retirement `publish_page` applies to a superseded page: revoked, and the
+            # identity map dropped so nothing can be resolved through it again.
+            page.revoked = True
+            page.clips.clear()
+            if session.active_page_token == page_token:
+                # `None`, matching the field's declared default, not an empty string: `_valid_token`
+                # would have to reject both, and only one of them is the type this dataclass says.
+                session.active_page_token = None
+            return claimed
 
     def _session(self, owner: str, session_id: Any) -> Session:
         if not _valid_token(session_id):
