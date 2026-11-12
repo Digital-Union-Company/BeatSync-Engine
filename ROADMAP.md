@@ -1550,6 +1550,168 @@ and report that their cached analysis no longer applies* — correct, but expens
 library, and a reason to keep using `SUFFIX` on new collisions rather than normalising names that
 already work.
 
+### R15 — Audio Cutter V2: multi-stream video, Folder Batch, one Audio Review · **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**
+
+Owner-requested additions (2026-11-03), **accepted into the roadmap by the owner on 2026-11-12**.
+Accepting the scope settles *what the product is meant to become*; it is **not** an authorisation to
+implement it. **No implementation, merge, deployment or priority promotion is authorised by this
+entry** — each stage below is implemented only under its own separately scoped, separately approved
+task, and R15-A and R15-B remain unstarted. The current Audio Cutter (R7.2)
+already accepts *a single video file* when FFprobe finds audio, as well as standalone audio files.
+It analyses and exports only the **first** audio stream: `audio_cutter.build_probe_command` uses
+`-select_streams a:0`, while `build_extract_command` uses `-map 0:a:0`. Therefore "video
+input" is not a new capability; **processing all audio streams is**.
+
+#### R15-C — One place to review exported audio · **ACCEPTED SCOPE · NOT IMPLEMENTED**
+
+Remove the duplicated **Exported clips** review/Keep/Discard gallery from Audio Cutter. Keep the
+cut plan, output report, manifest and exact finished run directory. Move the existing **Open results
+in Media Library** action beside the cut result, and route to **Media Library → Audio Review** with
+that specific run folder filled in. The handoff already exists (`gui._on_audio_open_in_library`);
+**reuse it** rather than building another review surface. Navigating does **not** scan, classify,
+move or delete anything: the operator still presses **Scan Folder** and confirms any sorting there.
+Retire stale review-page authority when changing folders, as in R11's handoff safety lesson. Keep
+Audio Review independently usable after a restart; its Keep/Discard/quarantine, no-overwrite,
+two-step unmarked sweep and destination validation remain the one canonical workflow. Remove
+only the redundant Cutter UI and related bindings after proving no orphaned session, component,
+gallery or classification callbacks remain.
+
+#### R15-A — All audio tracks from an audio-bearing video · **ACCEPTED SCOPE · NOT IMPLEMENTED**
+
+For a video with multiple audio streams, enumerate each stream through FFprobe, preserving its
+stream identity/index and available language/name metadata. Automatically extract or decode the
+**audio only**, then analyse silence and cut **each track independently** with the existing R7
+cut settings and output formats (WAV/FLAC/MP3). A video-only source with no audio is reported and
+skipped; an unsupported or failing stream is reported without silently substituting another.
+Stable source-plus-track names prevent collisions; manifests identify original video, track,
+time ranges, settings, outputs and failures. Avoid copying/re-encoding the entire video and avoid
+unnecessary large intermediate audio files; choose between direct FFmpeg decoding and bounded
+temporary extraction after a measured design check. Do not combine unrelated tracks into a mix,
+transcribe them or overwrite originals. Ensure the silence-detection stream and cut-output stream
+are the **same selected stream** (not an implicit FFmpeg default).
+
+#### R15-B — Audio Cutter Folder Batch (audio **and** video) · **ACCEPTED SCOPE · NOT IMPLEMENTED**
+
+Add an explicit Folder Batch mode analogous in operator workflow to Raw Cutter: choose an input
+folder, optional recursive inclusion, output location and shared cutting settings. Discover the
+supported audio and audio-bearing video files; each input and (when R15-A is enabled) each audio
+track gets an independently reported analysis/cut result. Use deterministic, collision-safe
+per-file/per-track output folders or names, a batch manifest and honest completed/skipped/failed
+counts. No silent overwrite, no automatic Keep/Discard or implicit review scan. Respect progress,
+active-job/refusal and bounded-resource rules; do not create a second review or source-discovery
+engine. This stage depends on the shared input scanner's **NTFS junction safety fix, which has since
+been delivered** — PR #88 merged on 2026-11-03 (merge commit `e6a7c0cd`), so the dependency is
+satisfied rather than outstanding, and this entry no longer gates on a pending draft. Still required
+of R15-B itself: explicit safe roots and truthful unreachable/incomplete cases. A real stop action
+is required before describing a control as Cancel.
+
+**Preferred implementation sequence, not a change to the owner's current priority order:**
+R15-C (simpler UI) → R15-A (per-track correctness) → R15-B (batch composition). Implement,
+review and release separately — one approved task per stage. None is part of R14-A media/cache
+maintenance.
+
+### R16 — Music Playlist Mode for Video Render · **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**
+
+Owner-requested (2026-11-03), **accepted into the roadmap by the owner on 2026-11-12**; accepting
+the scope is not an authorisation to build it, and **no implementation is authorised by this
+entry**. Allow multiple music files as **one ordered main soundtrack** for Create Music Video, instead of
+only the existing single-file `audio_input`. The current single-file render and R10 **Repeat
+Music 1×–30×** remain unchanged when playlist mode is off (default). Offer an editable visible
+queue with **Add/Remove**, **Move Up**, **Move Down**, **Shuffle** and **Sort by Name** (stable,
+case-insensitive ordering). Shuffle is an explicit one-time reorder, never a hidden randomisation
+at render time; the order shown and confirmed is the order rendered, and may be reproduced from
+recorded order/seed. Show track names, individual durations and a truthful total estimate.
+
+Treat the list as a continuous soundtrack in that order: normalise compatible formats/sample
+rates without editing the original songs, concatenate without silent gaps by default, then have
+beat/shot planning and final render operate on the complete audio timeline. Retain individual
+track boundaries and offsets in the plan/report; changing the playlist invalidates any stale
+render/analysis approval. Preserve Voice & SFX/Audio Layers placement against that timeline,
+existing render concurrency, cancellation, source identity and resource bounds. Do not loop
+finished video footage or silently reshuffle it. No crossfade, DJ mixing or automatic loudness
+mastering is required for V1.
+
+**Deliberately left open for the R16 design, not decided here.** The interaction between a playlist
+and R10's **Repeat Music 1×–30×** is an *unresolved* choice and is explicitly deferred: the
+preference recorded by the owner is to repeat the **whole ordered playlist** rather than each song,
+but that is a preference, not a decision, and nothing in the current code implements either reading.
+R16 must settle it — including what the control reads and whether both are offered — before any
+playlist/repeat behaviour is built. No assumption that this is already implemented.
+
+**Dependencies:** keep the shared scanner hotfix / R14-A safety work separate. R16 is optional
+product work, not an excuse to change the current single-song render default, which stays the
+default.
+
+---
+
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**
+
+Owner-requested UX improvement (2026-11-04), **accepted into the roadmap by the owner on
+2026-11-12**: after a lengthy operation finishes, **Google Chrome should offer an optional Windows
+desktop notification**, so the operator can work elsewhere rather than continuously watch BeatSync's
+tab. This is independent of the scanner safety hotfix, R14-A inventory, R15 Audio Cutter V2 and R16
+Music Playlist Mode. Accepting the scope is not an authorisation to build it: **no implementation is
+authorised by this roadmap entry**, and in particular **no service worker, Push server, background
+daemon, background poller or browser extension is authorised** in any stage of R17 — R17-B below is
+research into whether such a thing could ever be justified, not permission to add one.
+
+**First release (R17-A) — open-page notifications.** With BeatSync open in Chrome (the tab may be
+in the background), display one notification when an authoritative long-running job reaches its
+terminal state. Candidate event sources include Raw Cutter single / Folder Batch, full video render
+and Variant Lab batch, Stage-5 analysis/preparation, Audio Cutter single / eventual Folder Batch,
+and other genuinely long operations where the server already has a reliable terminal result.
+Scope by real job lifecycle, not a timer, guessed duration or "FFmpeg process disappeared". Distinguish
+**success**, **partial success (completed / skipped / failed)**, **failed**, and **cancelled**. Do
+not announce success while a final file is still being written or while the result is unknown.
+A brief example: `BeatSync — Raw Cutter batch finished · 27 completed, 1 failed`; clicking a
+notification should focus the corresponding open BeatSync tab and relevant result if safe. No
+automatic click, move, render, cleanup, restart or retry.
+
+**Settings → Notifications (R17-A).** Include a saved **Enable desktop notifications** toggle
+(**OFF by default**), an explicit **Allow notifications in Chrome** action and **Send test
+notification**. Show distinct app-setting and browser-permission states:
+`not requested` / `granted` / `denied` / `unsupported` and a plain explanation for each.
+A user gesture must initiate `Notification.requestPermission()`; never ask on page load, during
+a render, or because the saved toggle changed indirectly. The BeatSync toggle disables delivery
+even if Chrome permission remains granted; changing Chrome's per-origin permission belongs to
+Chrome Site Settings and is never falsely claimed to be revoked by BeatSync. A denied or
+unsupported browser capability must not block the job or affect its terminal report. Optional
+later refinements: per-job-type switches and quiet notifications, only if the simplest UX proves
+insufficient.
+
+**Security and reliability contract.** Desktop notification support requires a secure browsing
+context and permission. The local production origin `http://127.0.0.1:7860` is generally a
+potentially trustworthy loopback origin, unlike an ordinary insecure remote HTTP origin; verify
+actual `isSecureContext`, API presence and `Notification.permission` in the target Chrome
+version. Browser/Windows notification settings, Focus Assist / Do Not Disturb and OS policy can
+suppress display, so do not promise a guaranteed alert or replace in-app completion reporting.
+A notification must be associated with the **correct owner/session, job id and terminal event**;
+do not broadcast one operator's jobs to all tabs or issue duplicates from multiple Gradio updates,
+reconnections or tabs. Default notification content is minimal, with job type, terminal outcome
+and safe counts, **not full local file paths, media names or sensitive logs** on the Windows
+lock screen. Retain no new media metadata; do not duplicate progress engines or add a timer,
+daemon, background poller, new external cloud service or browser extension.
+
+**Browser lifecycle boundary — explicit.** V1 works while an authorised BeatSync page is actually
+open and receives the job's terminal result, even if another application is in the foreground.
+A normal page `Notification()` is not a promise that an alert will fire after the page is
+closed, Chrome has shut down or the session has disconnected. **R17-B (optional, separate future
+decision)** can investigate service-worker / Push-based persistent delivery after page closure,
+its security and lifecycle implications, and whether local-only BeatSync architecture can support
+it safely. Do not silently ship a background process or add push infrastructure in R17-A.
+
+**Acceptance to plan before coding:** manual permission granted/denied/reset tests in Chrome;
+toggle OFF/ON persistence; test notification; a real completed and a failed synthetic Raw Cutter
+batch; completed/failed/cancelled render and Stage-5 terminal cases; partial batch counts;
+no duplicate across repeat progress frames and two open browser tabs; no toast on page load;
+no source-path leakage; correct page focus on click; truthful non-delivery when Chrome blocks it;
+no change to existing job result, Cancel or concurrency behavior. Test on Windows with Chrome,
+using synthetic data, and separately document what happens with page open in background,
+page closed, browser closed and OS notifications disabled. Only authorise implementation after
+the scanner deployment and other active work are separately resolved.
+
+---
+
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
 Only once R7 has proven useful in practice:
@@ -1794,6 +1956,9 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R12** — Raw Cutter **Live Activity & Performance panel** | **MERGED AND DEPLOYED** (PR #82, main `e0bc9393`) — branch `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`. A compact read-out below the existing bar in both modes: real phase, status indicator, total and per-phase elapsed, file, `Source N / Total`, `Clip X / Y`, FFmpeg activity and encoder. Measured in Chrome: during a **9.95 s** blocking scene-detection pass the server emitted one frame and went silent (`data-job-ms` fixed at 28) while the display advanced **00:00 → 00:08**; cutting 19 clips ran 00:00 → 00:10 with `Clip 1/19 → 19/19`; Cancel froze at 00:06 with 4 of 150 clips kept; a batch showed per-source phase resets and 29 of 29 clips. **No new component, no new progress system, no backend poll, no new endpoint, no percentage invented.** GPU usage reports *Unavailable* and Qwen *Not used in Raw Cutter* rather than guessing. Observational only — no cutter algorithm, output path, manifest or cancellation behaviour changed. Deployed and GUI-smoke-verified; two follow-up hotfixes shipped on top of it for a defect family it exposed rather than caused (PR #83 `ffb828a1`, PR #84 `d5bc160f`: an unnamed Folder Batch / review folder became the application's own install directory via `os.path.abspath('')`). **Not independently reviewed** |
 | **R13** — Video Review **transfer Working overlay** | **MERGED AND DEPLOYED** (PR #86, main `c07d043a`) — **production GUI ACCEPTED on 2026-11-02.** Branch `feat/fun-video-review-working-overlay-r13` off `8a1c2ec4`, approved head `a9b0e5fc`; the merge is an ordinary two-parent commit (`8a1c2ec4` + `a9b0e5fc`) whose tree `151d0792` **equals the approved candidate tree exactly**, so no unreviewed source entered `main`, and the whole suite measured **9,416 passed / 9 skipped** on that candidate. Production fast-forwarded `5e8a6013 → c07d043a` from the `digitalunion` remote with HEAD *and* tree verified against remote main, `install.ps1` not run, and the installation returned to **STOPPED** afterwards. **Independently reviewed three times: F-1 and F-2 found and remediated, and F-6 — the F-3 remediation's own vacuous interval test — corrected with its four mutant controls verified.** The Confirm/Proceed handler is now a **generator**, `_clips_confirm_frames`, so the Working state reaches the browser *before* the first file moves; `_on_clips_confirm` is kept as the collected form and is byte-equivalent to the pre-R13 return value. Every refusal and the sweep gate emit **exactly one frame and claim no slot** — a spinner for an operation that moves nothing is the dead-button complaint inverted. Single-flight is a server-side **test-and-set** in the new pure `beatsync_fork/transfer_guard.py`, with the operation identity written out as `(owner, generation, signature, root_key)`: `owner` and `root_key` are exclusive (two browser tabs have two owner keys and would otherwise sort one folder at once, answered by its own `folder_in_progress` code), while `generation` is recorded rather than required because re-scanning must not entitle a second concurrent transfer. `concurrency_limit=None` is unchanged and load-bearing — a lane of 1 would leave the duplicate **queued** rather than refused (the measured S2-A R3 trap). Progress is counted from recorded `MoveOutcome`s, never a timer: `iter_sorted_clips` yields each one after its move happened or was refused, `moved` and `done` are both shown because a skipped clip is done and was not moved, the report closes on **moved / skipped / failed / of total** with a deliberate refusal kept apart from an unclassified failure, and `should_emit` reads **no clock** while capping the frames at 50 and always emitting the last outcome. **A classification and a sort are mutually exclusive, after independent review found the first attempt was not (F-1).** That attempt read the guard's *advisory* `busy()` in `_clips_decide` and then committed — check-then-act — so a classification that passed the read before admission still committed after it, was answered `ok: True`, was durable, and was ignored by the batch with both halves reporting success; reproduced in both directions on the shipped handler. The review's suggested post-admission snapshot re-read was measured against a probe carrying only that re-read and **did not close it**, because a commit suspended inside itself re-reads as unchanged. The correction is two halves: a **decision claim** (`begin_decision` / `end_decision`, deciding under `begin`'s own lock and by its own two rules, with `begin` raising the new `DecisionInFlight` while a conflicting decision is still being written) **and** the post-admission re-read, which together yield the invariant that once `begin` returns a reservation no conflicting durable decision can be in flight or start until it is released. Neither call waits; both raise, and the caller turns that into an explicit retry. `_clips_decide` still answers `transfer_in_progress` for this owner *and* for another session on the same folder, because the second tab never saw a greyed-out tile, still through the existing `refuse(...)` helper, so nothing is appended and no revision moves; the slot is released in a `finally` covering refusal, `StaleWrite`, a durability failure and a defect, and the transfer's reservation likewise on success, a partial batch, an injected exception and an **abandoned generator**; nothing is yielded from the `finally`, and no coordinator lock is held across the moves. **The R11 interaction is decided and tested**: a transfer whose page was retired or superseded mid-sort still completes its moves and reports them truthfully, but repaints the **authoritative** page rather than re-enumerating the root it was sorting — the R5-P3 / F1 rule applied to a transfer, so no second notion of "the current page" exists. **The two-step sweep confirmation, the no-overwrite `os.rename`, path containment, destination re-validation and `collision.py`'s two policies are all untouched**; `sort_decided_clips` keeps its signature and is now a list of what `iter_sorted_clips` yields, so there is one engine. **No new tab, no new button, no second review surface, no second naming engine, no new subprocess and no background service.** 64 new tests for the overlay plus **28 more for F-1** (15 bare-interpreter, including 32 threads at a barrier racing a transfer against a decision; 13 driving the real `ast`-extracted handler, with the interleaving placed by hooking admission and suspending the one durable commit rather than by racing a clock). Measured against the pristine candidate rather than asserted: **25 of the 28 F-1 tests fail there**; the other three legitimately pass, because two are scope tests with nothing to break pre-F-1 (a decision on a different folder, and alias spellings collapsing to one key) and one is the race test that review finding F-3 showed to be vacuous. The two that isolate the straddle fail against the recheck-only probe as well. **A second independent review confirmed the F-1 mechanism and found a further MAJOR, F-2, now corrected.** Exclusion was decided on `(owner, root_key)`, and neither component asks which *clips*: two sessions that scanned an ancestor and a descendant of one tree have two owner keys and two different root keys, and the same clip in both batches under the same durable identity -- reproduced on the F-1 tree as `accepted=True durable=REJECTED landed=library` under a terminal frame reading `✅ Sorted all 4 clip(s).` The correction is **one more rule in the same atomic decision**: the reservation carries the page's bounded, frozen identity set, the decision claim carries the one identity it may change, and `_conflicting_transfer` applies owner, then folder, then **identity overlap**, all under the one existing lock with `isdisjoint` so nothing is allocated inside it -- no second mutex, no second engine, and `begin` additionally compares the pending-decision map against its own page because a decision in flight holds no active record to scan. It closes two further things the owner/folder pair never excluded: two *transfers* over an overlapping batch (both would `os.rename` one path), and a root `realpath` cannot resolve. The rule is identity overlap and **not** a path-prefix test, so two nested folders whose pages share no clip stay independent; what is deliberately **not** claimed is a clip reachable under two *different* identities -- two hard links are two identities and are not detected, while path aliases (junctions, `..`, case, trailing separators) do collapse to one key and one identity, measured against a real NTFS junction. The same review found the 32-thread race test **vacuous** -- its classifying workers died on an uncaught `AttributeError`, so it passed against an implementation with no decision claim at all -- and it now records every worker outcome, treats an unexpected exception as a failure, and is backed by two standing not-vacuous proofs. **The separate interval test added alongside them for the "none can start until it is released" half was itself vacuous, which a third independent review found as F-6 and which is now corrected** — it ticked its two boundaries back to back, so every span was zero width, the overlap predicate could not fire, and it caught **0 of 40** against each of four defective guards including one with no exclusion at all. The replacement holds a real interval, places the conflicting attempt inside it by Event handshake rather than by sleeping, stamps refusals into the same logical clock so a holder's span provably encloses the refusal of its conflict, captures every worker exception, and ships **four** standing not-vacuous proofs — two of them cross-owner *and* cross-root so rules 1 and 2 cannot mask the identity and pending-decision rules. Measured after: **40 of 40 on all four mutants** for their intended reasons, **0 of 40** false positives on the shipped guard, **0 failures in 40 runs** with thread-exception warnings escalated to errors, and no change to any file under `src/`. A pre-existing flake was also found and fixed while re-running it: `test_many_concurrent_presses_admit_exactly_one_sort` only hoped the eight presses would overlap, and failed 4 times in 30 on the pristine candidate; the winner is now held at its first `note_progress` until every press has been through admission, measured 0 in 40 after. Open and recorded: **no Cancel for a transfer** (abandoning the event is a dropped frame, not a cancel anybody pressed), the progress figure is server-side text with no browser tick, so it is stale by up to one stride between frames, and a clip reachable under two *different* durable identities is deliberately not detected — two hard links are two identities. **Accepted in a bounded production GUI smoke test** on the unmodified deployed build, against isolated synthetic media only and never the operator's real folders: the Working overlay appeared before any file moved and said so, progress counted truthfully to a **moved / skipped / failed / of total** report, a **duplicate Confirm was refused server-side** (four presses in one tick → one sort plus a real refusal naming that batch's own progress), the **existing two-step Proceed gate was preserved** and moved nothing and wrote no durable decision before approval, **collision `SKIP` left the occupant byte-identical** and reported a skip distinct from a failure with the operator's saved policy untouched, and the **R11 handoff** still opened the finished job's own directory without scanning. Most significantly, **F-2's cross-root conflict was reproduced live and refused with HTTP 409** — two browser sessions over an ancestor and a descendant sharing eight durable identities, a burst of real decision requests during the parent's sort refused rather than accepted-then-ignored, which is exactly the route that answered `ok: True` before the fix; all eight clips moved exactly once and matched the terminal frame. Zero of the session's real endpoint calls returned 5xx, and the browser console oracle was canary-proven at both the start **and** the end of the session. The rare F-1 `DecisionInFlight` refusal **was not observed in a browser and is not claimed as such** — its window is one journal append long, and it remains covered by the deterministic tests. **Merged, deployed and GUI-accepted** |
 | **R14** — Media Library **Refresh & Maintenance** | **PLANNED.** A read-only inventory first (media count, duplicate filenames, cache records present / missing / on unreachable drives, cache location and reusable record count, reclaimable space), then optional confirmed cleanup with a dry-run preview and **reversible quarantine** preferred, then optional filename normalisation. Extends the existing `cache_admin.py` rather than adding a second engine. Two hard rules: **a missing file and an unreachable drive are different verdicts**, and the Stage-5 cache is keyed by **absolute path** with **path-derived candidate ids**, so a rename invalidates the signature, every candidate id and the payload's stored `video_file` — mass renaming or cache migration is not to be implemented until every identity reference can be proven safely updatable. Never clear the shared cache because a source is temporarily unavailable |
+| **R15** — Audio Cutter V2: multi-stream video, Folder Batch, one Audio Review | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner ideas 2026-11-03, scope accepted 2026-11-12). R7.2 already accepts single video files with audio, but chooses only `a:0`; R15-A will process each audio stream, R15-B adds a mixed audio/video Folder Batch, and R15-C removes the duplicate Cutter review surface in favour of the existing Media Library → Audio Review handoff. Preferred bounded sequence C → A → B, one approved task per stage. The batch stage's shared-scanner NTFS junction dependency is **satisfied** — PR #88 merged 2026-11-03 (`e6a7c0cd`). Accepting the scope authorises no source work; **R15-A and R15-B are unstarted** |
+| **R16** — Music Playlist Mode for Video Render | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner ideas 2026-11-03, scope accepted 2026-11-12). Ordered multiple songs with Move Up/Down, Shuffle and Sort by Name; one continuous soundtrack for beat/shot planning and rendering; visible order is frozen, no silent reshuffle. Existing single-track and R10 Repeat Music remain unchanged by default; playlist-repeat interaction is a future explicit decision |
+| **R17** — Chrome / Windows notifications on long-job completion | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner idea 2026-11-04, scope accepted 2026-11-12). Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional R17-B research (service worker / Push), NOT promised for V1 — **no service worker, Push server, daemon, background poller or extension is authorised**. Accepting the scope authorises no source work and no deploy |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
@@ -1872,6 +2037,16 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing
    Qwen worker.
+
+> **Accepted backlog (proposed 2026-11-03 to 2026-11-04, scope accepted by the owner 2026-11-12;
+> not inserted into the numbered owner priority):** **R15** Audio Cutter V2 (review consolidation →
+> all audio tracks → Folder Batch), **R16** Music Playlist Mode, and **R17** opt-in Chrome/Windows
+> notifications for completed long jobs are recorded above as **ACCEPTED ROADMAP SCOPE · NOT
+> IMPLEMENTED**. Accepting the scope settles what the product is meant to become; it **does not
+> authorise unrestricted implementation of any of them**, and each stage is built only under its own
+> separately scoped, separately approved task. They do not displace R14 work or the already recorded
+> product-owner priority decisions. The shared input-scanner NTFS junction safety fix they were
+> originally gated behind is **no longer outstanding** — PR #88 merged on 2026-11-03 (`e6a7c0cd`).
 
 > **The security research programme is separate and is not re-prioritised here.** PR #75, the
 > Win32 primitive and the A/B/C/F owner decisions are recorded in their own evidence packages and
