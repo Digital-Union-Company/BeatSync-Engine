@@ -641,7 +641,30 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
 #: that has not happened yet and is consumed by Cut Video, while a handoff describes work that is
 #: over and is consumed by the Review button; sharing one slot would let a new analysis clear a
 #: finished job's record, or a finished job invalidate a plan.
-_EXPECTED_STATE_COUNT = 14
+#:
+#: **12 since R15-C, which is the first change to REMOVE state rather than add it.** Three of the
+#: names above are gone and one is new, and the arithmetic is worth spelling out because this pin
+#: exists precisely so a change to the set is deliberate:
+#:
+#:   - `audio_review_state`   REMOVED. It held the Raw Audio Cutter's own page of exported clips for
+#:                            that tab's Keep/Discard buttons. R15-C removes that duplicated review
+#:                            surface in favour of the one canonical workflow in Media Library ->
+#:                            Audio Review, so there is no second page to hold.
+#:   - `audio_armed_state`    REMOVED with it. A sweep signature authorises one specific set of
+#:                            counts on one surface; with no Confirm on this tab there is no batch
+#:                            to arm. Audio Review's own `audio_preview_armed_state` is untouched.
+#:   - `audio_run_dir_state`  REPLACED, not merely renamed, by `audio_handoff_state`. The old one
+#:                            was a bare path string written whenever a run directory had been
+#:                            CREATED, so an export in which every clip failed still offered its
+#:                            empty folder for review. The new one is a `cut_handoff` record -- the
+#:                            exact sibling of the Raw Cutter's `cut_handoff_state`, and subject to
+#:                            the same `build()` gate, so the offer and the published-clip check are
+#:                            one object. A plain dict of primitives; nothing live enters it.
+#:
+#: Net: 14 - 3 + 1 = 12. Fewer states is not automatically an improvement, so the removal is pinned
+#: in both directions -- the count below, and the named-survivor list in the self-check, which still
+#: holds Audio Review's four.
+_EXPECTED_STATE_COUNT = 12
 
 
 def test_the_expected_state_count_matches_the_named_states():
@@ -655,15 +678,23 @@ def test_the_expected_state_count_matches_the_named_states():
     assert len(names) == _EXPECTED_STATE_COUNT, names
     for expected in ("session_state", "source_state", "prep_state", "variant_batch_state",
                      "director_proposal_state", "render_invocation_state",
-                     "audio_review_state",
                      # [R7.2] Named individually rather than counted, so a future state cannot
                      # satisfy the count by displacing one of these.
-                     "audio_armed_state", "audio_run_dir_state",
+                     # [FORK] Digital-Union (R15-C): `audio_review_state`, `audio_armed_state` and
+                     # `audio_run_dir_state` are removed from this list because the widgets are
+                     # removed; `audio_handoff_state` is the record that replaces the last of them.
+                     "audio_handoff_state",
                      "audio_preview_state", "audio_preview_armed_state",
                      # [R8 Final Polish] Video Review's own sweep signature, named for the same
                      # reason: a later state must not satisfy the count by displacing it.
                      "clips_armed_state"):
         assert expected in names, f"{expected} missing from {names}"
+    # [FORK] Digital-Union (R15-C): the removal has a positive half too. Asserting only the count
+    # would be satisfied by deleting three *other* states, so the three that R15-C retires are
+    # named as absent.
+    for retired in ("audio_review_state", "audio_armed_state", "audio_run_dir_state"):
+        assert retired not in names, (
+            f"{retired} is back; R15-C retires the Audio Cutter's own review state")
     assert "gr.State" in source
 
 

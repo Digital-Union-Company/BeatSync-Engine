@@ -148,20 +148,37 @@ def offer_text(record, action: str) -> str:
     return f"▶ {described} — press “{action}” to review them."
 
 
-def loaded_text(record) -> str:
-    """What Video Review's report says once the folder has been filled in.
+#: The review section a handoff lands on when the caller does not name one. It is a default rather
+#: than this module's only answer because R15-C gave the Audio Cutter the same handoff, and the one
+#: thing that genuinely differs between the two is which section of Media Library is being filled
+#: in. Keeping Video Review as the default preserves R11's exact wording, and its pinned tests,
+#: byte for byte.
+DESTINATION_VIDEO_REVIEW = "Video Review"
+#: R15-C: the Audio Cutter's only review surface.
+DESTINATION_AUDIO_REVIEW = "Audio Review"
+
+
+def loaded_text(record, destination: str = DESTINATION_VIDEO_REVIEW) -> str:
+    """What the review section's report says once the folder has been filled in.
 
     It states the three facts the operator needs and then stops: which folder, whether subfolders
     are included, and that scanning is still their own deliberate action. It never claims anything
     was scanned, moved or read — because nothing was.
+
+    [FORK] Digital-Union (R15-C): `destination` names the section, the same way :func:`offer_text`
+    already takes the button's own label rather than importing one — so one record type serves both
+    cutters without this module growing a second copy of the sentence. A blank or non-string value
+    falls back to the default rather than producing "Media Library → None".
     """
     valid = read(record)
     if valid is None:
         return ""
+    section = destination.strip() if isinstance(destination, str) and destination.strip() \
+        else DESTINATION_VIDEO_REVIEW
     scope = ("Subfolders are included, because each source in the batch has its own folder."
              if valid["recursive"] else
              "Subfolders are excluded: this job wrote its clips into that one folder.")
-    return ("Loaded the clips from your finished cut into Media Library → Video Review:\n"
+    return (f"Loaded the clips from your finished cut into Media Library → {section}:\n"
             f"{valid['directory']}\n"
             f"{summary(record)}.\n"
             f"{scope}\n"

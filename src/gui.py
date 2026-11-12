@@ -10266,20 +10266,36 @@ def _audio_fade_line(settings: dict, segments) -> str:
 
 
 def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, fmt,
-                  fade_edges=False, request: gr.Request = None):
+                  fade_edges=False):
     """Cut: re-analyze, then write each planned clip into a fresh timestamped run folder.
+
+    [FORK] Digital-Union (R15-C): the injected `gr.Request` is gone from the signature. It existed
+    only to scope a registry publication to one browser session, and nothing is published here any
+    more. Dropping it is safe because Gradio injects a request only for a parameter annotated as
+    one, so no positional index moves.
 
     Re-analyzing rather than trusting the on-screen plan is deliberate and matches the Raw Cutter:
     the file or a setting may have changed since Analyze, and writing a stale plan would export
     clips that do not correspond to anything the operator was shown.
 
-    [R7.2] The clips it wrote are then published into the audio registry, so the gallery can fetch
-    them on hover instead of carrying their bytes. **Publication cannot fail the cut**: the files
-    are already on disk and the report already says so, so a registry refusal costs the preview and
-    nothing else.
+    [FORK] Digital-Union (R15-C): the clips it wrote are **no longer published into a registry
+    here**, because the Audio Cutter no longer carries a review gallery. What it publishes instead
+    is one `cut_handoff` record naming its own run directory, which "Open results in Media Library"
+    then hands to Media Library → Audio Review — the single review surface. Two consequences, both
+    deliberate:
+
+    * **A cut that wrote nothing offers nothing.** `fork_handoff.build` answers `None` unless at
+      least one clip reached disk, so an all-failed export cannot hand an empty folder to review.
+      That gate used to be absent: the run directory was returned whenever it had been *created*.
+    * **No FFprobe duration pass runs on the export path any more.** Publishing a page measured
+      every clip to label its tile; with no tile to label, that work is gone rather than hidden.
+      The clip timings the operator needs are still on screen in the plan table and still recorded
+      in the manifest.
     """
     settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt, fade_edges)
-    blank = (AUDIO_GALLERY_EMPTY_HTML, AUDIO_COUNTS_INITIAL_TEXT, '', {}, '')
+    #: No handoff: there is no finished run to review. One value, because the review half of this
+    #: tab is gone and the only state a refusal still has to clear is the offer itself.
+    blank = (None,)
 
     mp3_problem = _audio_mp3_problem(settings['format'])
     if mp3_problem:
@@ -10313,7 +10329,7 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
                 rows, *blank)
 
     ffmpeg, _ = _audio_tools()
-    written, failures, paths, spans = {}, [], [], {}
+    written, failures = {}, []
     for segment in segments:
         name = fork_audio.clip_filename(stem, segment.index, settings['format'])
         destination = os.path.join(run_directory, name)
@@ -10324,14 +10340,6 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
             timeout=fork_audio.EXTRACT_TIMEOUT_SECONDS)
         if code == 0 and os.path.isfile(destination):
             written[segment.index] = name
-            paths.append(destination)
-            # Keyed by the decision identity so the span survives paging exactly as a decision
-            # does. It is the one thing the Audio Preview tab cannot know and this one can: where
-            # in the original recording the clip came from.
-            spans[fork_clips.decision_identity(destination, os.path.getsize(destination),
-                                               os.stat(destination).st_mtime_ns)] = (
-                f"{fork_audio.format_timecode(segment.start)}"
-                f"→{fork_audio.format_timecode(segment.end)}")
         else:
             detail = (log or '').strip().splitlines()
             failures.append(f"clip {segment.index}: {detail[-1] if detail else 'failed'}")
@@ -10358,16 +10366,22 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
               "Your source file was not modified."]
     if failures:
         lines += ['', "Not written:"] + [f"  • {line}" for line in failures]
-    report = "\n".join(lines) + manifest_note
 
-    # [R7.2] The review surface is the gallery, now backed by the registry. Decisions start empty
-    # -- every clip is undecided until the operator says otherwise -- and Confirm needs at least
-    # one KEEP before it will move anything.
-    view, publish_note = _audio_load_view(
-        _AUDIO_SURFACE_CUT, request, paths, run_directory, recursive=False,
-        page_index=1, page_size=fork_audio_review.DEFAULT_PAGE_SIZE, spans=spans)
-    gallery, counts = _audio_render(_AUDIO_SURFACE_CUT, view)
-    return (report + publish_note, rows, gallery, counts, '', view, run_directory)
+    # [FORK] Digital-Union (R15-C): the finished run's own handoff record, and the one line that
+    # offers it. `clips=len(written)` is the count that actually reached disk, which is what makes
+    # `build` refuse an empty export -- passing `len(segments)` would be the planned count and
+    # would defeat the only gate this record has. The outcome is read off the failure list rather
+    # than assumed: a cut with some clips missing must not be described as clean. There is no
+    # CANCELLED case because the Audio Cutter has no Cancel.
+    handoff = fork_handoff.build(
+        run_directory, mode=fork_handoff.MODE_SINGLE, clips=len(written),
+        outcome=(fork_handoff.OUTCOME_PARTIAL if failures
+                 else fork_handoff.OUTCOME_COMPLETED))
+    offer = fork_handoff.offer_text(handoff, LABEL_AUDIO_OPEN_IN_PREVIEW)
+    if offer:
+        lines += ['', offer]
+    report = "\n".join(lines) + manifest_note
+    return (report, rows, handoff)
 
 
 # =============================================================================================
@@ -10400,11 +10414,19 @@ class _AudioSurface:
         self.empty_message = empty_message
 
 
-_AUDIO_SURFACE_CUT = _AudioSurface(
-    'cutter', _AUDIO_CUT_REGISTRY, fork_audio_review.MEDIA_PREFIX_CUTTER,
-    fork_audio_review.GRID_CUTTER, 'audio-decisions', 'audio-counts',
-    'No clips to review. Cut a recording first.')
-
+# [FORK] Digital-Union (R15-C): `_AUDIO_SURFACE_CUT` is gone. The Audio Cutter had a second,
+# duplicated review surface -- its own gallery, destinations, Confirm, sweep gate and sort -- and
+# R15-C removes it in favour of the one canonical workflow in Media Library → Audio Review. The
+# shared core below is therefore now parameterised for exactly one surface, and is kept
+# parameterised deliberately rather than inlined: R15-B's Folder Batch is expected to want it.
+#
+# `_AUDIO_CUT_REGISTRY` and its `/r7audio` middleware mount are **kept on purpose**, and that is a
+# decision rather than an oversight. Nothing publishes a page into that registry any more, so every
+# request to the prefix answers `403 unknown_session` -- but `audio_review.MEDIA_PREFIX_CUTTER` is
+# still the module-level DEFAULT prefix for `media_url` and `gallery_html`, so un-mounting it would
+# leave that default pointing at a route Gradio would 404 instead. Narrowing a reviewed
+# authorization boundary is its own change, with its own evidence; it is not a side effect of
+# deleting a tab's widgets.
 _AUDIO_SURFACE_PREVIEW = _AudioSurface(
     'preview', _AUDIO_PREVIEW_REGISTRY, fork_audio_review.MEDIA_PREFIX_PREVIEW,
     fork_audio_review.GRID_PREVIEW, 'audio-preview-decisions', 'audio-preview-counts',
@@ -10493,6 +10515,69 @@ def _audio_page_decisions(view) -> dict:
     identity = view.get('identity') or {}
     return {clip_id: stored.get(key, fork_audio_review.PENDING)
             for clip_id, key in identity.items()}
+
+
+def _audio_page_is_live(surface, view) -> bool:
+    """Is the page this view describes still the owner's live page in the registry?
+
+    [FORK] Digital-Union (R15-C, review finding F-1). **The authority question, asked of the
+    server rather than of the request's own arguments.**
+
+    Every Gradio handler receives its inputs *by value at submit time*, so a Confirm or Proceed
+    that was already in flight still carries the page it was submitted with. R15-C's first attempt
+    retired a page by writing an empty view into `audio_preview_state`, which only changes what the
+    **next** event is given — so an event already holding the previous folder's view sorted that
+    folder anyway, and the terminal frame said `✅ Sorted all 3 clip(s).` Reproduced
+    deterministically before this gate existed.
+
+    The registry is the authority that already exists for this, and it is the one
+    `.claude/rules/clips-preview.md` requires be used: *"anything that needs to retire a page must
+    call this rather than add a second notion of 'the current page' beside it."* A revoked session
+    also **clears its page's clip map**, so there is nothing left to resolve — which is why one
+    question answers both halves: the decision path refuses here, and the media route refuses at
+    `open_authorized`.
+
+    `page_entries` is the read, not `resolve`: it asks about the *page*, needs no clip id, and goes
+    through the same `_session_by_id` gates, so a session that is unknown, revoked or malformed and
+    a page that is unknown or expired all answer the same way. A view with no tokens at all is not
+    live either — that is the empty view, and treating it as live would re-open the hole.
+
+    Deliberately NOT a new coordinator, a generation counter or a second notion of the current
+    page. It is one read of the registry the surface already owns.
+    """
+    session = (view or {}).get('session') or ''
+    page = (view or {}).get('page') or ''
+    if not session or not page:
+        return False
+    try:
+        surface.registry.page_entries(session, page)
+    except fork_clips.Refusal:
+        return False
+    return True
+
+
+def _audio_retire_page(surface, request) -> None:
+    """Revoke this owner's review session on `surface`. The real retirement.
+
+    [FORK] Digital-Union (R15-C, review findings F-1 and F-2). `revoke_owner` is the existing,
+    reviewed mechanism — the audio sibling of the Clips Preview's `invalidate(owner)`, which R11's
+    own F-1 added for exactly this reason. Three properties come with it rather than being
+    re-implemented here:
+
+    * it is **per-owner**, so another browser session keeps its own page and session id;
+    * it is **not a decision** — this class holds pages, not decisions, so the operator's kept and
+      discarded marks survive untouched and no durable store is written;
+    * a revoked page **clears its clip map**, so the retired folder's clips stop being fetchable
+      over the media route as well. That was finding F-2: before this, the previous folder's clips
+      stayed servable after the handoff.
+
+    A session with no browser identity has no page to retire; it still gets the repainted empty
+    state, which is what its own Scan would show anyway.
+    """
+    try:
+        surface.registry.revoke_owner(_audio_owner(request))
+    except fork_clips.Refusal:
+        pass
 
 
 def _audio_render(surface, view) -> tuple:
@@ -10672,6 +10757,12 @@ def _audio_confirm_core(surface, view, payload, library, discarded, armed_signat
     The order of the gates is the contract:
 
     1. **nothing loaded** -- nothing to do, and nothing is said about folders;
+    1b. **the page is still the live one** -- see `_audio_page_is_live`. [FORK] Digital-Union
+        (R15-C review finding F-1.) This gate is what makes a retirement real: a Confirm or Proceed
+        already in flight carries the page it was submitted with, so without asking the registry it
+        would sort a folder the operator has already navigated away from. It comes before the
+        decisions are folded in and before anything is validated, because a dead page should not
+        even be reasoned about;
     2. **the page's own decisions are folded in first**, so Confirm acts on what is on screen;
     3. **at least one clip must be kept.** This is R7.2's admission rule, replacing R7.1's
        "nothing may be undecided": the operator marks the good clips and presses Confirm;
@@ -10685,6 +10776,15 @@ def _audio_confirm_core(surface, view, payload, library, discarded, armed_signat
     if not view.get('entries'):
         gallery, counts = _audio_render(surface, view)
         return ("Nothing has been loaded to review yet.", view, gallery, counts, '', False, False)
+
+    if not _audio_page_is_live(surface, view):
+        # [FORK] Digital-Union (R15-C, F-1). The page this event was submitted with has been
+        # retired. Nothing moves, and the view is replaced with the empty one so the screen stops
+        # asserting a page the server no longer holds. Returning the *stale* view here would repaint
+        # a grid of dead credentials, which is a state the operator cannot act on.
+        retired = {}
+        gallery, counts = _audio_render(surface, retired)
+        return (AUDIO_PAGE_RETIRED_TEXT, retired, gallery, counts, '', False, False)
 
     view = _audio_merge_payload(view, payload)
     plan = fork_audio_review.plan_sort(_audio_tiles(view), _audio_page_decisions(view),
@@ -10719,61 +10819,15 @@ def _audio_confirm_core(surface, view, payload, library, discarded, armed_signat
 
 
 # ---------------------------------------------------------------------------------------------
-# Surface 1: the Raw Audio Cutter's review half
+# [FORK] Digital-Union (R15-C): the Raw Audio Cutter's review half USED TO BE HERE.
+#
+# `_on_audio_confirm`, `_on_audio_proceed`, `_on_audio_cancel` and `_on_audio_destinations_change`
+# are deleted, not disabled and not aliased. They were a second implementation of the workflow
+# below -- a second pair of destination boxes, a second Confirm, a second sweep gate and a second
+# sort over the same `_audio_confirm_core` -- and two surfaces that can move an operator's files
+# is one more than the owner asked for. The Audio Cutter now exports and hands off; Audio Review
+# reviews. The shared core above is untouched and keeps every property its tests pin.
 # ---------------------------------------------------------------------------------------------
-
-def _on_audio_confirm(payload, library_folder, discarded_folder, view, armed):
-    """Sort the cutter's page: KEEP into the voice library, everything else into quarantine.
-
-    The gallery releases the player on `pointerdown` of this button, before Gradio sends the click.
-    That is not decoration: Windows will not rename a file a player still holds open, and the clip
-    the operator just listened to is exactly the one that would refuse to move.
-    """
-    message, view, gallery, counts, signature, gate, _ = _audio_confirm_core(
-        _AUDIO_SURFACE_CUT, view, payload, library_folder, discarded_folder, armed,
-        app_root=ROOT_DIR)
-    return (message, gallery, counts, view, signature,
-            gr.update(visible=gate), gr.update(visible=gate))
-
-
-def _on_audio_proceed(payload, library_folder, discarded_folder, view, armed):
-    """Proceed: the operator agreed to sweep the unmarked clips in THIS batch.
-
-    It re-runs the whole of Confirm rather than acting on anything the gate computed. The signature
-    is a change detector, not a credential: the plan is re-derived, the destinations are
-    re-validated, and if any of it moved since the gate was shown the sweep is refused and the new
-    counts are presented instead.
-    """
-    return _on_audio_confirm(payload, library_folder, discarded_folder, view, armed)
-
-
-def _on_audio_cancel(view):
-    """Cancel the sweep. Nothing has moved, nothing was decided on the operator's behalf, and the
-    batch stays exactly as it was -- which is what makes agreeing to a sweep safe to try.
-
-    It writes the **same seven outputs as Confirm**, including a repainted gallery. That is not
-    symmetry for its own sake: the grid nonce is what makes a `gr.HTML` update deliverable, so a
-    Cancel that changed no markup would not reach the browser and the hidden field would never be
-    re-published from the server's state.
-    """
-    updated = dict(view or {})
-    updated['armed'] = ''
-    gallery, counts = _audio_render(_AUDIO_SURFACE_CUT, updated)
-    return (AUDIO_SWEEP_CANCELLED_TEXT, gallery, counts, updated, '',
-            gr.update(visible=False), gr.update(visible=False))
-
-
-def _on_audio_destinations_change(library_folder, discarded_folder, view):
-    """[R7.2 Phase 4] The live read-out beside the two destination boxes.
-
-    Runs on every edit of either field, so the operator's reported problem -- both boxes pointing
-    at the same folder -- is visible while they are still typing rather than only when Confirm
-    refuses. **It validates and reports; it never sorts, never writes a folder and never touches
-    the gallery**, so a half-typed configuration leaves the page fully reviewable.
-    """
-    _, message = fork_audio_review.destination_feedback(
-        (view or {}).get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
-    return message
 
 
 # ---------------------------------------------------------------------------------------------
@@ -10958,8 +11012,17 @@ def _on_audio_preview_confirm(payload, library_folder, discarded_folder, page_si
 
 def _on_audio_preview_proceed(payload, library_folder, discarded_folder, page_size, view, armed,
                               request: gr.Request = None):
-    """Proceed with the sweep this batch was armed for. Re-derives everything; see
-    `_on_audio_proceed` for why the signature is a change detector rather than a credential."""
+    """Proceed with the sweep this batch was armed for.
+
+    It re-runs the whole of Confirm rather than acting on anything the gate computed. The signature
+    is a **change detector, not a credential**: the plan is re-derived, the destinations are
+    re-validated, and if any of it moved since the gate was shown the sweep is refused and the new
+    counts are presented instead.
+
+    [FORK] Digital-Union (R15-C): this used to cross-refer to the cutter's `_on_audio_proceed` for
+    that explanation. That function is gone with the cutter's review half, so the reasoning is
+    stated here, where the only remaining Proceed lives.
+    """
     return _on_audio_preview_confirm(payload, library_folder, discarded_folder, page_size,
                                      view, armed, request)
 
@@ -10985,7 +11048,7 @@ def _on_audio_preview_destinations_change(library_folder, discarded_folder, view
     return message
 
 
-def _on_audio_open_in_library(run_directory):
+def _on_audio_open_in_library(handoff, request: gr.Request = None):
     """"Open results in Media Library": hand this cut's output folder to Audio Review.
 
     It only fills the folder box and selects the section. **It deliberately does not scan**,
@@ -10997,17 +11060,120 @@ def _on_audio_open_in_library(run_directory):
     section. Returning only the inner one lands the operator on whichever top-level tab they were
     already on, with an invisible selection applied underneath; returning only the outer one shows
     Media Library on whatever section was last open. Both halves are therefore load-bearing, and a
-    failure path must still return an update for each of the four outputs or Gradio mis-aligns them.
+    failure path must still return an update for each output or Gradio mis-aligns them.
+
+    [FORK] Digital-Union (R15-C). Three changes, each closing something the old version did wrong
+    now that this button is the *only* way to review an exported cut:
+
+    * **What arrives is the finished job's `cut_handoff` record, not a bare path string.** It is
+      re-validated through `fork_handoff.read` rather than trusted, because it has been
+      round-tripped through session state and is untrusted input on the way back in. The record
+      carries its own published-clip gate, so a cut that wrote nothing cannot offer a folder.
+    * **The directory is re-checked with one `isdir`**, asked now rather than cached: a record
+      describes a job that finished, not a disk that has stayed still since. A folder that has gone
+      is reported, never repaired and never silently replaced with one that still exists.
+    * **A successful handoff retires whatever Audio Review was holding**, through
+      `_audio_handoff_retire_review`. This is the audio half of the R11 F-1 hazard, and it is a
+      real one rather than a cosmetic one: filling the folder box with a new folder while the
+      gallery, the counts and an armed sweep all still described the *previous* one meant pressing
+      Confirm sorted the previous folder -- and an armed sweep moved its unmarked clips into
+      Discarded -- while every visible label named the new one.
+
+    The refusal paths deliberately retire **nothing**. They change the report and nothing else, so
+    a mis-press cannot cost an operator the page they were working on; a handoff that was refused
+    has not moved Audio Review anywhere.
+
+    [FORK] Digital-Union (R15-C, review findings F-1 and F-2): the injected `gr.Request` is back,
+    and it is load-bearing. The retirement now **revokes the owner's registry session** rather than
+    only writing an empty view into `gr.State`, and a revocation needs to know whose page to
+    retire. An earlier version of this handler took no request on the reasoning that it "owns no
+    per-owner page" -- that reasoning was exactly wrong, and is what left the retirement unable to
+    stop an event that was already in flight.
     """
-    folder = str(run_directory or '').strip()
-    if not folder:
-        return (gr.update(), gr.update(), gr.update(),
-                "Cut some clips first — there is no output folder to open yet.")
+    record = fork_handoff.read(handoff)
+    if record is None:
+        return _audio_handoff_refused(AUDIO_HANDOFF_NONE_TEXT)
+    folder = record['directory']
+    if not os.path.isdir(folder):
+        return _audio_handoff_refused(AUDIO_HANDOFF_MISSING_TEXT.format(folder=folder))
     return (gr.update(value=folder),
+            gr.update(value=record['recursive']),
             gr.Tabs(selected='tab-media-library'),
-            gr.Tabs(selected='tab-audio-review'),
-            f"Loaded the folder into Media Library → Audio Review:\n{folder}\n"
-            f"Press Scan Folder there when you are ready to review it.")
+            gr.Tabs(selected='tab-audio-review')) \
+        + _audio_handoff_retire_review(
+            fork_handoff.loaded_text(
+                record, destination=fork_handoff.DESTINATION_AUDIO_REVIEW),
+            request)
+
+
+def _audio_handoff_refused(message):
+    """Every output of a handoff that was REFUSED: say why, and leave everything else alone.
+
+    [FORK] Digital-Union (R15-C). The folder box, the recursion tick and both tab containers get a
+    bare `gr.update()`, so a mis-press does not navigate anywhere or redirect a review. Audio
+    Review's own report carries the reason -- it is the surface the operator was being sent to, and
+    the Audio Cutter's cut report must not be overwritten by it, because that report describes files
+    that really were written.
+
+    The remaining eight review outputs are left untouched, which is the whole point: **a refused
+    handoff retires nothing.** The operator keeps the page, the decisions and the armed sweep they
+    already had.
+
+    A fresh tuple per call rather than a module-level constant, because a `gr.update()` payload is
+    a mutable mapping and one shared instance would be handed to every session's response -- the
+    same reason `_cut_handoff_review_unchanged` builds its seven fresh.
+    """
+    unchanged = tuple(gr.update() for _ in range(len(_AUDIO_PREVIEW_OUTPUT_ORDER) - 1))
+    return (gr.update(), gr.update(), gr.update(), gr.update(), message) + unchanged
+
+
+def _audio_handoff_retire_review(message, request):
+    """Retire whatever Audio Review currently holds, and repaint it.
+
+    [FORK] Digital-Union (R15-C), the audio sibling of `_cut_handoff_retire_review`. The handoff
+    changes which folder Audio Review is *about*, so everything that made the previous folder
+    actionable has to stop being actionable: the frozen page of entries, the decisions keyed against
+    it, the counts, the page label and any sweep the operator had already armed.
+
+    **`_audio_retire_page` is the mechanism; the empty view and the widget updates are consequences
+    of it.** [FORK] Digital-Union (R15-C review finding F-1) -- and that ordering is the whole
+    correction. This function first said the opposite: it wrote an empty view into
+    `audio_preview_state` and called *that* the retirement. A `gr.State` write only changes what the
+    **next** event is handed, so a Confirm or Proceed already in flight -- Gradio gave it its
+    arguments at submit time -- still carried the previous folder's live page and sorted it. Both
+    halves are now real:
+
+    * the registry session is **revoked**, so the decision path refuses (`_audio_page_is_live`) and
+      the media route refuses (`open_authorized`), whenever the event was submitted;
+    * the empty view and the cleared signature stop the *screen* asserting a page the server no
+      longer holds. A disabled control is not an authorization boundary, and this one is not asked
+      to be.
+
+    Revoking **before** returning the repaint matters: the repaint is the slow part to reach the
+    browser, and authority must be gone the instant the handoff is handled, not whenever the
+    response lands.
+
+    It is assembled through `_audio_preview_outputs` rather than by listing nine updates, so there
+    is exactly one notion of "no current page" and a tenth output could not be forgotten here.
+
+    The destination read-out is left alone with `gr.update()`. It describes the two folders the
+    operator has typed, not the folder being reviewed; the next Scan recomputes it, and Confirm
+    re-validates both folders before moving a byte regardless of what it says.
+
+    This reaches no disk and publishes no page: with no entries, `_audio_render` returns on the
+    empty branch, exactly as the Cancel path already does.
+
+    **What it does not promise, stated narrowly and not widened.** A *scan* that was already in
+    flight finishes by minting a fresh session for the folder it was scanning, so it can still
+    republish that folder as a live page after the handoff -- the audio surface has no generation
+    counter to order the two, and adding one would be a second notion of the current page that
+    `.claude/rules/clips-preview.md` forbids. The consequence is bounded to presentation: the
+    republished page is live, is the page the gallery is actually showing, and its own report names
+    the folder it scanned, so a later Confirm acts on what is on screen. Authority is consistent;
+    the folder textbox can be stale. See `.claude/rules/audio-review.md` (R15-C / F-3).
+    """
+    _audio_retire_page(_AUDIO_SURFACE_PREVIEW, request)
+    return _audio_preview_outputs(message, {}, gr.update(), gate=False, signature='')
 
 
 def _cut_handoff_review_unchanged():
@@ -13164,106 +13330,39 @@ def create_ui() -> gr.Blocks:
                             interactive=False, lines=8, max_lines=16,
                             elem_id='audio-report-box')
 
-                # The review half: listen to what was actually written, then file it.
+                # [FORK] Digital-Union (R15-C): the review half USED TO BE HERE, and it is gone.
+                #
+                # A second pair of destination boxes, a second hover gallery, a second Confirm, a
+                # second sweep gate and a second sort all lived in this tab, doing the same job as
+                # Media Library -> Audio Review on the same files. What replaces all of it is one
+                # button beside the cut result. Exporting and reviewing are now separate steps on
+                # separate surfaces, and only one of them can move an operator's files.
+                #
+                # `AUDIO_GALLERY_CSS` was rendered here as well as in Audio Review; only this copy
+                # is removed. The stylesheet keys every rule on a CLASS rather than on a grid id
+                # precisely so one copy styles whichever galleries exist, so Audio Review's grid is
+                # unaffected.
                 with gr.Group():
-                    gr.Markdown(f"### {LABEL_AUDIO_REVIEW}\n\n{INFO_AUDIO_REVIEW}")
-                    with gr.Row():
-                        audio_library_folder = gr.Textbox(
-                            label=LABEL_AUDIO_LIBRARY,
-                            info=INFO_AUDIO_LIBRARY,
-                            value=_pref(fork_prefs.AUDIO_LIBRARY),
-                            placeholder=r"J:\Voice Library",
-                            elem_id='audio-library-folder')
-                        audio_discarded_folder = gr.Textbox(
-                            label=LABEL_AUDIO_DISCARDED,
-                            info=INFO_AUDIO_DISCARDED,
-                            value=_pref(fork_prefs.AUDIO_DISCARDED),
-                            placeholder=r"J:\Voice Discarded",
-                            elem_id='audio-discarded-folder')
-                    with gr.Row():
-                        audio_library_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='audio-library-browse')
-                        audio_discarded_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='audio-discarded-browse')
-                    # [R7.2 Phase 4] The live destination read-out. Written by the two folder
-                    # `.change()` handlers and by Confirm, so "these two folders are the same" is
-                    # visible while the operator is still typing rather than only when a sort is
-                    # refused -- which is the defect reported from real use.
-                    audio_destination_status = gr.Textbox(
-                        label=LABEL_AUDIO_DESTINATION_STATUS,
-                        value=AUDIO_DESTINATION_STATUS_INITIAL,
-                        interactive=False, lines=2, max_lines=5,
-                        elem_id='audio-destination-status')
-                    gr.Markdown(INFO_AUDIO_GALLERY)
-                    gr.HTML(AUDIO_GALLERY_CSS)
-                    with gr.Row():
-                        audio_enable_hover = gr.Button(
-                            LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
-                            elem_id='audio-enable-hover',
-                            elem_classes=['r7-enable-hover'])
-                        audio_counts = gr.Textbox(
-                            label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
-                            interactive=False, elem_id='audio-counts')
-                    audio_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
-                                            elem_id='audio-gallery')
-                    # The ONE server contract with the page: every decision and every edited name
-                    # as JSON. Hidden because it is machinery, not a control -- but a real widget,
-                    # so Gradio carries it with the click like any other input.
-                    # NOT `visible=False`: Gradio drops an invisible component from the DOM
-                    # entirely, and the page has to be able to write into this one. It is hidden
-                    # with CSS instead -- present, carried with the click, and off screen.
-                    audio_decisions = gr.Textbox(
-                        value='', label=' ', elem_id='audio-decisions')
-                    audio_confirm_btn = gr.Button(
-                        LABEL_AUDIO_CONFIRM, variant='primary',
-                        elem_id='audio-confirm-button',
-                        # The client releases the player on `pointerdown` of anything carrying
-                        # this class. Windows will not rename a file a player still holds open.
-                        elem_classes=['r7-release-audio'])
-                    # [R7.2 Phase 3] The sweep gate. Hidden until Confirm finds unmarked clips, and
-                    # hidden again the moment the batch is resolved either way, so the screen never
-                    # offers a Proceed that is not attached to a specific set of counts.
-                    with gr.Row():
-                        audio_proceed_btn = gr.Button(
-                            LABEL_AUDIO_PROCEED, variant='stop', visible=False,
-                            elem_id='audio-proceed-button',
-                            elem_classes=['r7-release-audio'])
-                        audio_sweep_cancel_btn = gr.Button(
-                            LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
-                            elem_id='audio-sweep-cancel-button')
                     audio_open_preview_btn = gr.Button(
                         LABEL_AUDIO_OPEN_IN_PREVIEW, variant='secondary',
                         elem_id='audio-open-preview-button')
                     gr.Markdown(INFO_AUDIO_OPEN_IN_PREVIEW)
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            audio_clip_name = gr.Textbox(
-                                label=LABEL_AUDIO_CLIP_NAME,
-                                info=INFO_AUDIO_CLIP_NAME,
-                                value='', visible=False, elem_id='audio-clip-name')
-                        with gr.Column(scale=3):
-                            # [R7.1] Kept as a fallback player for a single clip, hidden by
-                            # default: the gallery's hover playback is the review surface now.
-                            audio_player = gr.HTML(
-                                value='', visible=False, elem_id='audio-player')
-                    audio_file_report = gr.Textbox(
-                        label=LABEL_AUDIO_FILE_REPORT,
-                        value=AUDIO_FILE_REPORT_INITIAL_TEXT,
-                        interactive=False, lines=4, max_lines=10,
-                        elem_id='audio-file-report')
-                    # Per-browser-session, so one operator's review list is not reachable from
-                    # another tab. Nothing about the clips lives in a module-level record.
+                    # [FORK] Digital-Union (R15-C): the finished cut's own handoff record, and the
+                    # only state this tab's export half still needs. It REPLACES
+                    # `audio_run_dir_state`, which was a bare path string written whenever a run
+                    # directory had been CREATED -- so an export in which every clip failed still
+                    # offered its empty folder for review. A record carries the published-clip
+                    # count, and `cut_handoff.build` answers None below one, so the offer and the
+                    # gate are the same object.
                     #
-                    # [R7.2] Holds the whole view: the registry session and page tokens, the frozen
-                    # entries, and the decision/name records keyed by FILE IDENTITY so they survive
-                    # paging. `audio_armed_state` holds the sweep signature of the batch the
-                    # operator confirmed, and only that batch -- a plain string, never a live
-                    # object.
-                    audio_review_state = gr.State({})
-                    audio_armed_state = gr.State('')
-                    audio_run_dir_state = gr.State('')
+                    # `audio_review_state` and `audio_armed_state` are gone with the surface that
+                    # owned them: there is no page to hold and no sweep to arm on this tab.
+                    #
+                    # Per-session like every other state, and here that is load-bearing rather
+                    # than conventional -- a process-global handoff would let one operator's cut
+                    # redirect another operator's review. A plain dict of primitives; nothing live
+                    # enters it.
+                    audio_handoff_state = gr.State(None)
 
                 gr.Markdown(INFO_AUDIO_LAYERS_TIP)
 
@@ -14283,9 +14382,12 @@ def create_ui() -> gr.Blocks:
                 (pref_rejected_browse, pref_rejected),
                 (pref_raw_output_browse, pref_raw_output),
                 # [FORK] R7: the Audio Cutter's folder fields use the same self-contained helper.
+                # [FORK] Digital-Union (R15-C): its two review destinations and their Browse
+                # buttons went with the review half; only the export destination is left. The
+                # SAVED keys are untouched -- Settings still owns `AUDIO_LIBRARY` and
+                # `AUDIO_DISCARDED` through the two `pref_audio_*` rows below, and Audio Review's
+                # own destinations still fall back to them, so nothing was orphaned by the removal.
                 (audio_output_browse, audio_output),
-                (audio_library_browse, audio_library_folder),
-                (audio_discarded_browse, audio_discarded_folder),
                 (pref_audio_library_browse, pref_audio_library),
                 (pref_audio_discarded_browse, pref_audio_discarded),
                 (pref_audio_output_browse, pref_audio_output),
@@ -14421,76 +14523,18 @@ def create_ui() -> gr.Blocks:
         )
         audio_cut_btn.click(
             fn=_on_audio_cut,
-            # [FORK] R8 Phase 9: `audio_fade_edges` is APPENDED last, before the injected
-            # `gr.Request`, so every pre-existing positional index is unchanged. Analyze is
-            # deliberately NOT given it: fades change what is written, never where a clip begins
-            # or ends, so the plan on screen is identical either way and adding it there would
-            # imply the planner had changed.
+            # [FORK] R8 Phase 9: `audio_fade_edges` is APPENDED last. Analyze is deliberately NOT
+            # given it: fades change what is written, never where a clip begins or ends, so the
+            # plan on screen is identical either way and adding it there would imply the planner
+            # had changed.
             inputs=[audio_source, audio_output, audio_threshold, audio_min_silence,
                     audio_pad, audio_min_clip, audio_format, audio_fade_edges],
-            outputs=[audio_report, audio_table, audio_gallery, audio_counts,
-                     audio_decisions, audio_review_state, audio_run_dir_state],
-            concurrency_limit=None,
-        )
-        # [R7.1] ONE filing action, as the Clips Preview has. The browser contributes a decision
-        # and a name per clip id through `audio_decisions`; every path comes from the server's own
-        # frozen page, so the page cannot name a file to move.
-        #
-        # [R7.2] Confirm, Proceed and Cancel all write the SAME seven outputs through the same
-        # core, which is what keeps the sweep gate honest: there is no path on which Proceed can
-        # move a file that Confirm would not have moved, because Proceed *is* Confirm with the
-        # batch's signature supplied.
-        _audio_confirm_inputs = [audio_decisions, audio_library_folder, audio_discarded_folder,
-                                 audio_review_state, audio_armed_state]
-        _audio_confirm_outputs = [audio_file_report, audio_gallery, audio_counts,
-                                  audio_review_state, audio_armed_state,
-                                  audio_proceed_btn, audio_sweep_cancel_btn]
-        audio_confirm_btn.click(
-            fn=_on_audio_confirm,
-            inputs=_audio_confirm_inputs,
-            outputs=_audio_confirm_outputs,
-            concurrency_limit=None,
-        )
-        audio_proceed_btn.click(
-            fn=_on_audio_proceed,
-            inputs=_audio_confirm_inputs,
-            outputs=_audio_confirm_outputs,
-            concurrency_limit=None,
-        )
-        audio_sweep_cancel_btn.click(
-            fn=_on_audio_cancel,
-            inputs=[audio_review_state],
-            outputs=_audio_confirm_outputs,
-            concurrency_limit=None,
-        )
-        # [R7.2 Phase 4] Immediate destination validation. Both fields reach the same handler and
-        # it writes ONE read-only textbox -- never the gallery, never a decision, never a folder.
-        #
-        # Registered explicitly per widget rather than in a loop, which is the convention the
-        # Freestyle dropdowns already follow and for the same reason: a loop body produces
-        # `_field.change(...)` in the syntax tree, so every per-widget seam assertion in the suite
-        # becomes unable to find the binding and the guard silently stops guarding.
-        audio_library_folder.change(
-            fn=_on_audio_destinations_change,
-            inputs=[audio_library_folder, audio_discarded_folder, audio_review_state],
-            outputs=[audio_destination_status],
-            concurrency_limit=None,
-        )
-        audio_discarded_folder.change(
-            fn=_on_audio_destinations_change,
-            inputs=[audio_library_folder, audio_discarded_folder, audio_review_state],
-            outputs=[audio_destination_status],
-            concurrency_limit=None,
-        )
-        # [R7.2 Phase 2] "Open results in Media Library" fills Audio Review's folder box and
-        # selects it. It scans nothing, which is the requirement: no folder is read as a side
-        # effect of anything but a deliberate Scan.
-        # [R8 Commit A] Two tab containers in `outputs`, because the destination is now a section
-        # inside Media Library -- see the handler's docstring for why one is not enough.
-        audio_open_preview_btn.click(
-            fn=_on_audio_open_in_library,
-            inputs=[audio_run_dir_state],
-            outputs=[audio_preview_folder, main_tabs, library_tabs, audio_file_report],
+            # [FORK] Digital-Union (R15-C): three outputs, down from seven. The gallery, the
+            # counts and the hidden decision field belonged to a review surface this tab no longer
+            # has, and `audio_review_state` went with them. What is left is the plan table, the cut
+            # report and the finished run's handoff record -- which is the only thing the export
+            # half still has to tell the rest of the app.
+            outputs=[audio_report, audio_table, audio_handoff_state],
             concurrency_limit=None,
         )
 
@@ -14563,6 +14607,40 @@ def create_ui() -> gr.Blocks:
             fn=_on_audio_preview_destinations_change,
             inputs=[audio_preview_library, audio_preview_discarded, audio_preview_state],
             outputs=[audio_preview_destination_status],
+            concurrency_limit=None,
+        )
+
+        # [FORK] Digital-Union (R15-C): "Open results in Media Library", the Audio Cutter's one
+        # remaining review action. Registered HERE, after the Audio Review registrations, for one
+        # concrete reason: its `outputs` reuse `_audio_preview_outputs_list`, which is assigned
+        # just above. A nine-widget list retyped here would be a second copy to keep in step by
+        # hand, and the entry that got forgotten would be the one left asserting a page the server
+        # had already retired.
+        #
+        # It stays well clear of the span that another suite slices for the Video Review
+        # registrations, which is bounded by that section's own first registration and the first
+        # app-load hook and pins the count inside it; every Audio Review event, and this one, sort
+        # earlier than that boundary.
+        #
+        # `inputs` is the handoff record and nothing else. That substitution is half the feature:
+        # with the run-directory widget as the input, editing a folder box after a cut finished
+        # silently redirected that finished cut's review. The record is frozen when the cut ended.
+        #
+        # Thirteen outputs: the folder box, the recursion tick, both tab containers, and then the
+        # nine Audio Review outputs the retirement repaints. None of those nine is the safety
+        # mechanism -- `_audio_handoff_retire_review` hands back an empty view, and Confirm,
+        # Proceed and the sort then refuse because there is no page, not because something in the
+        # browser went grey. A refused handoff writes the reason into Audio Review's report and
+        # `gr.update()` to the other eight, so it leaves the operator's page exactly as it was.
+        #
+        # Not a render and not a cut: no `_RENDER_LOCK`, no cutter lane, and `concurrency_limit=None`
+        # for the measured S2-A R3 reason -- a lane of 1 would queue a second press rather than let
+        # it run.
+        audio_open_preview_btn.click(
+            fn=_on_audio_open_in_library,
+            inputs=[audio_handoff_state],
+            outputs=[audio_preview_folder, audio_preview_recursive, main_tabs, library_tabs]
+                    + _audio_preview_outputs_list,
             concurrency_limit=None,
         )
 
