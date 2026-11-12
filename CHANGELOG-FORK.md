@@ -20,6 +20,839 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-12 (R14-R1: building the interface no longer creates the shared cache folder)
+
+**Starting the GUI materialised a configured shared analysis-cache folder.** Nothing had to be
+clicked. `analysis_cache.resolve_location` creates the configured folder when its parent exists —
+correct for an analysis, wrong for a read-out — and the Cache Management category list is built at
+**UI construction time** precisely so a shared folder can be *named* in its description. So
+resolving the location in order to describe it also made it.
+
+Reproduced on `2b414ae7` in fresh processes, with `BEATSYNC_SHARED_CONFIG` pointing at a synthetic
+configuration and a task-owned folder whose parent existed and whose leaf did not:
+
+```
+import logger / paths / video_analysis / gui        -> NOT created
+gui._analysis_category_explanation()                -> CREATED
+gui.create_ui()                                     -> CREATED
+```
+
+**The chain in the report that prompted this was named slightly wrong, and the real one is one
+function longer.** There is no `_resolved_cache_location` in `gui.py`; what runs is
+`create_ui()` → `_analysis_category_explanation()` → `_cache_categories()` →
+`_analysis_cache_location()` → `video_analysis.resolve_cache_location()` →
+`analysis_cache.resolve_location()` → `os.makedirs`. The `_cache_categories` hop matters, because
+it is also what Inspect and Clear reach, which is why the fix had to land there rather than at the
+single construction-time call site.
+
+**The correction is to separate resolving from creating, not to add a second resolver.**
+`resolve_cache_location` gained a keyword-only `make_dirs` that it forwards verbatim;
+`analysis_cache.resolve_location` has always accepted one, and its own default is the real
+`os.makedirs`, so **`None` means unchanged**. A read-only caller now passes a refusing `make_dirs`
+through the new one-line `gui._analysis_cache_location_readonly()`. The refusal is
+`library_cache_location.RefuseDirectoryCreation` — the mechanism R14-A stage A4 already injects for
+exactly this reason, **reused rather than re-implemented**, and constructed per call because it
+records being asked. There is still exactly **one** resolver: a caller computing the location for
+itself could show one folder while Stage 5 wrote to another, which remains the most misleading
+thing this feature could do.
+
+**Four read paths moved; two deliberately did not.** `_cache_categories`, `_analysis_cache_notes`
+and `_on_inspect_shared_cache` resolve read-only, which also covers the construction-time
+description and Cache Management's Inspect and Clear. Moving `_cache_categories` as a unit is what
+stops Inspect and Clear disagreeing — had only one refused, the first click would have materialised
+the folder the other had just reported absent. `_on_save_shared_cache` and
+`_on_import_analysis_cache` keep the creating resolver: Save is the operator explicitly configuring
+the folder, and Import must have a destination to copy records into. Both are pinned by test so the
+scope of this hotfix stays visible.
+
+**A refused creation narrows what the result may be read for, and that is handled rather than
+hoped.** The resolver still returns `available=True` and the configured path for a folder it was
+refused permission to create — the right answer to *"where would the next analysis write?"* and the
+wrong answer to *"does it exist now?"*. So presence is never taken from it: both read-outs render
+from an independent measurement, and the **existing** wording already reports absence truthfully
+(`nothing cached yet` from `cache_admin.report_lines`, `This folder does not exist yet. It is
+created the first time an analysis runs.` from `STATUS_SHARED_CACHE_MISSING`). **No operator-visible
+string was added or changed**, and the shared-cache warning is unchanged: the category description
+is byte-identical to `INFO_CACHE_ANALYSIS_SHARED.format(path=…)`, asserted by test.
+
+**Nothing else moved.** Verified by comparing docstring-stripped executable bodies against
+`2b414ae7`: exactly `resolve_cache_location` in `video_analysis.py` and `_analysis_cache_location`
+plus the three read paths in `gui.py` changed; `_cache_path`, `_video_signature`,
+`_cache_entry_is_complete`, `_checkpoint_cache`, `_save_cache`, `_shared_cache_report`,
+`_analysis_category_explanation`, `_on_inspect_cache`, `_on_clear_cache` and `cleanup_on_startup`
+are untouched. `CACHE_CONTRACT_VERSION = "stage5_cache_v3"` and
+`ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"` are unchanged, `make_dirs` appears
+in no identity primitive, both Stage-5 entry points still call the resolver with **no** argument and
+therefore still create the folder, the local fallback expression is unchanged, and the PR #100
+`gradio_uploads` startup protection is untouched. **No cache record was read, written, moved or
+deleted, and no cache was cleaned or migrated.**
+
+`tests/test_cache_creation_side_effect.py` (29 tests) executes the real `gui.py` and
+`video_analysis.py` bodies against a synthesised namespace over the real fork modules and the real
+`ui_content.py` strings, asserting **filesystem state** rather than a mocked call, with a `mkdir`
+spy patched onto `os` itself — because "the folder is absent" and "creation was never attempted" are
+different findings. It covers the existing-folder, absent-leaf-with-live-parent, disconnected-storage
+and unreadable-configuration shapes, and repeated construction. Group F is the **negative control**:
+it rewrites the three fixed call sites back to `_analysis_cache_location()` and requires the folder
+to be created again — and that rewrite was proven **byte-identical, on executable statements, to the
+committed `2b414ae7` source** for all three functions, so the control reproduces the real defect
+rather than an approximation of it.
+
+### Added — 2026-11-11 (R14-B S2: twenty confirmed-missing paths, so the figure can be checked)
+
+**S1's count was believable and unverifiable, which is the same thing as unusable.** The owner's
+first real run of the source-state preview — `J:\New folder\Cuts`, 5,741 media files,
+122,334,222,752 bytes, 1,546 duplicate basenames (names, *not* verified content duplicates), the
+record pass stopping on its 2,000-record ceiling — reported *"at least 50 records with
+confirmed-missing source paths"*, alongside 42 records with no matching source verdict, 8
+unresolved, at least 734 out of scope and at least 587 from another cache-contract generation.
+Every one of those is a floor, deliberately. None of them can be checked by hand, so none of them
+can be trusted enough to act on later.
+
+S2 prints up to **twenty** of those paths in the same read-out. That is the whole feature.
+
+**It is display only, and the absences are the design.** The population is the finalised verdict
+tuple S1 already produced; the admission test is A1's own `library_inventory.confirmed_missing`,
+which reads `LeafVerdict.published` — so `MISSING_PROVISIONAL`, a non-final `MISSING_CONFIRMED`,
+`UNKNOWN`, `ACCESS_DENIED`, `ROOT_UNREACHABLE`, `NOT_INSPECTED` and `PRESENT` are all excluded by
+**that function** rather than by a second rule written in `gui.py`. Out-of-scope paths cannot reach
+the renderer at all, because only `SCOPE_IN` records were ever probed — which is why it contains no
+containment test to get wrong. No new classification, **no new filesystem call, no second record
+read, no new widget, no new event, no raised ceiling**, and nothing written anywhere.
+
+**Paths, not records.** Several records may name one source — the owner's library has 1,546
+duplicate basenames, so this is not hypothetical — so the sample deduplicates on `normcase` and
+reports a count of *distinct paths*, stating in the same sentence that this is **not** the record
+figure A5 reports below and that the two are not interchangeable. Measured live on a synthetic
+library: `25 DISTINCT source paths … (from 27 confirmed-missing verdicts)`, with A5 independently
+reporting `at least 27 records (lower_bound)`. **A5 remains the only authority for every aggregate,
+exactness label and lower bound**, and a test asserts its report block is *byte-identical* with the
+sample removed — if it were not, the display would be feeding the engine instead of reading it.
+
+**Bounded, deterministic, and labelled as a sample.** `F3_SAMPLE_MAX_PATHS = 20`; the remainder is
+named (`BOUNDED SAMPLE: 5 further distinct paths are not listed … never a complete list`). Ordering
+is by the normalised path, so the same pass shows the same twenty whatever order the records
+happened to be read in — pinned by feeding the renderer a reversed verdict tuple and requiring
+identical output.
+
+**Untrusted record text cannot corrupt the read-out.** `video_file` comes out of a JSON file this
+application has no guarantee of having written, so every line goes through
+`ffmpeg_diagnostics.bound` — the existing, tested helper that collapses control characters and
+whitespace and truncates with an ellipsis — rather than a new escaper. A line that came back
+changed is **marked**, because a real Windows path contains no control character: a rewritten line
+means the record holds something unexpected and the text is not safe to use as a path. The residual
+is stated rather than overclaimed: with the control characters gone the injected text is inert, but
+it is still text and can still *read* like a heading — it simply cannot start a line, since every
+sample path is indented and no newline survives.
+
+**And it still refuses to authorise anything:** *"A missing source path does NOT authorize deletion
+of its cache record."* The file may have been renamed or moved rather than deleted, more than one
+installation may use these records, and nothing in the panel distinguishes those cases. There is
+still no delete, clean, migrate or repair control, and the sample is not an instruction to build
+one.
+
+`tests/test_library_missing_sample.py` (new, 32 tests) covers: several records naming one source;
+the twenty-path cap with the remainder named; order independence from verdict order; out-of-scope
+exclusion (asserted over the filesystem spy's calls, not just the text); every non-qualifying
+verdict kind including disconnected and inaccessible storage; mid-pass root disappearance, where
+S1's end-of-pass check retracts the findings and the sample must print nothing; both default-off
+gates, where no path text appears at all; A5's block byte-identical with the sample stripped out;
+nothing written on any gate combination; and the renderer naming no filesystem function. Two
+negative controls keep it honest — removing the sample makes the path assertions fail, and
+bypassing `confirmed_missing` makes a provisional path appear.
+
+Touched: `src/gui.py` (one new `_f3_*` renderer, eleven constants, one guarded call site),
+`tests/test_library_missing_sample.py` (new), `tests/test_library_inventory_panel.py` (the renderer
+registered in `F3_FUNCTIONS`, so every structural ban in that suite covers it — the reverse pin
+added in S1 requires this), `ROADMAP.md`.
+
+### Fixed — 2026-11-11 (a failed upload retirement is no longer permission to delete)
+
+**A normal start deleted the operator's uploaded music and printed that it had kept it.** On
+2026-11-11, during an authorized deployment restart, `cleanup_on_startup` emitted its only line:
+
+```
+⚠️  Could not set aside the previous uploads, so they were left alone:
+    [WinError 5] Access is denied:
+    '…\input\gradio_uploads' -> '…\input\retired_uploads\20261111_212009'
+```
+
+and then hard-deleted a **114,522,906-byte** browser-uploaded MP3. No Recycle Bin trace;
+`input\retired_uploads` stayed empty, so nothing was retired. The loss was zero bytes only because
+a byte-identical original existed on another volume and had been SHA256-compared **before** the
+restart — a precaution, not a mechanism.
+
+**R8 protected the retirement's destination and left its source unprotected.** `protected_dirs`
+was `{audio, video, video_analysis_cache, retired_uploads}`; `gradio_uploads` was not in it, and
+the sweep immediately after the retirement is `shutil.rmtree(..., ignore_errors=True)` over
+everything else. So the failure path of the function that exists to *preserve* uploads was the
+only path on which the folder was still there to be deleted — and `ignore_errors=True` made it
+silent. The two halves of the bug were a bare `'gradio_uploads'` literal in two unrelated places:
+the retirement's source, and a protected set that never mentioned it.
+
+**The fix is one name and one set member.** `GRADIO_UPLOADS_DIR_NAME` is now a module constant
+beside `RETIRED_UPLOADS_DIR_NAME`, read by both the retirement and the sweep, and it is in
+`protected_dirs` **unconditionally**. Unconditional rather than only-on-failure is deliberate and
+costs nothing: a successful retirement has already renamed the folder away, so the name is simply
+not in `os.listdir(input_base)` when the sweep runs. There is no outcome to inspect, no value to
+thread back from the retirement, and therefore no way for the two to disagree. The recreation of
+the active uploads folder still runs on both paths.
+
+**What it is not:** no recovery path, no retry, no copy, no relocation, no new upload or cleanup
+coordinator, no fourth `os.rename`, and no new exception handling — the two `except` clauses are
+untouched, so an unexpected failure is still reported rather than swallowed. `processing/` and
+stray top-level files in `input/` are still swept, and the other four protected directories are
+unchanged. **The operating-system refusal behind the `WinError 5` was never identified and nothing
+here guesses at it** — an unexplained refusal is precisely the case that must not escalate into a
+deletion.
+
+**Why the existing tests did not catch it, which is the part worth keeping.** Two assertions
+covered this area and both stayed green through the incident:
+`test_the_upload_retirement_is_a_move_and_never_a_deletion` asserts no delete call is reachable
+*inside* `_retire_previous_uploads` — true then and true now, because the deletion was in the
+caller — and it asserts `cleanup_on_startup` mentions `RETIRED_UPLOADS_DIR_NAME`, i.e. that the
+*destination* is protected. Nothing asserted anything about the source surviving.
+
+`tests/test_upload_retirement.py` (new, 18 tests) therefore executes the **real** bodies of both
+functions against a synthetic `input/` tree with a shimmed `os`/`shutil`, injects the incident's
+own `OSError(EACCES, winerror=5)` on the rename, and inspects the bytes left on disk. On
+`143191933f32` eight of them fail, including the plain statement of the incident: *"the uploaded
+file was destroyed after the retirement failed"*, printed alongside the "left alone" message. It
+also pins the successful retirement (moved, not copied; no-replace on a name collision with the
+clock frozen), the unreadable-folder early return, three consecutive failed starts, a real
+Windows **junction** standing in for the uploads folder (its target must lose nothing), that
+`processing/` is still swept on both paths, that the sweep still contains both disposal calls so
+the protection cannot be a blanket skip, a mutation control proving the new protected entry is
+what saves the files, and a cross-module pin that the protected name is still the folder
+`paths.GRADIO_TEMP_DIR` actually sends uploads to.
+
+Touched: `src/gui.py` (one constant, one set member, two literals replaced by it, docstrings),
+`tests/test_upload_retirement.py` (new).
+
+### Added — 2026-11-11 (R14-B S1: the read-only source-state preview)
+
+**R14-B's first increment is a hand-off, not an engine, and that is the whole point.** A5
+(`library_cache_report`) has accepted `source_verdicts` and `library_roots` since it was written,
+and its source axis joins on `library_inventory.LeafVerdict.published == MISSING_CONFIRMED`. F-3
+supplied neither, so that axis answered
+
+```
+D source confirmed missing: not assessed -- no finalised source verdict was supplied,
+                            so nothing is known about any source file
+```
+
+on **every** run. There was therefore no preview of possible cleanup anywhere in the application:
+not a withheld one, not a partial one — the question was never put. This increment puts it, by
+gathering the evidence A5 was already waiting for. It adds no second measurement, no second
+classifier, no cleanup engine and no actuator, and it does not duplicate Cache Management, whose
+Inspect button measures *this application's own caches* and answers a different question.
+
+**One new widget: a second default-off tick.** The panel is now five widgets and no sixth — a
+folder box, **two** default-off ticks, one Build button and one read-only read-out. Raising it
+from four was deliberate: reading this installation's own records and going out to look for the
+operator's media are questions about two different folders, so folding the second into the first
+would have changed what an already-shipped control does for anyone who ticks only it. The new tick
+is **subordinate** — source state is a question *about* records — and ticking it alone reaches no
+filesystem at all, reporting that no record was read instead of going looking anyway.
+
+**Four properties carry the safety, and none of them is new code.**
+
+- **`SCOPE_IN` only.** A3 already decided which records name a source inside a root A1 positively
+  observed, so the new helper reuses that verdict rather than writing a second containment test.
+  A record whose source lies elsewhere is **never probed**, which is what keeps the pass inside
+  the folder the operator typed and means a library nobody selected is never discovered. The
+  record on a disconnected drive — the case R14-B names explicitly — stays `scope_out` and is
+  reported as *"describes a source outside the folders inspected"*, never as an orphan. A test
+  asserts its path reaches no filesystem call at all.
+- **A missing finding cannot escape unfinalised.** `classify_leaf` answers `MISSING_PROVISIONAL`
+  and `LeafVerdict.published` renders that as `UNKNOWN`; only `retract_subtree` settles clause
+  (d2). That same call is the **mid-pass-disconnect guard**: if the library root went away during
+  the pass, every provisional *and* every already-confirmed finding is taken back to `UNKNOWN`
+  rather than leaving a subtree of confirmed deletions behind. The helper returns the finalised
+  tuple and never `pending`, pinned structurally — **and it settles clause (d2) against an
+  observation taken after the evidence**, which is the correction described under *Fixed on
+  independent review* below.
+- **Bounded, and a reached bound is named.** `F3_SOURCE_MAX_RECORDS = 2000` and
+  `F3_SOURCE_MAX_DIRECTORIES = 500`, as module constants rather than widget values — the same rule
+  the record bounds follow, so no resource ceiling is in the operator's hands. They charge work
+  **attempted**. Records beyond a bound are reported with their source state *unestablished*, never
+  as present.
+- **It decides nothing.** Every figure, exactness label and withholding below the heading is still
+  A5's. On the measured fixture A5 publishes `source confirmed missing: at least 1 records
+  (lower_bound)` with its own population breakdown, its own `limitation: 1 eligible records had no
+  supplied source verdict`, and its own floor note — and it still prints *"No reclaimable-space
+  figure is offered, and nothing here is a recommendation to remove any file."* **No byte total is
+  produced by this increment**, because A5 refuses one at that exactness, and no invented total
+  replaces it.
+
+**The default path is measurably unchanged.** `bind_observation` keeps exactly **one** call site;
+it gained two keyword arguments whose values are empty tuples on every path that gathered no
+evidence, and `bind_observation(inventory=i)`, `bind_observation(inventory=i, source_verdicts=(),
+library_roots=())` and `bind_observation(inventory=i, source_verdicts=(), library_roots=(root,))`
+were measured to produce **byte-identical** report lines. So an operator who never ticks the new
+box sees what they saw before.
+
+**A measured blind spot in the F-3 test contract was closed on the way through.**
+`test_i10` pinned `F3_FUNCTIONS ⊆ gui.py`'s declared functions but **not** the reverse — and every
+structural ban in that suite (no subprocess, no shared-cache contact, no mutating vocabulary, the
+`bind_observation` call-site count) is only ever as wide as that tuple. `_f3_source_verdicts` was
+written, and the entire 106-test suite stayed green, **before** it was registered: the new helper
+sat outside every ban and nothing said so. The tuple is now pinned in both directions, so the next
+`_f3_*` helper cannot repeat it. This is the same class of defect as F-3's own N-1 and N-2
+findings, and it is recorded rather than quietly fixed.
+
+**What this still does not claim.** A record whose source is gone is **not** a record the read-out
+says may be deleted: the source may have been renamed or moved, more than one installation may use
+these records, and nothing here distinguishes those from a deletion — the read-out says exactly
+that, next to the figure. No deletion, quarantine, rename, move or migration is offered or
+performed. The **R-1 creation hazard is untouched and unexpanded**: it lives in `create_ui()` →
+`_resolved_cache_location()` → `video_analysis.resolve_cache_location`, which creates a configured
+shared-cache folder at UI build time; this increment calls no resolver, and both R14-A panels
+continue to report `configured_not_created` and *"this report created nothing"*. The alias
+limitation on the record half, and the still-outstanding third location fact
+(`THIRD_LOCATION_FACT_NOT_DELIVERED`), are unchanged.
+
+**Fixed on independent review — F-7: clause (d2) was settled on a stale observation.** The first
+published version of this increment handed `retract_subtree` the `RootState` that
+`inspect_library` had probed *before* any record was read. `RootState.positively_observed` is a
+frozen field, not a live probe, so that established only that the library folder was there when the
+read-out **started** — while `F3_SOURCES_NOTE` told the operator, in words, that a confirmed-missing
+finding "additionally requires the library root to have still been reachable when the pass ENDED".
+`test_s10` had pinned the *call* to `retract_subtree` and said so explicitly ("the behavioural case
+needs a disk that disappears"), which is exactly the assurance the call alone does not give: the
+guard is only as fresh as the state it is handed. Reproduced by substituting A1's own
+`probe_root` answer for any observation taken after the first listing — the read-out went on
+publishing `source confirmed missing: at least 1 records` with the root unreachable. Each root with
+findings is now observed **once more** when its own sub-pass finishes, and clause (d2) is settled
+against that. A re-observation that cannot be taken, or that no longer resolves to the same
+location, is handed on as-is: `retract_subtree` then declines jurisdiction and every provisional
+finding publishes as `UNKNOWN` — the fail-closed direction. Cost is one directory listing of the
+root per pass, only when there is something to finalise. Pinned by `test_s20` (the observation
+happens after the listings, and exactly once per root, so it cannot become a per-record probe) and
+`test_s21` (both `ROOT_UNREACHABLE` and a plain hold retract the finding, because
+`positively_observed` wants a positive verdict and not merely a reachable anchor — A1's own F-2).
+**No other behaviour changed**: with the root genuinely present the figures are identical, and the
+unticked read-out is byte-for-byte what it was.
+
+Touched: `src/gui.py` (one new `_f3_*` helper, nine new constants, one new checkbox, one appended
+registration input, two signatures, one block comment), `tests/test_library_source_preview.py`
+(new, 35 tests), `tests/test_library_inventory_panel.py` (four pinned counts updated, the tuple
+pinned in both directions), `tests/test_gradio_runtime_compat.py` (the fifth elem id and the third
+input).
+
+**Verification status, stated rather than implied.** The 35 new tests, the F-3 suite, the adjacent
+A1/A3/A5 suites and the opt-in real-Gradio 6.19.0 build all pass, and the served interface was
+driven through all four gate combinations against a task-owned server on synthetic fixtures: 546
+components (exactly one widget more than before), both ticks `value=False` as served, the Build
+dependency's inputs exactly `[folder, records, sources]`, two genuinely-missing sources published
+as `at least 2 records (lower_bound)`, the offline-drive record reported as out of scope with its
+path absent from the read-out entirely, and two identical clicks producing one identical read-out.
+That is **not** owner acceptance, and no real library or production cache was inspected at any
+point.
+
+### Fixed — 2026-11-10 (final assembly no longer dies on a constant: FUN R11 Assembly Budget)
+
+**A 1h59m render was discarded 81 seconds from completion.** Final assembly ran under a
+hardcoded `timeout=300`, and a render of 2,187 segments (14,865,314,550 bytes of clips, a
+7157.666667 s frame-locked timeline) was killed by `subprocess.TimeoutExpired` at exactly
+300 s. Forensics on the abandoned file: `ftyp`, then a 64-bit `mdat` whose declared size
+plus the 32-byte `ftyp` equalled the file length **exactly**, and **no `moov`**. So the mux
+had written all 16,922,008,592 bytes and patched the box size; only the index was missing.
+Re-running the identical argv with a sufficient bound completed in **381 s** — 219 s of mux
+plus **162 s of `+faststart` rewrite**. The render died in the faststart pass, which the old
+constant never budgeted for, and two hours of extraction were thrown away.
+
+**300 s was never a property of the workload.** Assembly cost is dominated by bytes moved,
+and the bytes are set by the operator's music length and source resolution — quantities the
+code can *measure* before the child starts. `src/beatsync_fork/assembly_budget.py` (new,
+stdlib-only, pure) derives the bound from the real `os.path.getsize` total of the segments
+about to be read, plus the `pcm_s24le` stream the plan implies, times the traversals the
+chosen argv actually performs.
+
+Load-bearing details:
+
+- **`+faststart` is budgeted explicitly, not absorbed.** It re-reads and rewrites the
+  finished file to move `moov` ahead of `mdat` — a whole extra read and write of the output,
+  and the pass the incident died in. `faststart=True` is passed only where `+faststart` is
+  genuinely on the command line.
+- **The 300 s constant is preserved as the FLOOR.** Any render whose measured workload
+  implies less keeps exactly the historical prompt-failure behaviour, so short renders are
+  bit-for-bit unchanged in this respect. `MIN == 300` is asserted by a test.
+- **A finite ceiling, never unbounded.** `MAX = 21,600 s`. A stalled FFmpeg must still die,
+  be reaped and be reported; a timeout helper is not a licence to wait forever. A test drives
+  payloads up to 10^18 bytes and asserts the result stays inside `[MIN, MAX]` and is always
+  an `int`.
+- **A timeout now names the workload it measured.** `describe_assembly_timeout` reports the
+  byte totals, the faststart pass and the throughput floor, printed *at the point of failure*
+  as well as before the run. A timeout that names no workload is how the constant survived
+  this long.
+- **No silent re-encode after a genuine timeout.** The fallback is gated on
+  `returncode != 0`; a timeout *raises* from `_run_media_command` after the child has been
+  killed **and reaped**, so it never returns and never reaches the fallback. Silently
+  re-encoding ~17 GB after a slow assembly would convert a late render into an hours-long
+  one. A test asserts exactly **one** child is started on the timeout path.
+- **Four other latent constants in the same function went with it.** The ProRes audio
+  extraction was bounded at `120 s` — unable to transcode a long track at all, since a 2 h
+  timeline is ~2.06 GiB of PCM — and the re-encode fallback at `600 s`, unreachable for any
+  long render. Each now scales on the term that actually governs it; the re-encode carries an
+  extra per-output-second encode term because it is compute-bound, not I/O-bound.
+- **The throughput floor is derived from measurement, not taste.** The mux moved ~31.8 GB of
+  combined read+write in 300 s (~106 MB/s aggregate) on the incident volume; the floor is set
+  at 16 MiB/s, roughly a 6× margin — low enough that a contended mechanical drive never trips
+  it, high enough that a stalled child still dies.
+- **Nothing else moved.** `-shortest`, the planned `-t` at the frame-locked plan length,
+  `pcm_s24le` @ 48 kHz, `+faststart`, `-c:v copy`, the frame-lock invariant and PR #96's
+  source-capacity eligibility are all unchanged and pinned by tests. The budget decides *how
+  long to wait*, never whether an output is valid: `rc=0` with a zero-byte file is still
+  rejected, because this incident's own artefact proves a nonempty MP4 is not a render.
+
+`tests/test_assembly_budget.py` — 31 tests. The pure arithmetic is imported and tested
+directly on a bare interpreter; the behavioural tests compile and execute the **real**
+`concatenate_videos_ffmpeg` and `_run_media_command` bodies against hand-built namespaces,
+following `test_extraction_failure_context.py`. A stalled child is a real subprocess
+(`sys.executable -c "time.sleep(600)"`), so the kill-and-reap path is exercised with no
+FFmpeg at all. One opt-in real-FFmpeg test concatenates three decodable segments and asserts
+the published frame count, the pcm_s24le stream and a clean full decode.
+
+### Added — 2026-11-09 (visible version and running build id)
+
+**The header now says which BeatSync this is and which source revision it was actually loaded
+from.** Two lines, built once at startup:
+
+```
+🎵 BeatSync Engine v0.1.0
+Running build: `e6a7c0cd` · Digital Union
+```
+
+and the same two facts in the browser tab title, so a screenshot of a window identifies what
+produced it. The version alone could not distinguish two machines on the same release running two
+different commits, which is the situation this was hard to diagnose from.
+
+**The version is the existing `FORK_VERSION`, reused and not restated.** There is deliberately no
+second version constant: a product version is a release decision, and two places to state it is how
+the screen and this record start disagreeing. The three display templates live in `ui_content.py`
+with every other string in the app; `0.1.0` appears in neither `gui.py` nor `ui_content.py`.
+
+**The build identity is resolved by one new stdlib-only fork module,
+`src/beatsync_fork/build_identity.py`** — read-only, bounded, windowless, and injectable, so every
+branch is executed on a bare interpreter with no `git` and no repository. It lives in the fork
+package rather than in `gui.py` because it needs a `git` child process and `gui.py`'s
+`subprocess.run` site count is pinned at exactly two; that count, the three authorised
+`app.load(js=…)` installers, the ten `gr.Tab`s and the `gr.Blocks` keyword set are all unchanged.
+
+Four properties, each of which is the honest answer rather than the convenient one:
+
+| Situation | Reported |
+|---|---|
+| this root is a git worktree, tracked files clean | `e6a7c0cd` |
+| tracked files differ from that commit | `e6a7c0cd (modified)` |
+| commit known, modification state **not measurable** | `e6a7c0cd (unverified)` |
+| no git, no metadata, a foreign worktree, or a non-commit answer | `Build unknown` |
+
+* **A worktree is believed only when it IS the application root, and only when the environment
+  cannot move it.** `--show-toplevel` is compared — resolved, case-folded, exact equality, never a
+  prefix in either direction — against `ROOT_DIR`. A portable install dropped inside an unrelated
+  repository would otherwise have reported *that* repository's commit as BeatSync's own; measured
+  against a real nested checkout, it reports `Build unknown` instead. The path comparison alone was
+  **not sufficient**, which independent review measured and which is corrected below.
+* **`(unverified)` is a genuine third state and is never collapsed into clean.** That is the one
+  direction that would turn a modified build into a confident-looking clean one.
+* **Nothing is ever invented.** Not a placeholder SHA, not the version, and in particular not
+  `UPSTREAM_BASELINE_COMMIT` — a real 40-character id sitting in the same package that would look
+  entirely plausible in the header while answering a different question. Untracked content is not a
+  modification either (`--untracked-files=no`), because `bin/`, `input/` and `output/` are runtime
+  directories and a fresh install is full of them.
+* **It is the LOCAL revision.** No network request, no remote, no `fetch` or `ls-remote`, and
+  GitHub's current `main` is never substituted — which is wrong in exactly the case the feature
+  exists for, a machine running something that was never pushed. No branch name is read either
+  (no `symbolic-ref`, no `--abbrev-ref`), which is what makes a detached HEAD work by construction;
+  verified against a real detached checkout and a real linked worktree.
+
+**Resolved once per process.** `create_ui` calls the memoised `cached_identity(ROOT_DIR)` exactly
+once; no handler, browser event, tab selection or render can reach it, asserted over every function
+in the module. The label is a string on the screen: it reaches no render path, no cache key, no
+Qwen request and no `beat_info`, and the module computes no identity of any kind — no `hashlib`, no
+contract constant. Nothing is created, written, moved or deleted, and the operator's media,
+input/output directories, shared analysis cache and configuration are not read.
+
+`BUILD_ID_CSS` styles the second line down with two inherited properties and no layout arithmetic,
+scoped to its own class.
+
+**The git child environment is isolated, because the ownership check above was defeatable through
+it.** Independent review measured that the first version of `_run_git` handed the child
+`dict(os.environ)`, and `git` reads its own behaviour out of its environment. With an inherited
+`GIT_DIR`, `rev-parse HEAD` answered out of a **different repository** while `--show-toplevel`
+still named the application root — so the ownership check passed and the header stated a foreign
+commit with no disclosure, which is precisely the confident lie this feature exists to prevent. It
+needed no file corruption, no administrator and no write access to the checkout, because `git`
+exports repository locators into the children it launches. Which locator, and whether it bites, was
+measured per context on git 2.53.0 for Windows rather than assumed:
+
+* `filter-branch --index-filter` exported an absolute `GIT_DIR` — the vector that borrows a foreign
+  commit outright.
+* A `post-commit` hook exported `GIT_INDEX_FILE`, which was enough to mislabel a clean checkout.
+* `submodule foreach` exported a **relative** `GIT_DIR=.git`, benign in the measured invocation.
+* `rebase --exec` and `bisect run` exported no harmful repository locator in the measured cases.
+
+Those are measurements of one git version on one platform and are not generalised to every git.
+What they establish is the finding that matters: an ordinary operator can inherit a Git-specific
+variable without malice, corruption or privilege, such a variable can make the reported build
+identity wrong, and the sweep below prevents that measured failure. The ordinary launch path was
+never affected — nothing in this repository sets a `GIT_*` variable, and `run.bat` introduces no
+`GIT_*` repository locator.
+
+The child environment is now built by **dropping every inherited variable whose name begins with
+`GIT_`** (case-insensitively) and then reinstating this module's own two settings by name. Measured
+against git 2.53.0, `GIT_DIR` borrowed the commit outright, `GIT_WORK_TREE` moved the toplevel so a
+legitimate install read `Build unknown`, and `GIT_COMMON_DIR` / `GIT_OBJECT_DIRECTORY` /
+`GIT_INDEX_FILE` broke `status` so a clean tree read `(unverified)`. It is deliberately a **prefix
+rather than a list of the variables that bite today**: the `GIT_CONFIG_*` family is inert for these
+three commands in that version and is swept anyway, because enumerating known offenders leaves the
+next one to be discovered in production. The sweep is equally deliberately narrow in the other
+direction — `PATH`, `SystemRoot` and `USERPROFILE` still arrive, or `git` would stop being
+findable; a nonstandard install depending on an inherited `GIT_EXEC_PATH` now answers
+`Build unknown` rather than a wrong commit, which is the correct direction to fail in. The caller's
+own environment is never modified.
+
+Twelve hostile environments are pinned as regression tests, the original defect is reproduced
+permanently against the policy that shipped, and a mutation control asserts the sweep is
+load-bearing: disabling it brings the borrowed commit straight back, so the new tests cannot
+quietly become vacuous. One consequence is recorded rather than hidden — `(unverified)` is no
+longer reachable by breaking `status` through the environment, so that branch stays pinned by the
+injected-runner test where it belongs.
+
+**Known limitation, deliberately not fixed here.** This base revision still carries the
+`show_copy_button` keyword that gradio 6.19.0 removed, so the full `create_ui()` does not build
+under the pinned Gradio. That is an unrelated, separately tracked blocker and silently fixing it was
+out of scope. Consequently the verification for this change is **source-level**: the keyword
+`elem_classes` was measured as declared by `gr.Markdown.__init__` in the installed gradio 6.19.0
+(which takes no `**kwargs`, so the check is real) and `title` as declared by `gr.Blocks.__init__`.
+The live GUI was **not** started and the header has **not** been seen rendered; it becomes visible
+only after a separately authorised deployment and restart.
+
+Touched: `src/beatsync_fork/build_identity.py` (new), `src/ui_content.py` (three templates, purely
+additive), `src/gui.py` (one import, one CSS constant, the `gr.Blocks` title, one resolution and two
+header lines), `tests/test_build_identity.py` (new).
+
+### Added — 2026-11-08 (R14-A F-3, Option 1: the local-only Media Library inventory)
+
+**A2 and A3 merged with no user surface at all.** An AST census over every module under `src/`
+put `inspect_library`, `inventory_lines`, `duplicate_basenames`, `forecast_destination`,
+`diagnose_root`, `list_directory`, `classify_leaf` and `read_records` at **zero call sites**: two
+heavily-tested stages were reachable only from their own suites. F-3 asked what to do about it,
+and the owner chose Option 1 — a small, read-only, **local-only** exposure of the producers that
+already exist — over both leaving them inert and building the broader historical design, whose
+source-state buckets have no producer at all.
+
+One new sibling accordion in Prepare & Verify, between the Library cache report and the
+preparation section. Four widgets and no fifth: a folder box, a default-off tick, one Build
+button and one read-only read-out. It publishes
+
+* **bounded Tier-A media facts** for one explicitly named folder, through A2's own
+  `inspect_library` / `inventory_lines` over the existing authoritative scanner, with
+  `diagnostics=False` (no recursive diagnostic walk) and A2's own existing per-root ceiling;
+* **local analysis-cache record facts**, behind the separate default-off tick, through A3's
+  `read_records` rendered by A5; and
+* **three separately labelled location facts.** Only the first is answered: the folder configured
+  at startup. The folder a **new** analysis would select is `NOT INSPECTED` — establishing it
+  takes a directory-state observation of the shared folder, which this local-only read-out does
+  not make. The folder the **last** analysis actually used is `NOT AVAILABLE, and OUTSTANDING`:
+  `OWNER_ACCEPTED_DEFERRED_FOR_THIS_INCREMENT; THIRD_LOCATION_FACT_NOT_DELIVERED`, see the
+  outstanding item below. Neither is guessed, and the third is **not** complete and is not
+  reported as a pass.
+
+**The owner's two operational choices are structural, not defaults.** Record reading needs the
+tick *and* the click: the gate is `inspect_records is not True`, so a stray `1` or `'false'`
+arriving from anywhere cannot start a filesystem pass. The Discarded folder is **omitted** — not
+offered, not selectable, not inspected; only one root is ever supplied and `include_rejected` is
+always `False`.
+
+**The shared analysis-cache folder's reach, stated precisely and scoped to what the
+implementation establishes.** The two halves of the panel differ and must not be described
+together:
+
+* **The record half never targets it.** It uses the startup snapshot's folder *text* for exactly
+  one purpose: establishing, lexically, that the folder it is about to read records from is
+  **not** that folder. It never reads, lists, counts or resolves the configured folder itself,
+  and never reaches the folder-creating resolver. Where the check cannot be made the record pass
+  is **refused**, and three conditions do so — the local folder resolving onto the shared one, a
+  Settings save having superseded the snapshot this session (so which folder is shared is no
+  longer known), and a configured folder with no single absolute form (so comparing it would mean
+  resolving it, which would mean contacting it). The comparison is exact normalised equality on
+  both the typed and the resolved local path, never a prefix test, so `…\VideoAnalysis2` is not
+  part of `…\VideoAnalysis`. A local cache legitimately junctioned onto a larger disk is followed
+  and **disclosed**, because the records came off the resolved storage.
+* **The media half inspects whatever folder the operator names** — including the shared folder,
+  if that is the path they type. It has no notion of a shared folder, does not recognise one and
+  does not refuse one. That is disclosed in the panel's own text and in the read-out.
+
+**And the record half's check is a comparison of NAMES, not of storage — a bounded limitation,
+disclosed rather than claimed away.** Two different names can denote one folder: a junction, a
+symbolic link, the extended-length `\\?\` spelling, a substituted or mapped drive letter, a short
+name. Distinguishing those would mean resolving the configured shared path, which the approved
+R-3 boundary forbids, so they are **not disproved**. A configured shared folder that is itself a
+junction onto the local cache's real target, and the extended-length spelling of the same folder,
+were reproduced and are known **not** to be refused; drive substitution, mapped drives and short
+names were **not** measured and are not claimed safe. The read-out states this where the records
+are reported, and the operator is told the practical precaution: if the local and shared folders
+may be two names for one folder, do not enable record reading. **No claim of physical
+shared-cache non-contact is asserted anywhere in this feature's code, tests or documentation** —
+the only places such a sentence appears at all are the regression guard's own ban patterns and the
+counterexamples it assembles to prove it fires, and quoting a false sentence in order to forbid it
+is not asserting it. The gate's behaviour is unchanged by this wording — the limitation was always
+there and is now written down.
+
+**Four of A3's optional observations are deliberately not requested, and each absence is stated
+in the read-out rather than inferred from a missing line.** `looks_reusable` and `read_text` are
+both `None`, so no record is re-opened by the delegated transport check and no alternative file
+transport exists; `is_complete` and `require_ai` are both `None`, so record completeness stays
+unassessed — outside a render there is no established analysis mode to judge for, and a figure for
+a question nobody asked is not a figure. The contract generation is passed **in** from
+`video_analysis` through the deferred import the cache Import handler already uses, and when it
+cannot be read that axis is unassessed rather than zero.
+
+Reading is bounded well below A3's own defaults — 4 000 entries, 2 000 records, 1 MB per record,
+32 MB in total, 100 reported names — expressed as module constants rather than widget limits, so
+no resource ceiling is in the operator's hands. The bounds charge work **attempted**, they are not
+a wall-clock, peak-memory or exact-byte ceiling, and whichever one was reached is named.
+
+**No number in this panel is its own.** A2's and A5's read-outs own every figure, each with its
+unit, its exactness and the population it answers for; what the panel writes is labels, states,
+refusals and words. A refused or limited pass publishes **no** count rather than a smaller one, no
+bucket is summed, nothing unestablished is rendered as a zero, and no A4 observation is bound
+beside a local record inventory — that would put two populations in one report.
+
+Separate call graph from the A6 panel by contract: no helper carries the `_a6_` prefix (every such
+name is pinned into A6's own ban tuple), A6 cannot reach this handler, and this handler reads
+exactly three **pure, no-disk** A6 helpers — the startup-snapshot parser, the supersession latch
+reader and the unambiguous-absolute-path gate — rather than keeping a second copy of a gate whose
+equivalence to the resolver is already proved over a measured table.
+
+**Outstanding, by owner decision, and named rather than buried.** *The location the last analysis
+actually used* is **NOT DELIVERED** in this increment. `video_analysis` already produces the fact
+and returns it per invocation; no part of the interface keeps it, so delivering it would mean the
+**analysis/render handler retaining the value it already receives**, after which this read-out
+would only read what that handler kept — the panel writes nothing itself and no render-path change
+is part of this increment. The line therefore reads `NOT AVAILABLE, and OUTSTANDING`, and the
+three-location-fact requirement is recorded as
+`OWNER_ACCEPTED_DEFERRED_FOR_THIS_INCREMENT; THIRD_LOCATION_FACT_NOT_DELIVERED`.
+
+Touched: `src/gui.py` (new constants, **eight** new `_f3_*` helpers plus the click handler — nine
+new functions, of which eight carry the prefix — one accordion, one registration),
+`tests/test_library_inventory_panel.py` (new).
+
+#### Corrections applied after independent review (R2)
+
+The R1 independent review of this candidate returned `CHANGES_REQUIRED` on five findings, all of
+them about what the increment *claimed* plus two coverage gaps. No behaviour changed: the gate,
+the comparison, the bounds, the call sites and the widget set are what they were, and the only
+executable addition is two `lines.append` calls that emit new disclosure text.
+
+* **The unqualified isolation sentence is gone** (above). It was false two ways, both reproduced:
+  typing the shared folder into the media box enumerates it — one operator keystroke, no alias
+  needed — and a configured shared *text* reaching the local cache's storage under a different
+  name is not refused.
+* **A repository-carried, opt-in runtime check now exists**: `tests/test_gradio_runtime_compat.py`.
+  It skips unless `BEATSYNC_TEST_GRADIO=1`; opted in, an absent or mismatched `gradio==6.19.0` is
+  a **failure, not a skip**. It censuses every `gr.*` call in `src/gui.py` against the real
+  `inspect.signature`, and it builds `create_ui()` once in a child process with `LOCALAPPDATA`
+  and `BEATSYNC_SHARED_CONFIG` redirected into a task-local directory. A build is **not** a
+  live-server smoke and not user acceptance; nothing calls `.launch()` or binds a port.
+* **Two proven test vacuities are fixed.** `test_e6` built a look-alike fixture, never used it as
+  the local cache and ended in a tautology; it now configures the shared folder as a strict
+  string prefix of the local cache path, in both realistic spellings, and asserts the pass runs
+  once on the intended folder. A new `test_e13` covers the **typed** arm of the comparison, which
+  had none. Each was measured RED under the matching mutation of the shipped source and GREEN
+  with it restored byte-for-byte.
+* **The mutation accounting is corrected.** The suite carries **ten** distinct mutators, all of
+  them used, referenced **thirteen** times across **twelve** call sites, and they mutate
+  **AST-extracted copies of function bodies, in memory**:
+  `src/gui.py` is never written to and therefore never restored. The earlier "seven mutations …
+  restored byte-identically" conflated this with a separate external file-mutation harness, whose
+  results are distinct evidence.
+
+#### Corrections applied after the second independent review (R3)
+
+The R2 independent review of the remediated candidate closed F-2, F-3, F-4 and F-5 on its own
+measurements and returned `CHANGES_REQUIRED` on two further findings, both of them about the claim
+R1 had already ruled out. No behaviour changed: the AST delta of `src/gui.py` against the R2 head
+is **zero executable function bodies**, and the only `src/gui.py` edit is inside one block comment.
+
+* **A seventh location was carrying the sentence, and this record denied it (N-1).** The R2 sweep
+  corrected the checkbox label, the panel info text, the `gui.py` block comment, two `gui.py`
+  docstrings, the read-out and this file — but `tests/test_library_inventory_panel.py`'s own module
+  docstring still stated, unchanged since the R1 head, that *this panel never reads, lists, counts,
+  measures or resolves the shared folder*. That paragraph is now scoped the same way the rest of
+  the increment is: the record half never **targets** the folder and compares **names**, the media
+  half inspects whatever it is given, and the alias residual is named with its measured,
+  unverified and unmeasured cases kept apart. Two universal statements that the surviving
+  docstring had falsified — this file's "no claim … is made anywhere" and the `gui.py` comment's
+  "is not written anywhere" — are corrected to say **asserted**, and both now name the one
+  legitimate exception: a regression guard necessarily quotes the sentence it forbids.
+* **The guard that was supposed to prevent this could not see the repository's own wording (N-2).**
+  `test_e16` banned four literal substrings in four constants; the phrasing above differs from one
+  of them by the single inserted word *measures*, and the review proved the blind spot was about
+  the phrasing rather than the file by planting that exact sentence into `INFO_LIBRARY_INVENTORY`
+  — an operator-facing constant the test guards — and watching `test_e16` still pass. The literal
+  pins are kept, and a **structural** matcher is added beside them: a negation that directly
+  governs a *list* of contact verbs, which catches the R1 wording, the `measures` variant, the
+  passive form and the original pronoun-object form alike. It runs over a widened surface — every
+  `F3_*`/`LABEL_LIBRARY_INVENTORY*`/`INFO_LIBRARY_INVENTORY` constant, the eight F-3 docstrings,
+  the F-3 block comment **and this suite's own module docstring**, the surface whose absence let
+  N-1 survive. Scoped statements and quoted counterexamples are exempt by construction, because a
+  guard that forbade *"the record half never reads, lists, counts or resolves the configured
+  folder itself"* or the media half's affirmative disclosure would make the honest text
+  unsayable; `test_e16b` asserts exactly that, and `test_e16a` asserts every matcher can fire,
+  from claims assembled at runtime so no banned literal sits in the file for a scanner to find.
+  The extraction is deliberately scoped to the F-3 block: `gui.py` carries a **pre-existing**
+  `main` comment about A6's unticked default-off report that a whole-file scan would flag.
+
+Touched: `src/gui.py` (one block comment), `tests/test_library_inventory_panel.py` (module
+docstring, `test_e16` strengthened, `test_e16a`/`test_e16b` added), `CHANGELOG-FORK.md`.
+
+### Fixed — 2026-11-08 (the application did not start on the pinned Gradio)
+
+**`gr.Textbox` has no `show_copy_button` parameter on `gradio==6.19.0`.** Gradio 6 replaced it
+with `buttons`, so the keyword raises
+
+```
+TypeError: Textbox.__init__() got an unexpected keyword argument 'show_copy_button'
+```
+
+while `create_ui()` is building the interface — the whole application failed to start. Measured
+against pristine `main` `2a7dcb01e0f1b247a4b8bd91033b799592aa8e89` (`src/gui.py` blob
+`171ab573a9d6b06ecf9d47c1dff997583952b30b`) on the real library.
+
+It went unnoticed because `gradio` cannot be imported on a bare interpreter, so every existing
+assertion about that widget is an AST assertion about source text the real library rejects. The
+intent — an operator can copy the read-out — is preserved by the replacement parameter rather
+than dropped. Production is unaffected: it runs `e6a7c0cd255c527c83b651e43c893bfc98418943`, which
+predates the widget.
+
+**Pinned two ways, both of them now in the repository.** A bare-CPython AST assertion on keyword
+names catches this one parameter returning; `tests/test_gradio_runtime_compat.py` — opt-in behind
+`BEATSYNC_TEST_GRADIO=1` — catches the *class* of defect, because it checks every `gr.*` keyword
+in the file against the real signature and builds `create_ui()` on the real library. The first
+version of this entry claimed the second half while it existed only as a local verification step
+outside the repository; that is corrected, and the check is committed and has been executed.
+Measured on the pinned runtime: 571 `gr.*` calls, 1183 keywords validated against a signature, 43
+accepted only by the runtime across six named `callee.keyword` pairs, nothing unknown and nothing
+dynamic; pristine `main` fails the build with the `TypeError` above, this tree builds 544 blocks.
+
+Touched: `src/gui.py` (one keyword, in the R14-A A6 read-out box),
+`tests/test_gradio_runtime_compat.py` (new, opt-in).
+
+### Fixed — 2026-11-08 (Short-Source Eligibility R1: a segment is only given a source that can fill it)
+
+**The owner's render stopped with three failed clips, and the planner was the one at fault.** Clip 5
+was allocated a 5.280-second frame-locked slot at 25 fps and handed `424.mp4`, a 5.133-second file:
+132 output frames committed, 128 available, short by four frames (0.160 s). The extraction worker
+refused it before FFmpeg ran — correctly — and `create_music_video` then refused to concatenate an
+incomplete timeline, also correctly. Reproduced as pure data from the pinned source; **no decoded
+frame count or rendered playback is claimed anywhere below.**
+
+**Three things had to be true at once, and the middle one is the real defect.**
+
+```
+_adjusted_score      penalty only below 55% of the slot -> 5.133/5.280 = 97%, silent
+                     and it reads candidate["duration"], the capped ANALYSIS WINDOW
+_materialize_clip    max(source_duration, video_duration) inflates the shortfall away
+create_clip_parallel refuses pre-extraction                                    <- correct
+create_music_video   refuses to concatenate                                    <- correct
+```
+
+The planner was measuring the wrong quantity, not measuring it too leniently. `candidate["duration"]`
+is the length of the Stage-5 analysis *window*, which Stage 5 caps; the length of the **file** was on
+every candidate all along as `candidate["video_duration"]`, written from the same FFprobe duration the
+worker later reads, and scoring never consulted it. Above the cap every candidate in any library reads
+as short — so a "penalise short candidates harder" fix would refuse every render whose segments exceed
+the cap, however long the real sources are. Just below it, a file barely longer than its own window
+reads as unlimited, which is exactly `424.mp4`.
+
+**Eligibility is now decided on the file, in output frames, at the real output rate.** `_source_frames`
+converts `video_duration` to output frames and `_can_fill_segment` compares it against the slot —
+`int(round(have * fps)) >= int(round(need * fps))`, mirroring `_materialize_clip`'s own `final_duration`
+floor so the number compared is the number the plan records. No probe, no new import, no new score
+penalty: `_adjusted_score` still has exactly nine `score -=` sites and the planner's module import set
+is unchanged.
+
+**The rate is the timeline's own rate, and there is no default.** `create_music_video` publishes the
+`fps` that built the frame-aligned timeline onto the shared `beat_info` bus, and
+`output_frame_rate` is its single reader — the same shape as `creative_profile`. Absent means *the
+guarantee was not requested*, so every existing caller and test keeps today's behaviour exactly; a rate
+that was supplied but is zero, negative, non-finite or unparseable **fails closed** with `ValueError`,
+because output-frame eligibility against a rate that is not one would be a guarantee about nothing. The
+rate travels on the bus rather than as a planner-call keyword because three suites pin that call's
+keyword bundle by exact equality; `build_planned_clip_sequence` and `_choose_candidate` still gained the
+optional `output_fps` parameter for direct callers.
+
+**An ineligible candidate is denied the win, never the draw — and that distinction was measured, not
+assumed.** A pre-filter that drops candidates before scoring changes which jitter each remaining
+candidate receives in the legacy branch, and changes both the weight normalisation and
+`select_index`'s single-eligible early return in the seeded branch. On a 48-segment synthetic matrix it
+re-edited renders that were already fine: **30 of 46 (65.2 %)** eligible winners changed at seed 0, and
+1–3 at seeds 381944 / 101 / 4242. So the legacy branch still draws `rng.random()` for **every**
+candidate in the original order and only skips the comparison, and the seeded branch runs
+`select_index` against the **unchanged** full score list, keeping that winner when it fits and
+re-drawing from the **same** `rng` only when it does not. Measured across seeds 0 / 381944 / 101 / 4242
+at 25 and 30 fps, two pool shapes, 768 segment decisions in total: **0 of 400** already-viable
+segments changed winner, **368 of 368** physically impossible winners repaired, **0** short sources
+leaked through.
+
+**No eligible source is a refusal before any worker starts, never a silent fallback.**
+`SegmentSourceCapacityError` names the segment (1-based and 0-based), the frames and seconds it needed,
+the best capacity actually available and the shortfall, labels the figures as duration-derived
+estimates, and says what to change. This matters because the alternative is worse than the bug:
+dropping an unfillable segment makes the plan shorter than the timeline, which discards the plan
+*whole* and sends the render to legacy random sampling — a path with no view of a source length at all.
+A render with **no** visual candidate library still returns `[]` and falls back exactly as before; that
+fallback remains duration-blind and is left so deliberately.
+
+**Both existing guards are kept as the backstop.** `video_duration` can be stale, and
+`ffmpeg_processing.get_video_duration` returns a 10.0-second fallback when its probe fails, so an
+unmeasured length is treated as *unmeasured rather than short* — the planner declines to judge and the
+worker, which actually probes the file, decides. R10's rule reused: an unmeasured count is never a
+refusal. Nothing pads, loops, stretches, duplicates or truncates a source frame, no beat boundary
+moves, and the frame-locked timeline, cancellation, render locking and the Source Input Gate are
+untouched.
+
+**Known and deliberately not fixed here.** `_materialize_clip` coerces `video_duration` with a bare
+`float()`, so a record carrying a string, list or dict there raises during planning — true on pristine
+`main`, a malformed-record defect rather than a capacity one, and pinned by a test so the finding
+cannot be lost. The two other clips that failed in the field report were never characterised.
+
+**One existing test was red at R1; R2 resolved it under its own authorization.** This paragraph
+records both states, because the first one is the history and the second one is the current truth.
+
+At R1, `tests/test_stage6_console_reporting.py::test_the_stage6_planner_is_unchanged_from_merged_main`
+asserted `git diff 079e9b31 -- src/auto_mode/stage6_av_planner.py` is **empty**, freezing the planner
+byte-identical. That guard was *appropriate for the older reporting-only change it shipped with*,
+whose whole point was that it did not touch the planner — but it reddens for **any** planner edit, so
+it was logically incompatible with this fix. Measured then on one variable: the node passed on
+pristine `main` and failed on this branch. R1 was not authorized to touch that path, so it reported
+the red node rather than widening into it.
+
+**R2 then re-pointed the baseline with explicit owner authorization** to this branch's published
+candidate commit `1828569ebe2a4f5b351e6c44b013e7df3dd56b1b` — a pinned historical Git object, not a
+fabricated hash — and renamed the node
+`test_the_stage6_planner_is_unchanged_from_the_approved_baseline`, because what it now asserts is
+weaker and different: unchanged from the **approved** baseline, not unchanged since the merged main
+the reporting-only change branched from. The node was not deleted, skipped, or weakened into an
+unconditional pass, and any *further* planner change still reddens it. Measured on a disposable
+worktree, never on the candidate source: **GREEN** with the planner unchanged, **RED** for a
+behavioural mutation (`>=` → `>` in `_can_fill_segment`), and **RED** for a comment-only mutation —
+which a byte freeze has to do, or "no unreviewed planner drift" reads stronger than it is.
+
+**The corrected gate can SKIP, and a SKIP is not a PASS.** Its baseline is a commit on this branch,
+so until that merges, a checkout holding only `main` — the installed production checkout, a fresh
+clone, a reviewer who has not fetched the branch — cannot reach the object: the node skips there
+instead of passing, and asserts nothing at all in that case. Once the baseline is an ordinary
+ancestor of `main`, the gate runs everywhere again.
+
+`src/auto_mode/stage6_av_planner.py`, `src/video_processor.py`,
+`tests/test_short_source_eligibility.py` (new, 71 tests, synthetic and media-free),
+`tests/test_stage6_console_reporting.py` (R2: the baseline re-point and rename described above).
+
 ### Added — 2026-11-01 (Video Review R13: the transfer is visible, truthful and single-flight)
 
 **Pressing Confirm in Video Review used to start moving files with no acknowledgement at all.** Two

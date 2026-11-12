@@ -31,9 +31,15 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PROCESSOR = os.path.join(_REPO_ROOT, "src", "video_processor.py")
 _PLANNER = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py")
 
-#: The merged main this slice branched from. The planner must stay byte-identical to it: P2 is a
-#: reporting change, and the thing it reports was already merged and independently reviewed.
-_PLANNER_BASELINE_SHA = "079e9b31afac5257aa5cef79a80a5aaad15b6aa5"
+#: The approved planner baseline this suite freezes against. For P2 it was the merged main
+#: ``079e9b31afac5257aa5cef79a80a5aaad15b6aa5``, because P2 was a reporting change and the planner
+#: it reports was already merged and independently reviewed. Short-Source Eligibility R1 then
+#: changed the planner **deliberately, under its own authorization**, which made that freeze
+#: incompatible with an intended change rather than protective of anything: it reddened for the one
+#: planner edit the owner had asked for. So the baseline now names R1's published candidate commit.
+#: It is still a pinned historical Git object — not a fabricated hash — and the gate still goes RED
+#: for any *further* planner change, which is the whole purpose of keeping it.
+_PLANNER_BASELINE_SHA = "1828569ebe2a4f5b351e6c44b013e7df3dd56b1b"
 
 #: Every ``print`` in the planner-summary block, in order, as it stood before P2. The second entry
 #: is the one P2 replaces; the rest must be untouched.
@@ -536,8 +542,22 @@ def test_no_environment_variable_was_added():
     assert envs == {"BEATSYNC_NVENC_CLIP_WORKERS"}, sorted(envs)
 
 
-def test_the_stage6_planner_is_unchanged_from_merged_main():
-    """G6. P2 is a reporting slice: the thing it reports was merged and reviewed already.
+def test_the_stage6_planner_is_unchanged_from_the_approved_baseline():
+    """G6. The planner must match the **approved** baseline — no longer "the merged main P2 branched
+    from", because that is no longer what this asserts.
+
+    P2 was a reporting slice, so freezing the planner against merged main ``079e9b31`` said
+    something true and useful: *this change does not touch the planner*. Short-Source Eligibility R1
+    changed the planner on purpose, with its own owner authorization, and this node was the single
+    red gate that resulted — it passed on pristine ``main`` and failed on the R1 candidate, which
+    demonstrated only that the planner had changed, never that a render had regressed. Re-pointing
+    the baseline at R1's published candidate commit keeps the guarantee that actually matters
+    (**no unreviewed planner drift**) while dropping a claim that had stopped being true.
+
+    So read the name literally: the planner is unchanged *from the approved short-source candidate
+    baseline*, which is a different and weaker statement than "unchanged since P2's merged main".
+    Anyone widening the planner again will redden this node, and should re-point the baseline only
+    with the same kind of authorization R1 and R2 each had.
 
     Asked via ``git diff``, **not** by comparing ``git show`` bytes to the file on disk. This
     repository is checked out with ``core.autocrlf`` active, so the working tree holds 845 CRLF
@@ -551,14 +571,24 @@ def test_the_stage6_planner_is_unchanged_from_merged_main():
 
     Skips rather than fails when git or the object is unavailable, matching
     ``test_stage6_shot_diagnostics``: the suite must still run on a bare CPython checkout.
+
+    **That skip is load-bearing while the candidate is unmerged, and it is a real limitation.** The
+    baseline is a commit on the short-source branch, so a checkout that has only ``main`` — the
+    installed production checkout, a fresh clone, any reviewer who has not fetched the PR — cannot
+    reach the object and this node SKIPS there rather than passing. A skip is not a pass: on such a
+    checkout this gate asserts nothing at all until the candidate is merged, after which the object
+    is an ordinary ancestor and the node runs everywhere again. Fetch the branch to exercise it.
     """
     try:
         probe = subprocess.run(["git", "cat-file", "-e", f"{_PLANNER_BASELINE_SHA}^{{commit}}"],
                                cwd=_REPO_ROOT, capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - environment
-        pytest.skip(f"git unavailable, cannot reach the merged planner: {exc}")
+        pytest.skip(f"git unavailable, cannot reach the approved planner baseline: {exc}")
     if probe.returncode != 0:  # pragma: no cover - environment
-        pytest.skip(f"merged main {_PLANNER_BASELINE_SHA[:8]} not in this checkout's history")
+        pytest.skip(
+            f"the approved planner baseline {_PLANNER_BASELINE_SHA[:8]} is not in this checkout's "
+            f"history (expected on a main-only checkout while the candidate is unmerged); "
+            f"this gate asserts nothing here")
 
     diff = subprocess.run(
         ["git", "diff", "--stat", _PLANNER_BASELINE_SHA, "--",
@@ -567,7 +597,9 @@ def test_the_stage6_planner_is_unchanged_from_merged_main():
 
     assert diff.returncode == 0, diff.stderr
     assert diff.stdout.strip() == "", (
-        f"the Stage-6 planner must not change in a reporting slice:\n{diff.stdout}")
+        f"the Stage-6 planner differs from the approved short-source candidate baseline "
+        f"{_PLANNER_BASELINE_SHA[:8]}. A further planner change needs its own authorization and its "
+        f"own review; re-point this baseline only once that has happened:\n{diff.stdout}")
 
 
 def test_stage5_and_cache_identity_are_not_touched_by_this_module():

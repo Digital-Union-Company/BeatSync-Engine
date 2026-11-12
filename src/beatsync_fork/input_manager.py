@@ -22,6 +22,18 @@ A returned :class:`InputSet` therefore means every directory in the tree was rea
 that cannot be stat'ed are a different matter: those are recorded as ``UNREADABLE`` rejections and
 remain visible in the report, because a named rejection is not a silent loss.
 
+A scan is also authoritative only if everything it counted really is *in* the selected folder, so
+the same all-or-nothing rule covers containment: a nested junction or mount point is never
+descended, and because its exclusion cannot be reported through :class:`InputSet`, finding one
+refuses the scan instead of publishing a complete-looking total. See
+:func:`_iter_candidate_paths` for why a nested symlink is deliberately treated differently.
+
+A caller that cannot afford an unbounded tree may pass ``max_entries``, which keeps the contract
+intact by **refusing** rather than returning a short result — the third way to fail, alongside an
+unlistable directory and a nested junction, and never a fourth way to succeed. It defaults to
+``None``, every caller in this repository leaves it there, and :func:`scan_folder` documents exactly
+what it does and does not bound.
+
 Deliberate non-goals
 --------------------
 No media copying, no FFmpeg, no OpenCV, no Qwen, no rendering, no full-file hashing, and no Gradio
@@ -62,6 +74,25 @@ persisted by a later phase (edit plans, run manifests) can never be compared acr
 
 class InputScanError(ValueError):
     """The scan root is missing, is not a directory, or cannot be listed."""
+
+
+class InputScanLimitExceeded(InputScanError):
+    """The tree holds more entries than the caller allowed itself to read.
+
+    A **subclass**, deliberately, so that every existing ``except InputScanError`` keeps working
+    unchanged — all seven call sites in this repository already surface that refusal to the
+    operator, and a containment refusal and a limit refusal need the same handling: the scan did
+    not complete, so nothing it saw may be published as a total.
+
+    ``limit`` is the cap that was passed; ``counted_at_least`` is how many entries had been
+    accounted for when the cap was reached. ``counted_at_least`` is a **lower bound and never a
+    total** — the tree holds more than that, which is precisely why the scan was refused.
+    """
+
+    def __init__(self, message: str, *, limit: int, counted_at_least: int) -> None:
+        super().__init__(message)
+        self.limit = int(limit)
+        self.counted_at_least = int(counted_at_least)
 
 
 class RejectReason(str, Enum):
@@ -354,25 +385,121 @@ def _walk_error_raiser(root: str) -> Callable[[OSError], None]:
     return raise_scan_error
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+"""``FILE_ATTRIBUTE_REPARSE_POINT``. A junction, a volume mount point and a symlink all carry it."""
+
+_PLAIN_DIRECTORY = ""
+_NESTED_SYMLINK = "symlink"
+_NESTED_REPARSE = "reparse"
+
+
+def _nested_link_kind(path: str) -> str:
+    """Classify a child directory for traversal safety, from **link-level** metadata only.
+
+    Returns one of :data:`_PLAIN_DIRECTORY`, :data:`_NESTED_SYMLINK` or :data:`_NESTED_REPARSE`.
+
+    Raises:
+        InputScanError: the entry's link metadata could not be read, so whether reading it would
+            leave the selected folder is **undecidable**. It fails closed, because treating an
+            unreadable attribute as "an ordinary folder" is precisely the assumption this function
+            exists to remove.
+
+    Deliberately **not** ``library_inventory.is_reparse_point`` or ``cache_admin._is_reparse``: both
+    answer ``False`` when the attribute cannot be read. That is the right shape for a *reporting*
+    predicate and the wrong shape for a *gate* — an unreadable attribute is not evidence of a plain
+    directory. ``os.lstat`` is resolved from the ``os`` namespace at call time so a test can inject a
+    failure the same way the traversal-error suite injects ``os.scandir``.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise InputScanError(
+            f"Cannot scan folder tree: cannot tell whether {path} is a real folder or a link "
+            f"({exc}), so it is unknown whether reading it would leave the selected folder."
+        ) from exc
+
+    if stat_module.S_ISLNK(info.st_mode):
+        return _NESTED_SYMLINK
+
+    attributes = getattr(info, "st_file_attributes", None)
+    if attributes is None:
+        if os.name == "nt":
+            raise InputScanError(
+                f"Cannot scan folder tree: {path} reported no link metadata, and on this platform "
+                f"a junction cannot be told apart from an ordinary folder without it, so reading "
+                f"it cannot be shown to stay inside the selected folder."
+            )
+        return _PLAIN_DIRECTORY
+
+    return _NESTED_REPARSE if attributes & _FILE_ATTRIBUTE_REPARSE_POINT else _PLAIN_DIRECTORY
+
+
 def _iter_candidate_paths(root: str, recursive: bool) -> Iterator[str]:
     """Yield every file entry under ``root`` in a deterministic order.
 
-    Directory symlinks are not followed, so a self-referential link cannot make the walk unbounded.
+    Nested directory links are never descended, so a self-referential link cannot make the walk
+    unbounded **and** no file stored outside the selected folder can reach the classifier. Two kinds
+    are distinguished, because only one of them was ever actually contained:
 
-    Raises ``InputScanError`` if any directory cannot be listed: the walk is all-or-nothing, never
-    partial. Note that ``os.walk`` swallows ``entry.is_dir()`` failures internally and treats such an
-    entry as a file; that entry then reaches the classifier and is accounted for as an ``UNREADABLE``
-    rejection, so it is still reported rather than lost.
+    * A **symlink** is already excluded by ``os.walk``, which consults ``os.path.islink()``. That
+      silent exclusion is long-standing, intended, and pinned by
+      ``test_symlinked_directory_is_not_traversed``, so it is preserved exactly.
+    * A **junction or volume mount point** is *not* excluded: ``os.path.islink()`` is ``False`` for
+      one on Windows, so ``followlinks=False`` does not stop it and ``os.walk`` descends into its
+      target. Measured on CPython 3.14.3: an unpruned junction was entered, and the files beneath it
+      were ``stat``-ed and counted as part of the selected folder — 1776 of 1808 reported bytes came
+      from outside the root. Pruning ``dirnames`` in place is what stops the descent, which is the
+      same policy ``cache_admin._walk_contained`` already applies to the cache tree.
+
+    A junction therefore makes the scan **refuse**, rather than quietly excluding it. Quietly
+    excluding it would shrink the operator's source set while still reporting a complete-looking
+    total, which is the silent-truncation failure this module exists to prevent; and the excluded
+    directory cannot be reported through :class:`InputSet` without a new field that every caller
+    would have to learn to display. The refusal names the link and says what to do about it, and
+    every existing caller already surfaces ``InputScanError`` to the operator.
+
+    Raises ``InputScanError`` if any directory cannot be listed, if a nested junction is found, or if
+    a child directory's link metadata cannot be read: the walk is all-or-nothing, never partial. Note
+    that ``os.walk`` swallows ``entry.is_dir()`` failures internally and treats such an entry as a
+    file; that entry then reaches the classifier and is accounted for as an ``UNREADABLE`` rejection,
+    so it is still reported rather than lost.
 
     Both modes follow the same rule for *entries*: this function decides only "directory or not", and
     anything that is not a directory is passed to the classifier, which owns extension, ``stat``,
     regular-file, empty-file and ``UNREADABLE`` handling. No entry may be dropped here, because an
     entry dropped here is invisible in every count the report publishes.
+
+    The selected ``root`` itself is never classified, so a folder the operator explicitly chose stays
+    usable even when it is itself a junction: the decision being made here is only ever about a
+    directory the operator did *not* choose.
     """
     if recursive:
         walk = os.walk(root, onerror=_walk_error_raiser(root), followlinks=False)
         for dirpath, dirnames, filenames in walk:
-            dirnames.sort()
+            kept: list[str] = []
+            refused: str | None = None
+            for name in sorted(dirnames):
+                child = os.path.join(dirpath, name)
+                kind = _nested_link_kind(child)
+                if kind == _NESTED_SYMLINK:
+                    continue
+                if kind == _NESTED_REPARSE:
+                    if refused is None:
+                        refused = child
+                    continue
+                kept.append(name)
+            # Assigned before the refusal below, so the walk cannot descend a link even if this
+            # generator is resumed or abandoned: containment is structural, not a side effect of
+            # raising. `kept` is built from sorted(dirnames), so ordering stays deterministic.
+            dirnames[:] = kept
+            if refused is not None:
+                raise InputScanError(
+                    f"Cannot scan folder tree: {refused} is a junction or mount point inside the "
+                    f"selected folder, so the files it leads to are stored somewhere else. They "
+                    f"were not counted, and the scan was refused rather than reporting a total "
+                    f"that mixes in files from another location. To include them, select that "
+                    f"target as a source folder in its own right."
+                )
             for name in sorted(filenames):
                 yield os.path.join(dirpath, name)
         return
@@ -410,6 +537,7 @@ def scan_folder(
     extensions: Iterable[str] | None = None,
     detect_duplicates: bool = True,
     chunk_bytes: int = FINGERPRINT_CHUNK_BYTES,
+    max_entries: int | None = None,
 ) -> InputSet:
     """Enumerate source video files under ``root`` and account for every entry seen.
 
@@ -420,18 +548,61 @@ def scan_folder(
             optional). Defaults to :data:`SUPPORTED_VIDEO_EXTENSIONS`.
         detect_duplicates: Compute duplicate candidates. Set ``False`` to skip all file reads.
         chunk_bytes: Head/tail size for fingerprinting.
+        max_entries: Optional ceiling on how many discovered entries this caller is willing to
+            classify. ``None`` — the default, and what every caller in this repository passes —
+            means no ceiling and behaviour identical to before the parameter existed. See
+            *Bounding* below.
 
     Returns:
         An :class:`InputSet` covering a **complete** traversal. Nothing is copied, moved, modified or
         deleted.
 
     Raises:
+        ValueError: ``max_entries`` is neither ``None`` nor a positive ``int``. Checked **before any
+            filesystem access**, because passing ``0`` or ``-1`` is a programming error in the
+            caller, not an observation about the folder, and must not be reported as one.
+        InputScanLimitExceeded: the tree holds **more than** ``max_entries`` entries.
         InputScanError: ``root`` is empty, missing, not a directory or unlistable, **or** any
             directory in the tree could not be listed. Traversal is all-or-nothing: a returned
             :class:`InputSet` always means every directory was read successfully, so an incomplete
             scan can never masquerade as a smaller library.
+
+    Bounding, and what ``max_entries`` honestly is
+    ----------------------------------------------
+    It is a **classification-entry ceiling**. It is *not* a wall-clock bound and *not* a peak-memory
+    bound, and it must never be described as either.
+
+    * It counts **discovered entries**, not supported media files. Cost is incurred per entry seen,
+      so a ceiling on accepted files alone would leave a directory of ten million ``.txt`` files
+      entirely unbounded.
+    * Exactly ``max_entries`` entries **succeeds**; the entry *after* that refuses. Proving there is
+      a further entry requires pulling one, which is what separates "there are more" from "there are
+      exactly this many".
+    * Reaching it **raises** rather than returning a short :class:`InputSet`. The all-or-nothing
+      contract is the point of this module, and a truncated success would also be a *containment*
+      lie: measured, a ceiling reached before a nested junction means the junction is never seen, so
+      a short result is no evidence that the tree is contained.
+    * **What it cannot bound.** ``os.walk`` materialises one directory's entries completely before
+      it yields the first of them, and :func:`_nested_link_kind` takes one ``os.lstat`` per child
+      directory before any of that directory's files are yielded. Measured on CPython 3.14.3: a
+      single directory of 20,000 files with a ceiling of 1 still enumerated all 20,000 entries at
+      identical peak memory, and a root holding 4,000 subdirectories still performed 4,000 ``lstat``
+      calls. The irreducible floor is therefore O(entries in the largest single directory) +
+      O(subdirectories of each visited directory), and only the per-entry classification cost above
+      that floor is actually bounded.
     """
     started = time.perf_counter()
+
+    # Before any filesystem access, so an invalid ceiling is always the same deterministic error
+    # regardless of whether `root` happens to exist. `isinstance(True, int)` is True in Python, so
+    # bool is excluded explicitly rather than being silently accepted as 1.
+    if max_entries is not None:
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int):
+            raise ValueError(
+                f"max_entries must be a positive integer or None, not {type(max_entries).__name__}"
+            )
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be a positive integer or None, not {max_entries}")
 
     if not root or not str(root).strip():
         raise InputScanError("No folder was provided.")
@@ -451,6 +622,20 @@ def scan_folder(
     collisions = 0
 
     for candidate in _iter_candidate_paths(resolved_root, recursive):
+        if max_entries is not None and discovered >= max_entries:
+            # Checked BEFORE the increment, so `discovered` and the accounting below stay exactly
+            # consistent with one another, and so this entry is never half-counted. Reaching here
+            # at all means the generator produced one more entry than the ceiling allowed, which
+            # is the proof that the tree is larger -- a ceiling equal to the entry count exhausts
+            # the generator instead and succeeds.
+            raise InputScanLimitExceeded(
+                f"Cannot scan folder tree: {resolved_root} holds more than the {max_entries} "
+                f"entries this inspection allowed itself to read, so the inventory was not "
+                f"completed and no count for this folder is a total. Narrow the folder, or raise "
+                f"the limit.",
+                limit=max_entries,
+                counted_at_least=discovered,
+            )
         discovered += 1
         absolute = os.path.abspath(candidate)
 
@@ -542,6 +727,7 @@ __all__ = [
     "Fingerprint",
     "FingerprintError",
     "InputScanError",
+    "InputScanLimitExceeded",
     "InputSet",
     "MediaFile",
     "RejectReason",

@@ -1479,6 +1479,28 @@ Three constraints decide whether that report is honest:
 
 #### R14-B — Optional Cleanup · **only after an explicit confirmation**
 
+> **S1 delivered (2026-11-11): the read-only preview, and nothing that acts on it.** The Media
+> Library inventory gained a second default-off tick that gathers source-state evidence for
+> `SCOPE_IN` records only and hands it to A5, which already knew how to join it. So the first
+> bullet below is now **partly** satisfied and partly, deliberately, not: the operator gets a
+> truthful per-record source state and A5's own confirmed-missing figure, but **no byte total** —
+> A5 withholds one at that exactness and S1 invents nothing to replace it. Everything that would
+> *act* on the preview remains unbuilt, which is the intended order. See `CHANGELOG-FORK.md`
+> (2026-11-11) for the four safety properties and for what S1 explicitly does not claim.
+
+> **S2 delivered (2026-11-11): the figure is now checkable.** The owner's first real run — 5,741
+> media files, 122,334,222,752 bytes, the record pass stopping on its 2,000-record ceiling —
+> reported *"at least 50 records with confirmed-missing source paths"*, which is believable and
+> impossible to verify. S2 prints up to **twenty** of those paths in the same read-out:
+> deduplicated into distinct paths, ordered by path so a repeat run shows the same ones, labelled
+> a bounded sample, and admitted only by A1's own `confirmed_missing` — so nothing out of scope,
+> unknown, provisional, access-denied, unreachable or unresolved can appear. It is **display
+> only**: no new classification, no new filesystem call, no second record read, no new widget, no
+> raised ceiling, and A5's report block is byte-identical with the sample removed. It counts
+> **paths** where A5 counts **records**, and says so. The first bullet below is therefore still
+> only partly satisfied — there is still **no byte total**, by A5's own exactness rule — and
+> everything that would *act* on the preview is still unbuilt.
+
 - **Dry-run preview first**, stating the exact file count and the bytes that would be reclaimed.
 - **Preserve unrelated Qwen model and cache variants.** A record keyed by a different backend or
   config token is not obsolete; it belongs to another configuration.

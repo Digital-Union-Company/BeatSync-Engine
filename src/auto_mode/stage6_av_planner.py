@@ -78,16 +78,71 @@ def creative_seed(beat_info: Dict | None) -> int:
     return creative_profile(beat_info).seed
 
 
+class SegmentSourceCapacityError(RuntimeError):
+    """[FORK] Digital-Union (Short-Source Eligibility R1): no source can fill a planned segment.
+
+    Raised by ``build_planned_clip_sequence`` **before** any extraction worker starts, when a visual
+    library is present but none of its candidate moments comes from a file long enough to supply the
+    frame-locked slot a segment was allocated.
+
+    It is deliberately a refusal rather than a shorter plan. Dropping the segment would make the
+    plan shorter than the timeline, which discards the plan whole and sends the render to the
+    renderer's legacy sampling — and that path picks a file at random with no view of its length at
+    all, so it is strictly worse than stopping.
+    """
+
+
+def output_frame_rate(beat_info: Dict | None, output_fps: float | None = None) -> float | None:
+    """[FORK] Digital-Union (Short-Source Eligibility R1): the render's effective output frame rate.
+
+    The source-capacity guarantee is stated in **output frames**, so it cannot be made at all
+    without the rate the frame-locked timeline was actually built at. Nothing is guessed and there
+    is no default: ``None`` means the caller did not ask for the guarantee, and the planner then
+    behaves exactly as it always has.
+
+    Read like every other render-scoped fact this module needs — the explicit argument first, then
+    the shared ``beat_info`` bus, where ``video_processor.create_music_video`` publishes the rate it
+    resolved. One reader, exactly as ``creative_profile`` is the one reader of the creative state,
+    so the rate cannot fork into two independently-parsed views of the same number.
+
+    A rate that *was* supplied but is not usable **fails closed** with ``ValueError``: claiming
+    output-frame eligibility against a zero, negative, non-finite or unparseable rate would be a
+    guarantee about nothing.
+    """
+    if output_fps is None and isinstance(beat_info, dict):
+        output_fps = beat_info.get("output_fps")
+    if output_fps is None:
+        return None
+    try:
+        rate = float(output_fps)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"output frame rate {output_fps!r} is not a number, so source capacity cannot be "
+            f"expressed in output frames"
+        )
+    if not np.isfinite(rate) or rate <= 0.0:
+        raise ValueError(
+            f"output frame rate {rate!r} is not a usable positive frame rate, so source capacity "
+            f"cannot be expressed in output frames"
+        )
+    return rate
+
+
 def build_planned_clip_sequence(
     cut_times: Sequence[float],
     segment_durations: Sequence[float],
     beat_info: Dict | None,
     video_files: Sequence[str],
+    output_fps: float | None = None,
 ) -> List[Dict]:
     """Build exact source clip choices for every output segment.
 
     Returns an empty list when no visual library is present, which tells the
     renderer to keep its old fallback sampling.
+
+    [FORK] Digital-Union (Short-Source Eligibility R1): ``output_fps`` is the optional frame-rate
+    authority for the source-capacity guarantee. Supplied explicitly, or published on ``beat_info``
+    by the renderer; absent, every existing caller and test keeps today's behaviour unchanged.
     """
     beat_info = beat_info or {}
     video_analysis = beat_info.get("video_analysis") or {}
@@ -117,6 +172,12 @@ def build_planned_clip_sequence(
         None if profile_settings.is_neutral_source_diversity()
         else profile_settings.source_diversity_factor()
     )
+    # [FORK] Digital-Union (Short-Source Eligibility R1): the frame-rate authority, resolved ONCE
+    # per call alongside the other render-scoped constants above — never per segment, and never per
+    # candidate. `None` keeps the legacy behaviour in full: no eligibility is consulted, so the
+    # candidate loop below is the one it has always been. Resolved after the empty-library return,
+    # so a render with no visual candidates still falls back exactly as before.
+    output_rate = output_frame_rate(beat_info, output_fps)
 
     # [FORK] Digital-Union (Freestyle V1): the per-section layer. `profile_settings` above stays the
     # GLOBAL base and the seed stays global — Freestyle varies only the four Stage-6 controls, and
@@ -299,8 +360,19 @@ def build_planned_clip_sequence(
             base_scores=base_scores,
             controls=segment_scoring,
             source_diversity_factor=segment_diversity,
+            output_fps=output_rate,
         )
         if not candidate:
+            # [FORK] Digital-Union (Short-Source Eligibility R1): with a frame-rate authority in
+            # hand, an empty return means every candidate's source file is measurably too short for
+            # this segment's frame-locked slot — so the plan cannot be completed and saying so here
+            # is the whole point. Falling through to `continue` would shorten `planned`, trip the
+            # length check below, discard the entire plan and hand the render to legacy random
+            # sampling, which cannot see a source length at all. Without a rate (`output_rate is
+            # None`) nothing is claimed and the original `continue` stands untouched.
+            if output_rate is not None:
+                raise SegmentSourceCapacityError(
+                    _capacity_refusal(i, profile, candidates, output_rate))
             continue
         planned_clip = _materialize_clip(
             candidate=candidate,
@@ -564,6 +636,78 @@ def _adjusted_score(
     return score
 
 
+def _segment_frames(profile: Dict, fps: float) -> int:
+    """[FORK] Digital-Union (Short-Source Eligibility R1): a segment's slot, in output frames.
+
+    ``max(0.05, float(profile["duration"]))`` mirrors ``_materialize_clip``'s ``final_duration``
+    exactly, so the number compared here is the number the plan goes on to record.
+    """
+    return int(round(max(0.05, float(profile["duration"])) * fps))
+
+
+def _source_frames(candidate: Dict, fps: float) -> int | None:
+    """[FORK] Digital-Union (Short-Source Eligibility R1): a candidate's whole source FILE, in
+    output frames — or ``None`` when the file's length is not measurable from the record.
+
+    ``video_duration`` is the length of the **file**, written by Stage 5 from the same FFprobe
+    duration the extraction worker later reads. ``duration`` is a different quantity: the length of
+    the analysed *window*, which Stage 5 caps. Reading the window as a capacity statement is the
+    defect this replaces — a long file's window is short, so above the cap no candidate in any
+    library could satisfy a slot, and below it a file barely longer than its window reads as
+    perfectly capable.
+
+    **A duration-derived estimate, never a decoded frame count.** An absent, unparseable,
+    non-finite or non-positive value returns ``None`` and is treated as *unmeasured*, not short: an
+    unmeasured count must never become a refusal, and the worker's own pre-extraction guard — which
+    probes the file — stays the authority.
+    """
+    try:
+        seconds = float(candidate.get("video_duration"))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(seconds) or seconds <= 0.0:
+        return None
+    return int(round(seconds * fps))
+
+
+def _can_fill_segment(candidate: Dict, profile: Dict, fps: float) -> bool:
+    """Whether this candidate's source file can supply its segment's whole frame-locked slot."""
+    available = _source_frames(candidate, fps)
+    if available is None:
+        return True
+    return available >= _segment_frames(profile, fps)
+
+
+def _capacity_refusal(index: int, profile: Dict, candidates: Sequence[Dict], fps: float) -> str:
+    """[FORK] Digital-Union (Short-Source Eligibility R1): the actionable pre-render message.
+
+    Names the segment, what it needs, and the best capacity actually available when one can be
+    established — a bare "no source fits" would leave the operator with nothing to act on.
+    """
+    needed = _segment_frames(profile, fps)
+    best = None
+    for candidate in candidates:
+        available = _source_frames(candidate, fps)
+        if available is not None and (best is None or available > best):
+            best = available
+    message = (
+        f"Segment {index + 1} (index {index}) was allocated {needed} output frames "
+        f"({max(0.05, float(profile['duration'])):.3f}s at {fps:g} fps), but no analysed source "
+        f"moment comes from a file long enough to supply them"
+    )
+    if best is not None:
+        message += (
+            f"; the longest available source supplies about {best} frames, "
+            f"short by {needed - best}"
+        )
+    return message + (
+        ". These are duration-derived estimates, not decoded frame counts. Use source videos "
+        "longer than the longest planned segment, or raise Cut Density so the segments are "
+        "shorter. Refused before extraction rather than publishing a clip short of its slot, "
+        "which would desynchronise every later cut."
+    )
+
+
 def _choose_candidate(
     candidates: Sequence[Dict],
     profile: Dict,
@@ -575,7 +719,17 @@ def _choose_candidate(
     base_scores: Sequence[float] | None = None,
     controls: "fork_creative.ScoringControls | None" = None,
     source_diversity_factor: float | None = None,
+    output_fps: float | None = None,
 ) -> Dict | None:
+    # [FORK] Digital-Union (Short-Source Eligibility R1): `output_fps` turns on the source-capacity
+    # guarantee, and does nothing else. It is deliberately NOT a pre-filter over `candidates`:
+    # reshaping the field before the draw changes which jitter each candidate receives in the legacy
+    # branch, and changes both the weight normalisation and `select_index`'s single-eligible early
+    # return in the seeded branch — measured at 7.84 % / 21.66 % of already-viable segments picking
+    # a different winner. So scoring, iteration order and the RNG stream are untouched, and a
+    # candidate that cannot physically fill the slot is denied the WIN rather than the draw.
+    # `None` leaves both branches exactly as they were.
+    #
     # [FORK] Digital-Union (L1A): `base_scores` is the precomputed static score for THIS segment's
     # target, aligned with `candidates` by position — candidate ids are not used as the key, because
     # they are not guaranteed unique across a 900-source library. The alignment is checked rather
@@ -602,6 +756,11 @@ def _choose_candidate(
                 source_diversity_factor=source_diversity_factor,
             )
             score += rng.random() * 0.015
+            # [FORK] Digital-Union (Short-Source Eligibility R1): AFTER the draw, never before it.
+            # Every candidate still consumes exactly one `rng.random()` in the original order, so
+            # the stream each candidate sees is the legacy stream; only the comparison is skipped.
+            if output_fps is not None and not _can_fill_segment(candidate, profile, output_fps):
+                continue
             if score > best_score:
                 best_score = score
                 best_candidate = candidate
@@ -622,7 +781,20 @@ def _choose_candidate(
         for position, candidate in enumerate(candidates)
     ]
     rng = _stable_rng(seed, index, profile.get("target"), profile.get("start"))
-    return candidates[fork_variation.select_index(scores, rng)]
+    chosen = fork_variation.select_index(scores, rng)
+    if output_fps is None or _can_fill_segment(candidates[chosen], profile, output_fps):
+        return candidates[chosen]
+
+    # [FORK] Digital-Union (Short-Source Eligibility R1): the first draw is made against the
+    # UNCHANGED full score list, so a render whose winner can fill its slot is bit-identical to
+    # before — including the stream position. Only an unfillable winner is denied, and the
+    # replacement comes from the SAME `rng`, so nothing re-seeds and nothing is reordered.
+    eligible = [position for position in range(len(candidates))
+                if _can_fill_segment(candidates[position], profile, output_fps)]
+    if not eligible:
+        return None
+    return candidates[eligible[fork_variation.select_index(
+        [scores[position] for position in eligible], rng)]]
 
 
 def _score_candidate(candidate: Dict, profile: Dict,

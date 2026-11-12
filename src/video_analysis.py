@@ -533,7 +533,7 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
     return _hash_text(raw, length=24)
 
 
-def resolve_cache_location(local_default: str | None = None):
+def resolve_cache_location(local_default: str | None = None, *, make_dirs=None):
     """[FORK] Digital-Union (FUN Shared Analysis Cache): which cache directory to use, resolved once.
 
     Returns a frozen `beatsync_fork.analysis_cache.CacheLocation`. Call it **once per invocation**
@@ -547,11 +547,34 @@ def resolve_cache_location(local_default: str | None = None):
 
     Total: a missing, unreadable or malformed shared configuration resolves to the local default,
     with the reason carried on the result for the caller to report rather than swallowed here.
+
+    [FORK] Digital-Union (R14-R1): ``make_dirs`` is forwarded verbatim to
+    `analysis_cache.resolve_location`, whose own default is the real `os.makedirs`. **`None` means
+    "unchanged"** — it is not a second policy — so both Stage-5 entry points below call this with
+    no argument and keep the documented create-the-configured-folder behaviour exactly.
+
+    It exists because *resolving* and *creating* were welded together, and the GUI needs the first
+    without the second: building the interface resolved the location to describe it and thereby
+    materialised a configured shared folder before the operator had started an analysis or pressed
+    anything. A read-only caller now passes a refusing ``make_dirs``
+    (`library_cache_location.RefuseDirectoryCreation`, the mechanism R14-A stage A4 already uses)
+    rather than a second resolver — there is deliberately still exactly ONE resolver, because a
+    caller that computed the location independently could show one folder while Stage 5 used
+    another.
+
+    **A refused creation does not make the answer a lie, but it does narrow it.** The parent-rule
+    branch above is unaffected (an unreachable parent still reports and falls back without being
+    asked to create anything); what changes is that the configured-folder branch returns
+    ``available=True`` for a folder that was not created. That is the right answer to *"which
+    directory would the next analysis use?"* and the wrong answer to *"does it exist right now?"* —
+    so a read-only caller must establish presence independently and must never read presence,
+    emptiness or usability off this result. A4 does exactly that, and both GUI read-outs here go
+    through measurements that report an absent folder as absent.
     """
     base = VIDEO_ANALYSIS_CACHE_DIR if local_default is None else local_default
     try:
         config, notice = fork_analysis_cache.load_config(fork_analysis_cache.config_path())
-        location = fork_analysis_cache.resolve_location(base, config)
+        location = fork_analysis_cache.resolve_location(base, config, make_dirs=make_dirs)
     except Exception as exc:
         # Nothing about reading a settings file may be able to fail an analysis run.
         return fork_analysis_cache.CacheLocation(
