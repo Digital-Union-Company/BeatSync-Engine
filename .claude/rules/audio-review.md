@@ -313,15 +313,67 @@ current page' beside it"*:
 - **The refusal paths revoke nothing**, and that is asserted against the registry rather than
   against widget values.
 
-**What this does not promise — stated narrowly, do not widen [R15-C / F-3].** A *scan* already in
-flight finishes by minting a **fresh** session for the folder it was scanning, so it can still
-republish that folder as a live page after the handoff. This surface has no generation counter to
-order a scan against a retirement, and adding one would be exactly the second notion of "the
-current page" the rule above forbids. The residual is bounded to presentation, and the bound is the
-reason it is acceptable: the republished page is **live**, is the page the gallery is actually
-showing, and its own report names the folder it scanned — so a later Confirm acts on what is on
-screen. **Authority is consistent; the folder textbox can be stale.** Do not restate this as "the
-handoff fully orders a concurrent scan", and do not claim a browser-level proof that was not taken.
+## The two races that revoking alone did not close  [R15-C / F-3, F-4]
+
+**Revoking is necessary and was not sufficient.** Both of the following were reproduced on
+`534cdb6f` with threading barriers — never sleeps, never a probabilistic race — and **both moved
+real files.**
+
+### F-4: a read cannot gate a mutation
+
+`_audio_page_is_live` is a **read**, and between it and the first `os.rename` the real code merges
+the payload, plans the sort, renders a gallery and validates both destinations against the
+filesystem. A handoff landing anywhere in that window revoked the page *after* the read, and the
+sort moved the clips anyway: three left folder A under a terminal frame reading
+`✅ Sorted all 3 clip(s).`
+
+`.claude/rules/video-review-transfer.md` already states the governing principle, from R13's own
+F-1: *"a read cannot refuse anything, because what it reports may change before the caller acts on
+it."*
+
+So the sort **claims** the page instead. `ClipRegistry.claim_page` is one locked test-and-set that
+verifies the page is live, retires it, and hands back its entries. Three consequences:
+
+- the claim sits **after** every refusal and immediately **before** `_audio_sort`, so a refused
+  destination or an unarmed sweep still leaves the page usable — and a collision failure still
+  leaves the clips retryable on screen, because the handler re-scans afterwards;
+- the lock is **not** held across the renames. The entries come back and the filesystem work
+  happens outside, because a registry lock held across a batch would stall every other session's
+  media request;
+- a batch that **wins** the claim finishes and says so. That is the explicit policy: the operator
+  pressed Confirm on a page they held, so abandoning it half-way is the one outcome with no honest
+  description. Nothing is left actionable afterwards — the claim retired the page — and the handoff
+  never claims to have prevented it.
+
+### F-3: a generation beside the mint is another check-then-act
+
+A scan of folder A that finished after a handoff to folder B published A as a **live page with
+tiles** while the folder box named B, and a Confirm on it moved all three files. **The previous
+review called this presentation-only. It was not** — do not repeat that classification.
+
+The first correction attempt put a `ScanCoordinator` generation beside the registry and checked
+`is_current` in `_audio_load_view` before calling `_audio_publish`. **A barrier between that check
+and the mint reproduced F-3 a second time**, because the two live under different locks.
+
+So the fence lives **inside the registry**, as a per-owner **page epoch**:
+
+- `revoke_owner` advances the epoch *and* revokes the sessions, in one locked step. Revoking alone
+  was never enough: a scan does not reuse a revoked session, it mints a **fresh** one;
+- every event that can publish — Scan, a page turn, and the re-scan a successful sort performs —
+  reads `owner_epoch` at its **start** and threads it to `new_session(expected_epoch=…)`, which
+  compares it **in the same `with self._lock` block that mints the session**;
+- `_audio_load_view` deliberately does **not** check the epoch itself. A check there would be one
+  more check-then-act;
+- a superseded publication yields **nothing** and the empty view, and the event's report is the
+  supersession note *alone* — not "Found 3 audio clip(s)" followed by a page count of zero, which
+  reads as a live page;
+- it is **per-owner**, so one operator's retirement cannot fence another's scan. Verified in two
+  real browser sessions.
+
+**No new coordinator, no new lock, no new thread, no second notion of "the current page."** One
+authority — the registry that already owns pages — and one lock. A scan the operator starts *after*
+a handoff reads the new epoch and behaves entirely normally; that positive control is what stops
+"nothing publishes" from passing for the wrong reason.
 
 `loaded_text(record, destination=...)` names the section. The default stays `Video Review` so R11's
 wording and its pinned tests are byte-identical; the audio caller passes `DESTINATION_AUDIO_REVIEW`.

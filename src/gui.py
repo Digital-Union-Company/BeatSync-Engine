@@ -7797,6 +7797,8 @@ _AUDIO_PREVIEW_REGISTRY = fork_clips.ClipRegistry()
 CLIPS_MAX_TRACKED_SESSIONS = 32
 _CLIPS_SCANS = fork_clips.ScanCoordinator(max_owners=CLIPS_MAX_TRACKED_SESSIONS)
 
+
+
 #: [R13] The authority for "one Video Review transfer at a time". Deliberately a **separate**
 #: object from `_CLIPS_SCANS` rather than another flag on it: the coordinator owns *pages*, and a
 #: transfer outlives the page lifecycle question it is asked about -- the sort is still running
@@ -10445,7 +10447,7 @@ def _audio_owner(request):
         getattr(request, 'session_hash', None) if request is not None else None)
 
 
-def _audio_publish(surface, owner, paths, page_index, page_size):
+def _audio_publish(surface, owner, paths, page_index, page_size, expected_epoch=None):
     """Mint a fresh session and one page of opaque clip ids for `paths`.
 
     Returns `(session_id, page_token, entries, start)`. This revokes the owner's previous session
@@ -10455,7 +10457,7 @@ def _audio_publish(surface, owner, paths, page_index, page_size):
     total = len(paths)
     start, count = fork_audio_review.page_slice(page_index, total, page_size)
     frozen = fork_audio_review.freeze_paths(paths, start, count)
-    session_id = surface.registry.new_session(owner)
+    session_id = surface.registry.new_session(owner, expected_epoch=expected_epoch)
     page_token, entries = surface.registry.publish_page(
         owner, session_id, int(fork_audio_review.resolve_page(page_index, total, page_size)),
         frozen, servable=fork_audio_review.SERVABLE_SUFFIXES)
@@ -10556,6 +10558,56 @@ def _audio_page_is_live(surface, view) -> bool:
     return True
 
 
+def _audio_page_epoch(surface, request):
+    """This owner's page epoch on `surface`, or `None` if they have no browser identity.
+
+    [FORK] Digital-Union (R15-C / F-3). Read at the **start** of every event that will publish a
+    page -- Scan, a page turn, and the re-scan a successful sort performs -- and handed down to
+    `new_session`, which compares it **inside the same lock that mints the session**.
+
+    Reading it before the folder walk is the whole point. An epoch read afterwards would leave
+    exactly the window this closes, and a check performed outside the registry's lock would leave a
+    smaller one: measured on `534cdb6f`, a scan suspended between a generation check and the mint
+    published folder A as a live page after a handoff to folder B, and a Confirm on it moved all
+    three files. The comparison has to be atomic with the mint, which is why the epoch lives in the
+    registry rather than in a coordinator beside it.
+    """
+    try:
+        return surface.registry.owner_epoch(_audio_owner(request))
+    except fork_clips.Refusal:
+        return None
+
+
+def _audio_claim_page(surface, view):
+    """**Take** the page this view describes, or `None` if it is no longer the live one.
+
+    [FORK] Digital-Union (R15-C / F-4). The authority a file move acts under, and it is a claim
+    rather than a check for the reason `.claude/rules/video-review-transfer.md` states about R13's
+    own F-1: *"a read cannot refuse anything, because what it reports may change before the caller
+    acts on it."*
+
+    `_audio_page_is_live` is a read, and between it and the first `os.rename` the real code merges
+    the payload, plans the sort, renders a gallery and validates both destinations against the
+    filesystem. A handoff landing anywhere in that window revoked the page **after** the read and
+    the sort moved the files regardless -- reproduced deterministically on `534cdb6f` with a
+    barrier: three clips left the retired folder under `✅ Sorted all 3 clip(s).`
+
+    Claiming retires the page inside the registry's own lock, so after this returns there is nothing
+    left for a second press, a stale press, the media route or a later retirement to act on. The
+    lock is not held across the moves -- the entries come back and the filesystem work happens
+    outside -- because a registry lock held across a batch of renames would stall every other
+    session's media request.
+    """
+    session = (view or {}).get('session') or ''
+    page = (view or {}).get('page') or ''
+    if not session or not page:
+        return None
+    try:
+        return surface.registry.claim_page(session, page)
+    except fork_clips.Refusal:
+        return None
+
+
 def _audio_retire_page(surface, request) -> None:
     """Revoke this owner's review session on `surface`. The real retirement.
 
@@ -10573,6 +10625,13 @@ def _audio_retire_page(surface, request) -> None:
 
     A session with no browser identity has no page to retire; it still gets the repainted empty
     state, which is what its own Scan would show anyway.
+
+    [FORK] Digital-Union (R15-C / F-3): `revoke_owner` now also **advances the owner's page
+    epoch**, and that half is what stops a scan already walking a folder from republishing it
+    afterwards. Revoking the sessions alone was not enough -- a scan does not reuse a revoked
+    session, it mints a **fresh** one, so the page came straight back live. One call still does
+    both, under the registry's own lock, so there is no interval in which a retirement is half
+    applied.
     """
     try:
         surface.registry.revoke_owner(_audio_owner(request))
@@ -10593,8 +10652,21 @@ def _audio_render(surface, view) -> tuple:
 
 
 def _audio_load_view(surface, request, paths, root, recursive, page_index, page_size,
-                     spans=None, decisions=None, names=None):
+                     spans=None, decisions=None, names=None, epoch=None):
     """Publish one page of `paths` and build the view. Returns `(view, note)`.
+
+    [FORK] Digital-Union (R15-C / F-3): `epoch` fences the publication. This is the **only**
+    function that publishes a page, so threading it here covers all three paths that can produce one
+    -- Scan, a page turn, and the re-scan a successful sort performs. `None` means "unfenced" and is
+    what any caller outside an event gets.
+
+    It is deliberately **not checked here.** It is handed to `new_session`, which compares it inside
+    the lock that mints the session: a check in this function would be one more check-then-act, and
+    a barrier placed between such a check and the mint reproduced the defect a second time. A
+    superseded publication yields **nothing** and the empty view, so a scan that finished after a
+    handoff leaves the operator with an honest "no current page" rather than a live gallery for a
+    folder the box no longer names -- the same disposition the Clips Preview reached, for the same
+    reason.
 
     `note` is prose for the caller's report when publication failed -- never an exception, because
     every caller is a Gradio event handler and a failed preview must not discard a cut that
@@ -10619,8 +10691,12 @@ def _audio_load_view(surface, request, paths, root, recursive, page_index, page_
                        f"({refusal.reason}). Reload the page.")
     try:
         session_id, page_token, entries, start = _audio_publish(
-            surface, owner, paths, page_index, resolved_size)
+            surface, owner, paths, page_index, resolved_size, expected_epoch=epoch)
     except fork_clips.Refusal as refusal:
+        if refusal.reason == 'superseded_scan':
+            # [FORK] Digital-Union (R15-C / F-3). The owner's page was retired while this was being
+            # prepared -- in practice by their own handoff. Nothing was published.
+            return empty, AUDIO_PAGE_SUPERSEDED_NOTE
         return empty, (f"\n\u26a0\ufe0f  The preview gallery could not be opened ({refusal.reason}). "
                        f"The files are on disk either way.")
 
@@ -10812,6 +10888,28 @@ def _audio_confirm_core(surface, view, payload, library, discarded, armed_signat
                             + ['', AUDIO_SWEEP_GATE_PROMPT])
         return (message, view, gallery, counts, plan.signature, True, False)
 
+    # [FORK] Digital-Union (R15-C / F-4). **CLAIM the page, immediately before the first move.**
+    #
+    # The liveness gate above is a read, and everything between it and here is real work -- the
+    # payload merge, the plan, the render, two destination validations that touch the filesystem.
+    # A handoff landing anywhere in that window revoked the page *after* the read and the sort moved
+    # the files anyway. Narrowing the window would not close it; what closes it is taking the page
+    # in one locked test-and-set, so the retirement and the sort can no longer both believe they
+    # won. This is R13's own F-1 lesson applied here: a mutation is CLAIMED, not permitted by a
+    # check.
+    claimed = _audio_claim_page(surface, view)
+    if claimed is None:
+        retired = {}
+        gallery, counts = _audio_render(surface, retired)
+        return (AUDIO_PAGE_RETIRED_TEXT, retired, gallery, counts, '', False, False)
+    # The claim answers which clips the SERVER believes are on this page. If that disagrees with the
+    # view the decisions were made against, the two are not the same page and nothing may move --
+    # this is defence in depth rather than an expected branch, and it costs one set comparison.
+    if {entry.clip_id for entry in claimed} != {e.clip_id for e in (view.get('entries') or ())}:
+        retired = {}
+        gallery, counts = _audio_render(surface, retired)
+        return (AUDIO_PAGE_RETIRED_TEXT, retired, gallery, counts, '', False, False)
+
     message, refreshed = _audio_sort(surface, view, resolved_library, resolved_discarded,
                                      sweep_unmarked=plan.has_unmarked)
     gallery, counts = _audio_render(surface, refreshed)
@@ -10897,6 +10995,9 @@ def _on_audio_preview_scan(folder, recursive, page_size, library_folder, discard
     after sorting part of it does not forget what the operator decided about the rest.
     """
     previous = dict(view or {})
+    # [FORK] Digital-Union (R15-C / F-3): taken BEFORE the walk, so a retirement that happens
+    # while this scan is enumerating can see that a scan is in flight and fence its publication.
+    epoch = _audio_page_epoch(_AUDIO_SURFACE_PREVIEW, request)
     found = fork_audio_review.discover_audio(folder, recursive)
     _, dest_message = fork_audio_review.destination_feedback(
         found.root or folder, library_folder, discarded_folder, app_root=ROOT_DIR)
@@ -10913,12 +11014,19 @@ def _on_audio_preview_scan(folder, recursive, page_size, library_folder, discard
     new_view, note = _audio_load_view(
         _AUDIO_SURFACE_PREVIEW, request, paths, found.root, recursive=bool(recursive),
         page_index=1, page_size=page_size,
-        decisions=previous.get('decisions'), names=previous.get('names'))
+        decisions=previous.get('decisions'), names=previous.get('names'),
+        epoch=epoch)
     if not paths:
         return _audio_preview_outputs(
             "No audio clips found in that folder.\n"
             f"Playable formats: {', '.join(fork_audio_review.SERVABLE_SUFFIXES)}",
             new_view, dest_message)
+    if note == AUDIO_PAGE_SUPERSEDED_NOTE:
+        # [FORK] Digital-Union (R15-C / F-3). Nothing was published, so the usual read-out must not
+        # be printed above it: `_audio_preview_scan_report` would lead with "Found 3 audio clip(s)"
+        # and then state a page count of zero, which reads as a failure of the folder rather than as
+        # what happened. The note alone is the truthful report.
+        return _audio_preview_outputs(note.strip(), new_view, dest_message)
     report = _audio_preview_scan_report(found, new_view, page_size) + note
     return _audio_preview_outputs(report, new_view, dest_message)
 
@@ -10950,7 +11058,15 @@ def _audio_preview_turn(payload, step, page_size, view, request):
         _AUDIO_SURFACE_PREVIEW, request, paths, current.get('root', ''),
         recursive=current.get('recursive', True), page_index=target, page_size=resolved_size,
         spans=current.get('spans'), decisions=current.get('decisions'),
-        names=current.get('names'))
+        names=current.get('names'),
+        # [FORK] Digital-Union (R15-C / F-3): a page turn publishes a page, so it is fenced for
+        # exactly the same reason a scan is -- a turn that landed after a handoff would otherwise
+        # republish the folder the operator has left.
+        epoch=_audio_page_epoch(_AUDIO_SURFACE_PREVIEW, request))
+    if note == AUDIO_PAGE_SUPERSEDED_NOTE:
+        # [FORK] Digital-Union (R15-C / F-3): same reasoning as the scan. Announcing "Page 2 of 7"
+        # for a page that was never published would be the misleading half of the old behaviour.
+        return (note.strip(), turned)
     return (f"Page {turned.get('page_index', 1)} of "
             f"{fork_audio_review.page_count(len(paths), resolved_size)}." + note, turned)
 
@@ -10979,6 +11095,11 @@ def _on_audio_preview_confirm(payload, library_folder, discarded_folder, page_si
     honest page to show: the clips that moved are no longer in the folder, and leaving them on
     screen would let a second Confirm report them as missing.
     """
+    # [FORK] Digital-Union (R15-C / F-3): taken at the START of the event, before the sort, so
+    # that a handoff arriving while files are being moved fences the re-scan below. Without it a
+    # sort admitted before a retirement would finish and then republish the folder it had just
+    # emptied as a live page, with the folder box naming somewhere else.
+    epoch = _audio_page_epoch(_AUDIO_SURFACE_PREVIEW, request)
     message, sorted_view, gallery, counts, signature, gate, did_sort = _audio_confirm_core(
         _AUDIO_SURFACE_PREVIEW, view, payload, library_folder, discarded_folder, armed,
         app_root=ROOT_DIR)
@@ -11004,7 +11125,8 @@ def _on_audio_preview_confirm(payload, library_folder, discarded_folder, page_si
         _AUDIO_SURFACE_PREVIEW, request, paths, found.root,
         recursive=sorted_view.get('recursive', True),
         page_index=sorted_view.get('page_index', 1), page_size=page_size,
-        decisions=sorted_view.get('decisions'), names=sorted_view.get('names'))
+        decisions=sorted_view.get('decisions'), names=sorted_view.get('names'),
+        epoch=epoch)
     remaining = (f"\n\n{len(paths)} clip(s) still in the review folder."
                  if paths else "\n\nThe review folder is now empty.")
     return _audio_preview_outputs(message + remaining + note, rescanned, dest_message)

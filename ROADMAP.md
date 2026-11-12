@@ -1579,9 +1579,18 @@ input" is not a new capability; **processing all audio streams is**.
 > leaving a retired folder under a terminal frame reading `✅ Sorted all 3 clip(s).` (F-1) — and the
 > retired page stayed fetchable over the media route (F-2). Both are closed by revoking the owner's
 > registry session through the existing `revoke_owner` and gating the shared confirm core on a
-> registry liveness read, with a positive control proving an ordinary Confirm still sorts. One
-> residual is left open and stated narrowly: a concurrent *scan* can still republish the old folder
-> as a live page, which is a presentation inconsistency rather than an authority one (F-3).
+> registry liveness read, with a positive control proving an ordinary Confirm still sorts.
+>
+> **Two further lifecycle races were then reproduced and closed (2026-11-13).** A liveness *read*
+> could not gate the sort, so a handoff landing between the read and the first rename still moved
+> the clips (F-4); and a *scan* that finished after a handoff republished the old folder as a
+> **live page with tiles**, and a Confirm on it moved all three files (F-3) — the earlier note
+> calling that "presentation only" was **wrong** and is corrected in `CHANGELOG-FORK.md`. Closed by
+> **claiming** the page (`ClipRegistry.claim_page`, one locked test-and-set) instead of reading it,
+> and by a per-owner **page epoch** compared inside the same lock that mints a session. No new
+> coordinator, lock or thread; a served-page smoke confirmed the retired page's media route going
+> `206 → 403`, a normal scan afterwards still working, and cross-owner isolation across two real
+> browser sessions.
 > Verified by offline seam tests, by executing the real handoff chain, and by **building the whole
 > Blocks tree against the real pinned Gradio 6.19.0** — 513 components against the pristine parent's
 > 546, with every removed `elem_id` absent and every kept one present. That is a construction test,

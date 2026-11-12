@@ -201,6 +201,7 @@ def chain(gui_tree: ast.Module) -> dict:
         "AUDIO_HANDOFF_NONE_TEXT": ui_content.AUDIO_HANDOFF_NONE_TEXT,
         "AUDIO_HANDOFF_MISSING_TEXT": ui_content.AUDIO_HANDOFF_MISSING_TEXT,
         "AUDIO_PAGE_RETIRED_TEXT": ui_content.AUDIO_PAGE_RETIRED_TEXT,
+        "AUDIO_PAGE_SUPERSEDED_NOTE": ui_content.AUDIO_PAGE_SUPERSEDED_NOTE,
         "AUDIO_CONFIRM_DISABLED_TEXT": ui_content.AUDIO_CONFIRM_DISABLED_TEXT,
         "AUDIO_SWEEP_GATE_HEADING": ui_content.AUDIO_SWEEP_GATE_HEADING,
         "AUDIO_SWEEP_GATE_PROMPT": ui_content.AUDIO_SWEEP_GATE_PROMPT,
@@ -218,7 +219,11 @@ def chain(gui_tree: ast.Module) -> dict:
                  "_audio_resolved_destinations", "_audio_sort", "_audio_page_is_live",
                  "_audio_retire_page", "_audio_confirm_core", "_audio_preview_page_label",
                  "_audio_preview_outputs", "_audio_handoff_refused",
-                 "_audio_handoff_retire_review", "_on_audio_open_in_library"):
+                 "_audio_handoff_retire_review", "_on_audio_open_in_library",
+                 # [FORK] Digital-Union (R15-C / F-3, F-4): the claim, the epoch reader and the
+                 # two real events the lifecycle tests drive end to end.
+                 "_audio_claim_page", "_audio_page_epoch", "_audio_preview_scan_report",
+                 "_on_audio_preview_scan", "_on_audio_preview_confirm"):
         exec(ast.unparse(_func(gui_tree, name)), namespace)
     namespace["_registry"] = registry
     namespace["press"] = lambda record: namespace["_on_audio_open_in_library"](record, _Request())
@@ -1053,3 +1058,306 @@ def test_video_reviews_own_handoff_is_unchanged(gui_tree: ast.Module):
         "its pinned tests are preserved byte for byte")
     assert "_cut_handoff_retire_review" in body
     assert handoff.loaded_text(_record("C:/x")).count("Video Review") == 1
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R15-C review findings F-3 and F-4)
+#
+# Both were reproduced on the merged baseline `534cdb6f` with threading barriers -- never sleeps,
+# never a probabilistic race -- and both MOVED REAL FILES:
+#
+#   F-4  A handoff landing between `_audio_page_is_live` (a read) and the first `os.rename` left
+#        the sort running on a page the retirement had already revoked. Three clips left folder A
+#        under a terminal frame reading `Sorted all 3 clip(s).`
+#   F-3  A scan of folder A that finished after a handoff to folder B published A as a LIVE page
+#        with tiles while the folder box named B, and a Confirm on it moved all three files. The
+#        previous review classified this as presentation-only; the measurement says otherwise.
+#
+# The corrections reuse what already exists. F-4 is closed by CLAIMING the page instead of reading
+# it -- `ClipRegistry.claim_page` is one locked test-and-set that retires the page and hands back
+# its entries, so the lock is never held across the renames. F-3 is closed by a per-owner page
+# EPOCH inside the same registry, compared in the same locked step that mints a session, because a
+# generation held in a second object cannot be atomic with a mint that happens under this lock --
+# measured: a barrier between such a check and the mint reproduced F-3 a second time.
+# =============================================================================================
+
+def _barrier_pair():
+    import threading
+    return threading.Event(), threading.Event()
+
+
+def _run_in_thread(fn):
+    import threading
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:                                # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread, box
+
+
+def test_f4_a_handoff_between_the_check_and_the_move_cannot_sort(chain, tmp_path):
+    """F-4. The handoff is delivered *while* Confirm sits between its liveness read and its first
+    rename. Deterministic: Confirm waits on an Event until the handoff has fully returned."""
+    folder_a = str(tmp_path / "run_A")
+    folder_b = str(tmp_path / "run_B")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (folder_b, library, discarded):
+        os.makedirs(path)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    view, paths = _publish(chain, folder_a)
+    payload = _decide_every_clip(view)
+
+    past_gate, handoff_done = _barrier_pair()
+    real_merge = chain["_audio_merge_payload"]
+
+    def barrier_merge(current, raw):
+        past_gate.set()
+        assert handoff_done.wait(timeout=30), "the handoff never completed"
+        return real_merge(current, raw)
+
+    chain["_audio_merge_payload"] = barrier_merge
+    thread, box = _run_in_thread(lambda: chain["_audio_confirm_core"](
+        chain["_AUDIO_SURFACE_PREVIEW"], view, payload, library, discarded, "",
+        app_root=str(tmp_path)))
+    assert past_gate.wait(timeout=30), "Confirm never reached the barrier"
+    chain["press"](_record(folder_b, clips=1))
+    handoff_done.set()
+    thread.join(timeout=60)
+    assert "error" not in box, box.get("error")
+
+    assert "Nothing was moved" in box["value"][0], box["value"][0]
+    assert sorted(os.listdir(library)) == [], "a retired page moved a clip into the library"
+    assert sorted(os.listdir(discarded)) == [], "a retired page discarded a clip"
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths)
+
+
+def test_f4_an_already_claimed_batch_finishes_and_says_so(chain, tmp_path):
+    """F-4's other ordering, and the policy the task required be made explicit.
+
+    Once the page is **claimed** the sort owns it, and the operator's press was authorised when
+    they made it. The policy is that the admitted batch finishes, reports truthfully and leaves
+    nothing actionable -- rather than being abandoned half-way, which is the one outcome with no
+    honest description.
+    """
+    folder_a = str(tmp_path / "run_A")
+    folder_b = str(tmp_path / "run_B")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (folder_b, library, discarded):
+        os.makedirs(path)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    view, _paths = _publish(chain, folder_a)
+    payload = _decide_every_clip(view)
+
+    claimed, handoff_done = _barrier_pair()
+    real_sort = chain["_audio_sort"]
+
+    def barrier_sort(surface, current, lib, dis, sweep_unmarked):
+        claimed.set()
+        assert handoff_done.wait(timeout=30), "the handoff never completed"
+        return real_sort(surface, current, lib, dis, sweep_unmarked=sweep_unmarked)
+
+    chain["_audio_sort"] = barrier_sort
+    thread, box = _run_in_thread(lambda: chain["_audio_confirm_core"](
+        chain["_AUDIO_SURFACE_PREVIEW"], view, payload, library, discarded, "",
+        app_root=str(tmp_path)))
+    assert claimed.wait(timeout=30), "Confirm never claimed the page"
+    chain["press"](_record(folder_b, clips=1))
+    handoff_done.set()
+    thread.join(timeout=60)
+    assert "error" not in box, box.get("error")
+
+    assert "Sorted" in box["value"][0], box["value"][0]
+    assert sorted(os.listdir(library)) == ["take_part_001.wav"]
+    assert sorted(os.listdir(discarded)) == ["take_part_002.wav", "take_part_003.wav"]
+    # Nothing is left actionable: the claim retired the page, so a second press cannot reuse it.
+    assert not chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], view)
+    again, *_ = chain["_audio_confirm_core"](chain["_AUDIO_SURFACE_PREVIEW"], view, payload,
+                                             library, discarded, "", app_root=str(tmp_path))
+    assert "Nothing was moved" in again, again
+
+
+def test_f3_a_scan_that_finishes_after_a_handoff_publishes_nothing(chain, tmp_path):
+    """F-3. The scan is suspended after it has walked folder A and *before* the registry mint --
+    the exact window in which a generation checked outside the registry's lock still lost."""
+    folder_a = str(tmp_path / "run_A")
+    folder_b = str(tmp_path / "run_B")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (folder_b, library, discarded):
+        os.makedirs(path)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    os.makedirs(folder_a)
+    paths = []
+    for index, name in enumerate(("take_part_001.wav", "take_part_002.wav",
+                                  "take_part_003.wav"), start=1):
+        path = os.path.join(folder_a, name)
+        with open(path, "wb") as handle:
+            handle.write(b"RIFF" + bytes(200 + index))
+        paths.append(path)
+
+    about_to_mint, handoff_done = _barrier_pair()
+    real_publish = chain["_audio_publish"]
+
+    def barrier_publish(surface, owner, discovered, page_index, page_size, **kwargs):
+        about_to_mint.set()
+        assert handoff_done.wait(timeout=30), "the handoff never completed"
+        return real_publish(surface, owner, discovered, page_index, page_size, **kwargs)
+
+    chain["_audio_publish"] = barrier_publish
+    thread, box = _run_in_thread(lambda: chain["_on_audio_preview_scan"](
+        folder_a, False, 24, library, discarded, {}, _Request()))
+    assert about_to_mint.wait(timeout=30), "the scan never reached publication"
+    chain["press"](_record(folder_b, clips=1))
+    handoff_done.set()
+    thread.join(timeout=60)
+    assert "error" not in box, box.get("error")
+
+    outputs = box["value"]
+    report, gallery, published_view = outputs[0], outputs[1], outputs[3]
+    assert not published_view.get("entries"), "the stale scan published a live page"
+    assert "r7-tile" not in str(gallery), "the stale scan rendered actionable tiles"
+    assert "was not loaded" in report, report
+    # The honesty half: it must not lead with "Found 3 audio clip(s)", which reads as a live page.
+    assert not report.startswith("Found "), report
+    message, *_ = chain["_audio_confirm_core"](chain["_AUDIO_SURFACE_PREVIEW"], published_view,
+                                               "{}", library, discarded, "",
+                                               app_root=str(tmp_path))
+    assert "Nothing has been loaded" in message or "Nothing was moved" in message, message
+    assert sorted(os.listdir(library)) == []
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths)
+
+
+def test_a_normal_scan_after_a_handoff_still_works(chain, tmp_path):
+    """The positive control for F-3: the fence must stop only a scan that was already running.
+
+    A scan the operator starts *after* a handoff reads the new epoch and publishes entirely
+    normally. Without this, "nothing publishes" would satisfy the test above for the wrong reason.
+    """
+    folder_b = str(tmp_path / "run_B")
+    folder_c = str(tmp_path / "run_C")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (folder_b, library, discarded):
+        os.makedirs(path)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    os.makedirs(folder_c)
+    for name in ("c1.wav", "c2.wav"):
+        with open(os.path.join(folder_c, name), "wb") as handle:
+            handle.write(b"RIFF")
+
+    chain["press"](_record(folder_b, clips=1))
+    outputs = chain["_on_audio_preview_scan"](folder_c, False, 24, library, discarded, {},
+                                              _Request())
+    assert len(outputs[3].get("entries") or ()) == 2, outputs[0]
+    assert outputs[0].startswith("Found 2 audio clip(s)"), outputs[0]
+    assert chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], outputs[3])
+
+
+def test_the_claim_is_where_the_sort_is_admitted(gui_tree: ast.Module):
+    """Structural, so the claim cannot regress into another read.
+
+    The claim must sit between the last refusal and `_audio_sort`.
+    `.claude/rules/video-review-transfer.md` states the rule this enforces: a mutation is claimed,
+    not permitted by a check.
+    """
+    body = ast.unparse(_func(gui_tree, "_audio_confirm_core"))
+    claim = body.index("_audio_claim_page")
+    assert claim < body.index("_audio_sort("), "the claim must precede the sort"
+    assert body.index("plan.has_unmarked") < claim, \
+        "the sweep gate must be decided before the page is consumed, or the gate would retire it"
+    assert body.index("validate_destinations") < claim, \
+        "a refused destination must leave the page usable, so validation comes first"
+
+    claim_fn = ast.unparse(_func(gui_tree, "_audio_claim_page"))
+    assert "surface.registry.claim_page" in claim_fn, claim_fn
+    assert "fork_clips.Refusal" in claim_fn
+
+
+def test_the_epoch_is_compared_inside_the_mint_not_beside_it(gui_tree: ast.Module):
+    """F-3's correction, asserted structurally because this is exactly what the first attempt got
+    wrong: a generation checked in `_audio_load_view` and then acted on by `_audio_publish` is one
+    more check-then-act, and a barrier between the two reproduced the defect again."""
+    load = ast.unparse(_func(gui_tree, "_audio_load_view"))
+    assert "expected_epoch=epoch" in load, load
+    for forbidden in ("is_current", "_AUDIO_SCANS", "ScanCoordinator"):
+        assert forbidden not in load, f"_audio_load_view checks the epoch itself via {forbidden}"
+    publish = ast.unparse(_func(gui_tree, "_audio_publish"))
+    assert "new_session(owner, expected_epoch=expected_epoch)" in publish, publish
+    for event in ("_on_audio_preview_scan", "_audio_preview_turn", "_on_audio_preview_confirm"):
+        assert "_audio_page_epoch" in ast.unparse(_func(gui_tree, event)), event
+
+
+def test_no_new_coordinator_was_introduced(gui_tree: ast.Module, gui_source: str):
+    """The boundary the task set. The epoch lives in the registry that already owns pages, and no
+    second ScanCoordinator, lock, thread or module-level lifecycle object was added for audio."""
+    for node in gui_tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.upper().startswith("_AUDIO")):
+            value = ast.unparse(node.value)
+            assert "ScanCoordinator" not in value, f"{node.targets[0].id} is a second coordinator"
+            assert "Lock" not in value and "Thread" not in value, \
+                f"{node.targets[0].id} holds live machinery"
+    assert "_AUDIO_SCANS" not in gui_source
+
+
+def test_the_registry_epoch_and_claim_contract():
+    """`claim_page` and the epoch, as ordinary bare-interpreter code against the real registry."""
+    registry = clips.ClipRegistry()
+    owner = "o"
+    assert registry.owner_epoch(owner) == 0
+    session = registry.new_session(owner, expected_epoch=0)
+    token, entries = registry.publish_page(
+        owner, session, 1, [(1, __file__, 10, 1, 1, 1)], servable=(".py",))
+    assert entries and registry.page_entries(session, token)
+
+    claimed = registry.claim_page(session, token)
+    assert [e.clip_id for e in claimed] == [e.clip_id for e in entries]
+    with pytest.raises(clips.Refusal):
+        registry.claim_page(session, token)
+    with pytest.raises(clips.Refusal):
+        registry.page_entries(session, token)
+
+    before = registry.owner_epoch(owner)
+    registry.revoke_owner(owner)
+    assert registry.owner_epoch(owner) == before + 1
+    with pytest.raises(clips.Refusal) as refused:
+        registry.new_session(owner, expected_epoch=before)
+    assert refused.value.reason == "superseded_scan"
+    assert refused.value.status == 409
+    assert registry.new_session(owner, expected_epoch=registry.owner_epoch(owner))
+    # An unfenced mint is unchanged for every pre-existing caller, which is what keeps the video
+    # surface's call sites byte-identical.
+    assert registry.new_session(owner)
+
+
+def test_the_epoch_is_per_owner():
+    """One operator's retirement must not fence another's scan."""
+    registry = clips.ClipRegistry()
+    a_epoch = registry.owner_epoch("owner-a")
+    registry.new_session("owner-b")
+    registry.revoke_owner("owner-b")
+    assert registry.owner_epoch("owner-a") == a_epoch, "owner B's retirement moved owner A's epoch"
+    assert registry.new_session("owner-a", expected_epoch=a_epoch)
+
+
+def test_neither_correction_holds_a_lock_across_the_filesystem(gui_tree: ast.Module):
+    """The task's explicit constraint. The claim returns the entries and the renames happen after
+    it; nothing in the audio path acquires a registry or coordinator lock around a batch."""
+    for name in ("_audio_claim_page", "_audio_retire_page", "_audio_page_epoch",
+                 "_audio_sort", "_audio_confirm_core"):
+        body = ast.unparse(_func(gui_tree, name))
+        for forbidden in (".acquire(", "threading.", "_lock"):
+            assert forbidden not in body, f"{name} reaches {forbidden}"
