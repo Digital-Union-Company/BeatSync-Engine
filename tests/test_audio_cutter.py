@@ -759,11 +759,103 @@ def test_the_audio_tab_hides_none_of_its_controls(gui_tree: ast.Module):
     for widget in ("audio_source", "audio_output", "audio_threshold", "audio_min_silence",
                    "audio_pad", "audio_min_clip", "audio_format", "audio_analyze_btn",
                    "audio_cut_btn", "audio_plan", "audio_table", "audio_report",
-                   # [R7.1] the review surface is a gallery, not a dropdown and two buttons
-                   "audio_gallery", "audio_counts", "audio_decisions", "audio_confirm_btn",
-                   "audio_enable_hover",
-                   "audio_library_folder", "audio_discarded_folder"):
+                   # [FORK] Digital-Union (R15-C): the review half is gone and the handoff is what
+                   # is left of it. This tab now exports and points at the one review surface.
+                   "audio_open_preview_btn"):
         assert f"{widget} = gr." in block, f"{widget} is not in the Audio Cutter tab"
+
+
+#: [FORK] Digital-Union (R15-C): every widget of the review half this tab used to carry. Asserted
+#: ABSENT rather than merely un-listed, because "we stopped asserting it is there" and "it is gone"
+#: are different claims and only the second one is R15-C.
+_REMOVED_REVIEW_WIDGETS = (
+    "audio_gallery", "audio_counts", "audio_decisions", "audio_confirm_btn",
+    "audio_proceed_btn", "audio_sweep_cancel_btn", "audio_enable_hover",
+    "audio_library_folder", "audio_discarded_folder", "audio_library_browse",
+    "audio_discarded_browse", "audio_destination_status", "audio_clip_name",
+    "audio_player", "audio_file_report", "audio_review_state", "audio_armed_state",
+    "audio_run_dir_state",
+)
+
+
+def _widget_assignments(tree: ast.Module) -> set:
+    """Every name assigned a `gr.<Something>(...)` anywhere in the module.
+
+    Resolved over the syntax tree, not by substring. The first attempt here *was* a substring check
+    for `f"{widget} = gr."` and it reported two live widgets that had genuinely been deleted:
+    `pref_audio_library_browse = gr.Button(` CONTAINS `audio_library_browse = gr.`, so the Settings
+    tab's own buttons matched the cutter's removed ones. A name is a name; ask the parser.
+    """
+    found = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func).startswith("gr.")):
+            found.add(node.targets[0].id)
+    return found
+
+
+@pytest.mark.parametrize("widget", _REMOVED_REVIEW_WIDGETS)
+def test_the_cutter_carries_no_second_review_surface(gui_tree: ast.Module, widget: str):
+    """[FORK] Digital-Union (R15-C). The whole increment, stated as an absence.
+
+    Checked over the WHOLE module rather than the tab body, because a widget declared anywhere
+    would still be a live component.
+    """
+    assert widget not in _widget_assignments(gui_tree), (
+        f"{widget} still exists; R15-C removes the Audio Cutter's duplicate review surface rather "
+        f"than hiding or disabling it")
+
+
+def test_the_removal_did_not_take_the_settings_or_review_widgets_with_it(gui_tree: ast.Module):
+    """The positive control for the absence above, and it is not decoration.
+
+    The removed names are *prefixes* of real, surviving widgets -- `pref_audio_library_browse`,
+    `audio_preview_library` -- so an over-eager deletion would have been easy and the absence test
+    alone could not tell it from a correct one. Settings still owns the two saved voice-pair keys,
+    and Audio Review still owns its own destinations.
+    """
+    live = _widget_assignments(gui_tree)
+    for survivor in ("pref_audio_library", "pref_audio_discarded", "pref_audio_library_browse",
+                     "pref_audio_discarded_browse", "audio_preview_library",
+                     "audio_preview_discarded", "audio_preview_library_browse",
+                     "audio_preview_discarded_browse", "audio_preview_gallery",
+                     "audio_preview_counts", "audio_preview_decisions",
+                     "audio_preview_confirm_btn", "audio_preview_proceed_btn",
+                     "audio_preview_sweep_cancel_btn", "audio_preview_enable_hover",
+                     "audio_preview_destination_status", "audio_preview_state",
+                     "audio_preview_armed_state"):
+        assert survivor in live, f"{survivor} was removed with the cutter's review half"
+
+
+@pytest.mark.parametrize("handler", ["_on_audio_confirm", "_on_audio_proceed", "_on_audio_cancel",
+                                     "_on_audio_destinations_change"])
+def test_the_cutter_keeps_no_review_handler(gui_tree: ast.Module, handler: str):
+    """The handlers go with the widgets -- deleted, not left callable behind a dead button.
+
+    A surviving `_on_audio_confirm` would be a second, unreferenced path to `_audio_confirm_core`
+    that could file an operator's clips, reachable by anything that still knew its name.
+    """
+    names = {node.name for node in ast.walk(gui_tree) if isinstance(node, ast.FunctionDef)}
+    assert handler not in names, f"{handler} is still defined"
+
+
+def test_the_shared_review_core_survived_the_removal(gui_tree: ast.Module):
+    """The other half of R15-C, and the one that is easy to get wrong by over-deleting.
+
+    Audio Review is driven by exactly the same functions the cutter's half used to share, so every
+    one of them must still be here. Requirement 10 of the increment in one assertion: remove the
+    duplicate surface, keep the engine.
+    """
+    names = {node.name for node in ast.walk(gui_tree) if isinstance(node, ast.FunctionDef)}
+    for shared in ("_audio_owner", "_audio_publish", "_audio_identities", "_audio_durations",
+                   "_audio_tiles", "_audio_page_decisions", "_audio_render", "_audio_load_view",
+                   "_audio_merge_payload", "_audio_resolved_destinations", "_audio_sort",
+                   "_audio_confirm_core", "_on_audio_preview_scan", "_on_audio_preview_confirm",
+                   "_on_audio_preview_proceed", "_on_audio_preview_cancel",
+                   "_on_audio_preview_destinations_change"):
+        assert shared in names, f"{shared} was removed; Audio Review still needs it"
 
 
 def test_the_feature_adds_no_process_launch_to_the_view_layer(gui_tree: ast.Module):
@@ -797,7 +889,11 @@ def test_the_cut_handler_creates_its_run_directory_exclusively(gui_tree: ast.Mod
     assert keywords.get("exist_ok") == "False", "the run directory must not be reused"
 
 
-_AUDIO_BUTTONS = ("audio_analyze_btn", "audio_cut_btn", "audio_confirm_btn")
+# [FORK] Digital-Union (R15-C): Analyze, Cut and the handoff. `audio_confirm_btn` is gone with the
+# review half; the handoff button replaces it in this set rather than the set simply shrinking,
+# because it is the one remaining Audio Cutter action that writes widgets outside its own tab and
+# is therefore the one most worth holding to the isolation rules below.
+_AUDIO_BUTTONS = ("audio_analyze_btn", "audio_cut_btn", "audio_open_preview_btn")
 
 
 def _registration(tree: ast.Module, widget: str, event: str = "click") -> ast.Call:
@@ -852,10 +948,16 @@ def test_the_review_list_is_per_session_state_not_a_module_record(gui_tree: ast.
     """One operator's review list must not be reachable from another browser session.
 
     Asserted by walking real module-level assignments. A name-substring ban over raw source was
-    tried first and was wrong: `_AUDIO_REVIEW` is a substring of the perfectly legitimate UI label
-    `LABEL_AUDIO_REVIEW`, so the ban fired on a piece of prose.
+    tried first and was wrong: `_AUDIO_REVIEW` was a substring of the then-legitimate UI label
+    `LABEL_AUDIO_REVIEW`, so the ban fired on a piece of prose. (R15-C removed that label with the
+    surface it titled, but the lesson is kept: the next such collision will be with some other
+    name, and walking assignments is immune to all of them.)
     """
-    assert "audio_review_state = gr.State({})" in gui_source
+    # [FORK] Digital-Union (R15-C): `audio_review_state` is gone with the review half it carried,
+    # and `audio_handoff_state` is the per-session state this tab keeps instead. The claim is the
+    # same one and it still has a positive half: a process-global handoff would let one operator's
+    # cut redirect another operator's review.
+    assert "audio_handoff_state = gr.State(None)" in gui_source
     module_level = {target.id for node in gui_tree.body
                     if isinstance(node, ast.Assign)
                     for target in node.targets if isinstance(target, ast.Name)}
@@ -864,8 +966,10 @@ def test_the_review_list_is_per_session_state_not_a_module_record(gui_tree: ast.
     # [R7.2] Four module-level `_AUDIO*` names now exist and none of them is an operator's review
     # list. They are allowed BY NAME rather than by a prefix pattern, so a future module-level
     # record cannot join them by being spelled similarly.
-    allowed = {"_AUDIO_CUT_REGISTRY", "_AUDIO_PREVIEW_REGISTRY",
-               "_AUDIO_SURFACE_CUT", "_AUDIO_SURFACE_PREVIEW",
+    # [FORK] Digital-Union (R15-C): `_AUDIO_SURFACE_CUT` is dropped from the allowlist with the
+    # surface it described. Leaving it would be a quietly loosened guard -- it would go on
+    # permitting a name that must not come back, and `holders <= allowed` would never notice.
+    allowed = {"_AUDIO_CUT_REGISTRY", "_AUDIO_PREVIEW_REGISTRY", "_AUDIO_SURFACE_PREVIEW",
                "_AUDIO_PREVIEW_OUTPUT_ORDER"}
     assert holders <= allowed, (
         f"unreviewed module-level Audio record(s): {sorted(holders - allowed)}")
@@ -882,13 +986,24 @@ def test_the_module_level_audio_registries_hold_no_decisions_and_are_owner_scope
     """
     for registry in ("_AUDIO_CUT_REGISTRY", "_AUDIO_PREVIEW_REGISTRY"):
         assert f"{registry} = fork_clips.ClipRegistry()" in gui_source, registry
-    assert "_AUDIO_CUT_REGISTRY" != "_AUDIO_PREVIEW_REGISTRY"
 
-    # The two surfaces must not share a registry: `new_session` revokes an owner's previous
-    # sessions, so a shared one would let an Audio Preview scan kill the cutter's live gallery.
-    cut = ast.unparse(_func(gui_tree, "_on_audio_confirm"))
+    # [FORK] Digital-Union (R15-C): the review half that published into `_AUDIO_CUT_REGISTRY` is
+    # gone, so nothing publishes a page into it any more and its `/r7audio` prefix answers
+    # `403 unknown_session` for every request. Both the registry and its mount are KEPT
+    # deliberately, and that decision is pinned here so it reads as a decision rather than as
+    # leftovers: `audio_review.MEDIA_PREFIX_CUTTER` is still the module-level DEFAULT prefix for
+    # `media_url` and `gallery_html`, so un-mounting it would leave that default pointing at a
+    # route Gradio would 404. Narrowing a reviewed authorization boundary is its own change with
+    # its own evidence, not a side effect of deleting a tab's widgets.
+    assert "_AUDIO_SURFACE_CUT" not in _widget_assignments(gui_tree)
+    module_names = {ast.unparse(node.targets[0]) for node in gui_tree.body
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1}
+    assert "_AUDIO_SURFACE_CUT" not in module_names, (
+        "the cutter surface constant outlived the surface it described")
+
+    # The one surviving surface names only itself. A handler reaching for the other surface's
+    # constant is how a token minted for one would come to be looked up in the other's map.
     preview = ast.unparse(_func(gui_tree, "_on_audio_preview_confirm"))
-    assert "_AUDIO_SURFACE_CUT" in cut and "_AUDIO_SURFACE_PREVIEW" not in cut
     assert "_AUDIO_SURFACE_PREVIEW" in preview and "_AUDIO_SURFACE_CUT" not in preview
 
 
@@ -920,41 +1035,28 @@ def _outputs_of(gui_tree: ast.Module, gui_source: str, button: str) -> set:
     return _wired(gui_tree, button, "outputs")
 
 
-def test_confirm_repaints_everything_it_changed(gui_tree: ast.Module, gui_source: str):
-    """[R7.1] One filing action. It must rewrite the report, the grid, the counters AND the
-    server-side review list -- repainting the old page would leave already-moved clips on screen,
-    and a second Confirm would then report them as missing.
+def test_the_cut_writes_only_its_own_three_outputs(gui_tree: ast.Module, gui_source: str):
+    """[FORK] Digital-Union (R15-C), replacing `test_confirm_repaints_everything_it_changed`.
 
-    [R7.2] Plus the sweep gate's own two buttons and its signature, so a resolved batch cannot
-    leave a Proceed on screen that is no longer attached to any counts.
+    There is no Confirm on this tab to repaint anything. Cut writes the report, the plan table and
+    the handoff record -- and **nothing else**. Asserted as an exact set rather than a minimum, so
+    a fourth output has to be a reviewed decision; a Cut that also wrote an Audio Review widget
+    would be the duplicated-surface coupling R15-C removes, reintroduced from the other direction.
     """
-    written = _outputs_of(gui_tree, gui_source, "audio_confirm_btn")
-    for widget in ("audio_file_report", "audio_gallery", "audio_counts", "audio_review_state",
-                   "audio_armed_state", "audio_proceed_btn", "audio_sweep_cancel_btn"):
-        assert widget in written, widget
+    written = _outputs_of(gui_tree, gui_source, "audio_cut_btn")
+    assert written == {"audio_report", "audio_table", "audio_handoff_state"}, written
 
 
-def test_proceed_and_cancel_write_exactly_what_confirm_writes(gui_tree: ast.Module,
-                                                              gui_source: str):
-    """[R7.2 Phase 3] There must be no path on which Proceed moves a file Confirm would not have
-    moved. Sharing the output set is half of that; `_on_audio_proceed` delegating to
-    `_on_audio_confirm` is the other half, so the sweep cannot acquire its own policy."""
-    confirm = _outputs_of(gui_tree, gui_source, "audio_confirm_btn")
-    assert _outputs_of(gui_tree, gui_source, "audio_proceed_btn") == confirm
-    assert _outputs_of(gui_tree, gui_source, "audio_sweep_cancel_btn") == confirm
-    body = ast.unparse(_func(gui_tree, "_on_audio_proceed"))
-    assert "_on_audio_confirm(" in body, "Proceed must BE Confirm, with the signature supplied"
+def test_the_sort_still_takes_no_path_from_the_browser(gui_tree: ast.Module):
+    """[R7.2] Kept, and now the only surface it applies to. The file that moves is `entry.path`
+    off the registry's frozen `ClipEntry`, and the decision is looked up BY that entry. Nothing is
+    indexed out of the payload.
 
-
-def test_confirm_takes_the_decisions_only_through_the_hidden_field(gui_tree: ast.Module):
-    """The browser supplies a decision and a name per clip id. It never supplies a PATH -- every
-    file that moves is named by the server's own frozen page."""
-    read = _wired(gui_tree, "audio_confirm_btn", "inputs")
-    assert "audio_decisions" in read
-    assert "audio_review_state" in read
-
-    # [R7.2] The file that moves is `entry.path` off the registry's frozen ClipEntry, and the
-    # decision is looked up BY that entry. Nothing is indexed out of the payload.
+    [FORK] Digital-Union (R15-C): the half of the original test that read the cutter's hidden
+    decision field is gone with the field. What it protected -- that a page cannot name a file to
+    move -- lives in `_audio_sort`, which is shared, so the claim survives where the widget did
+    not. Audio Review's own hidden field is pinned in `test_audio_preview_tab.py`.
+    """
     body = ast.unparse(_func(gui_tree, "_audio_sort"))
     assert "entry.clip_id" in body
     assert "view.get('entries')" in body
@@ -1008,29 +1110,39 @@ def test_the_gallery_releases_its_players_before_confirm_moves_anything(gui_sour
     assert ".r7-release-audio" in block
     assert "stop()" in block
     # Every button that can move a file carries the class.
-    for button in ("audio_confirm_btn", "audio_proceed_btn",
-                   "audio_preview_confirm_btn", "audio_preview_proceed_btn"):
+    # [FORK] Digital-Union (R15-C): two, not four. The cutter's Confirm and Proceed are gone, and
+    # with them the only buttons outside Audio Review that could move an operator's clips -- which
+    # is the point of the increment. The class is still matched by CLASS rather than by id, so
+    # R15-B's batch surface needs no client change to join.
+    for button in ("audio_preview_confirm_btn", "audio_preview_proceed_btn"):
         start = gui_source.index(f"{button} = gr.Button(")
         declaration = gui_source[start:gui_source.index(")", gui_source.index(
             "elem_id", start))]
         assert "r7-release-audio" in declaration, f"{button} does not release the player"
 
 
-def test_the_cutters_destination_fields_validate_immediately_too(gui_tree: ast.Module):
-    """[R7.2 Phase 4] The owner's reported defect was on this surface as well: both destination
-    boxes set to the same folder, and sorting proceeding anyway. Each field gets its own binding,
-    registered explicitly rather than in a loop so these per-widget assertions can find it."""
-    for field in ("audio_library_folder", "audio_discarded_folder"):
-        written = _wired(gui_tree, field, "outputs", "change")
-        assert written == {"audio_destination_status"}, field
-        read = _wired(gui_tree, field, "inputs", "change")
-        assert read == {"audio_library_folder", "audio_discarded_folder", "audio_review_state"}
+def test_the_cutter_has_no_destination_fields_left_to_validate(gui_tree: ast.Module):
+    """[FORK] Digital-Union (R15-C), replacing `test_the_cutters_destination_fields_validate…`.
 
-    handler = ast.unparse(_func(gui_tree, "_on_audio_destinations_change"))
-    assert "destination_feedback" in handler
-    # It reports; it never sorts, writes a folder or repaints the gallery.
-    for forbidden in ("sort_clips", "file_entry", "os.makedirs", "_audio_render", "os.rename"):
-        assert forbidden not in handler, f"the change handler reaches {forbidden}"
+    The owner's original defect -- both destination boxes set to the same folder, and sorting
+    proceeding anyway -- was reported on this surface *as well as* on Audio Review, and R7.2 Phase 4
+    fixed it in both places. R15-C removes the surface, so the defect cannot recur here at all:
+    there is no folder on this tab that a sort could be pointed at.
+
+    The equivalent live check for Audio Review is
+    `test_audio_preview_tab.py::test_the_destinations_validate_as_typed`, and the shared validator
+    is still pinned by `test_the_cutter_no_longer_uses_the_single_destination_helper` below.
+    """
+    live = _widget_assignments(gui_tree)
+    for field in ("audio_library_folder", "audio_discarded_folder", "audio_destination_status"):
+        assert field not in live, f"{field} is back on the Audio Cutter tab"
+    # And no `.change()` binding was left pointing at a widget that no longer exists.
+    for node in ast.walk(gui_tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "change"
+                and isinstance(node.func.value, ast.Name)):
+            assert node.func.value.id not in ("audio_library_folder", "audio_discarded_folder"), \
+                f"an orphaned .change() on {node.func.value.id} survived the removal"
 
 
 def test_the_cutter_no_longer_uses_the_single_destination_helper(gui_tree: ast.Module):
@@ -1042,30 +1154,64 @@ def test_the_cutter_no_longer_uses_the_single_destination_helper(gui_tree: ast.M
 
 
 def test_the_sweep_gate_buttons_are_hidden_until_confirm_finds_unmarked_clips(gui_source: str):
-    for button in ("audio_proceed_btn", "audio_sweep_cancel_btn"):
+    """[FORK] Digital-Union (R15-C): Audio Review's pair, which is now the only pair."""
+    for button in ("audio_preview_proceed_btn", "audio_preview_sweep_cancel_btn"):
         start = gui_source.index(f"{button} = gr.Button(")
         declaration = gui_source[start:gui_source.index("elem_id", start)]
         assert "visible=False" in declaration, button
 
 
 def test_the_gate_is_revealed_and_hidden_by_the_server_not_the_page(gui_tree: ast.Module):
-    """A Proceed the browser could reveal would be a Proceed with no counts behind it."""
-    for name in ("_on_audio_confirm", "_on_audio_cancel"):
+    """A Proceed the browser could reveal would be a Proceed with no counts behind it.
+
+    [FORK] Digital-Union (R15-C): asserted on Audio Review's handlers, the cutter's pair having
+    been deleted. The claim is unchanged and so is the core's half of it.
+    """
+    for name in ("_on_audio_preview_confirm", "_on_audio_preview_cancel"):
         body = ast.unparse(_func(gui_tree, name))
-        assert "gr.update(visible=" in body, name
+        assert "visible=" in body or "_audio_preview_outputs" in body, name
     gallery_js_free = ast.unparse(_func(gui_tree, "_audio_confirm_core"))
     assert "visible" not in gallery_js_free, (
         "the core decides WHETHER to gate; the handler owns the widget update")
 
 
-def test_the_cut_records_its_run_directory_so_the_results_can_be_opened_later(gui_tree: ast.Module):
-    """"Open results in Audio Preview" needs the folder the cut actually wrote to, not a widget the
-    operator may have edited since."""
+def test_the_cut_publishes_a_handoff_record_rather_than_a_bare_run_directory(gui_tree: ast.Module):
+    """[FORK] Digital-Union (R15-C), replacing `test_the_cut_records_its_run_directory…`.
+
+    "Open results in Media Library" needs the folder the cut actually wrote to, not a widget the
+    operator may have edited since -- that much is unchanged. What R15-C changes is the *shape*: a
+    `cut_handoff` record rather than a path string, so the published-clip gate and the offer are
+    one object, and `clips=` must be the count that reached disk.
+    """
     written = _wired(gui_tree, "audio_cut_btn", "outputs")
-    assert "audio_run_dir_state" in written
+    assert "audio_handoff_state" in written
     cut = _func(gui_tree, "_on_audio_cut")
-    final = [node for node in ast.walk(cut) if isinstance(node, ast.Return)][-1]
-    assert "run_directory" in ast.unparse(final)
+    body = ast.unparse(cut)
+    assert "fork_handoff.build(" in body, "the cut must publish a handoff record"
+    assert "fork_handoff.MODE_SINGLE" in body, (
+        "an audio cut writes its clips into one folder, so subfolders must be excluded")
+    # The count is the number WRITTEN, never the number planned. `len(segments)` here would make
+    # the record's only gate unreachable: an export in which every clip failed would still offer a
+    # folder containing nothing.
+    build = next(node for node in ast.walk(cut) if isinstance(node, ast.Call)
+                 and ast.unparse(node.func) == "fork_handoff.build")
+    clips = next(kw for kw in build.keywords if kw.arg == "clips")
+    assert ast.unparse(clips.value) == "len(written)", ast.unparse(clips.value)
+
+    # The SUCCESS return is the last one in source order. Selected by `lineno` rather than by
+    # taking the last element `ast.walk` happens to yield: `walk` is breadth-first and its order is
+    # not source order, which this assertion discovered by landing on the makedirs refusal instead.
+    returns = [node for node in ast.walk(cut) if isinstance(node, ast.Return)]
+    final = max(returns, key=lambda node: node.lineno)
+    assert "handoff" in ast.unparse(final), ast.unparse(final)
+
+    # And every refusal returns the SAME arity with no handoff, so Gradio cannot misalign them and
+    # a failed cut cannot leave a previous cut's record standing.
+    for node in returns:
+        rendered = ast.unparse(node)
+        if node is final:
+            continue
+        assert "*blank" in rendered, f"a refusal path does not clear the handoff: {rendered}"
 
 
 def test_the_cut_refuses_mp3_up_front_when_the_encoder_is_missing(gui_tree: ast.Module):
@@ -1202,11 +1348,17 @@ def test_a_filename_cannot_carry_markup_into_the_page(tmp_path):
     assert "&lt;img" in markup
 
 
-def test_the_player_is_html_not_a_file_component(gui_tree: ast.Module):
-    """A file component would hand Gradio a path it refuses to serve."""
+def test_the_cutter_tab_carries_no_audio_component_at_all(gui_tree: ast.Module):
+    """[FORK] Digital-Union (R15-C), replacing `test_the_player_is_html_not_a_file_component`.
+
+    The single-clip fallback player went with the review half. The claim that mattered is stronger
+    now rather than weaker: a `gr.Audio` would hand Gradio a path from the operator's own folder,
+    which it refuses to serve -- and there is no longer any player on this tab for one to creep
+    back into. `preview_markup` itself is untouched and still covered above.
+    """
     block = _audio_tab_body(gui_tree)
-    assert "audio_player = gr.HTML(" in block
     assert "gr.Audio(" not in block
+    assert "audio_player = gr." not in block
 
 
 # =============================================================================================

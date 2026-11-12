@@ -20,6 +20,104 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-11-12 (R15-C: one place to review exported audio)
+
+**Two surfaces reviewed exported audio clips, and now there is one.** The Raw Audio Cutter carried
+its own Keep/Discard gallery — a second pair of destination folders, a second Confirm, a second
+sweep gate and a second sort — doing the same job as **Media Library → Audio Review** on the same
+files. R15-C removes it. The Audio Cutter exports and hands off; Audio Review reviews.
+
+This is the first functional increment of R15 (Audio Cutter V2). **R15-A (all audio tracks of a
+video) and R15-B (Folder Batch) are not started**, and nothing here anticipates them beyond leaving
+the shared core parameterised.
+
+**What was removed, and it is removed rather than hidden.** The widgets
+(`audio_gallery`, `audio_counts`, `audio_decisions`, `audio_confirm_btn`, `audio_proceed_btn`,
+`audio_sweep_cancel_btn`, `audio_enable_hover`, `audio_library_folder`, `audio_discarded_folder`
+and their Browse buttons, `audio_destination_status`, `audio_clip_name`, `audio_player`,
+`audio_file_report`), the four handlers (`_on_audio_confirm`, `_on_audio_proceed`,
+`_on_audio_cancel`, `_on_audio_destinations_change`), the surface constant `_AUDIO_SURFACE_CUT`,
+and three `gr.State` slots. A disabled button is not a boundary, and a surviving
+`_on_audio_confirm` would have been a second unreferenced path to `_audio_confirm_core` that could
+still file an operator's clips.
+
+**What was deliberately NOT removed, because over-deleting was the real risk here.** Every shared
+function the two surfaces used — `_audio_confirm_core`, `_audio_sort`, `_audio_render`,
+`_audio_load_view`, `_audio_merge_payload` and the rest — is untouched, as are
+`beatsync_fork/audio_review.py`, `audio_library.py`, `audio_cutter.py`, `clips_review.py` and
+`audio_media_server.py`. Audio Review runs on exactly the engine it ran on before. The removed
+names are *prefixes* of real surviving widgets (`pref_audio_library_browse`,
+`audio_preview_library`), so the test suite pins the removal in **both** directions.
+
+`_AUDIO_CUT_REGISTRY` and its `/r7audio` middleware mount are **also kept, as a decision rather
+than as leftovers.** Nothing publishes a page into that registry any more, so the prefix answers
+`403 unknown_session` for every request — but `audio_review.MEDIA_PREFIX_CUTTER` is still the
+module-level *default* prefix for `media_url` and `gallery_html`, so un-mounting it would leave
+that default pointing at a route Gradio would 404 instead. Narrowing a reviewed authorization
+boundary is its own change with its own evidence, not a side effect of deleting a tab's widgets.
+
+**The handoff is now a record, and that closes a defect rather than just moving a value.**
+`audio_run_dir_state` was a bare path string written whenever a run directory had been **created**,
+so an export in which every single clip failed still offered its empty folder for review and the
+operator pressed Scan Folder on nothing. It is replaced by `audio_handoff_state`, carrying the
+existing `beatsync_fork/cut_handoff.py` record — the Raw Cutter's own type, **reused rather than
+copied** — whose `build()` answers `None` below one published clip. So the offer and the gate are
+one object, `clips=` must be the count that actually reached disk, and a record coming back out of
+session state is re-validated through `read()` as the untrusted input it is. The record also carries
+the outcome, so a cut with failures is reported as partial instead of clean, and the cut report
+gains one line offering the review.
+
+**A successful handoff retires whatever Audio Review was holding.** This is the audio half of the
+R11 F-1 hazard and it is a real one: filling the folder box with a new folder while the gallery, the
+counts and an armed sweep all still described the *previous* one meant that pressing Confirm sorted
+the previous folder — and an armed sweep moved its unmarked clips into Discarded — while every
+visible label named the new one. The empty view is the mechanism and the widget updates are
+consequences of it: `_audio_sort` reads `view.get('entries')` and finds none, so Confirm, Proceed
+and the sort refuse because the page is gone, not because something in the browser went grey. The
+retirement is assembled through the existing nine-output `_audio_preview_outputs`, so there is one
+notion of "no current page". **Both refusal paths retire nothing** — a mis-press must not cost an
+operator the page they were working on.
+
+**Navigation is still not an action.** The handoff scans nothing, classifies nothing, sorts nothing
+and moves nothing; the one filesystem question it asks is a single `isdir`, asked at press time
+rather than cached, because a record describes a job that finished and not a disk that has stayed
+still since. A folder that has gone is reported, never repaired and never silently replaced by a
+parent that still exists.
+
+**Unchanged:** cutting, silence detection, the three output formats, output filenames, the exclusive
+`exist_ok=False` run directory, the manifest, the plan table and the cut report. Audio Review's
+Keep/Discard, no-overwrite `os.rename`, destination validation and two-step unmarked sweep are
+untouched, and it remains independently usable after a restart with no cut in the session — its
+folder box is still editable and `Scan` still reads nothing belonging to the cutter. Settings still
+owns the saved `AUDIO_LIBRARY` / `AUDIO_DISCARDED` voice-pair keys and Audio Review's destinations
+still fall back to them, so removing the boxes that *displayed* those preferences orphaned neither.
+
+**One cost removed and one capability given up, both stated.** Publishing the cutter's page ran an
+FFprobe duration pass over every exported clip to label its tiles, plus a `stat` per clip for the
+span map; with no tiles, that work is gone rather than hidden. The thing genuinely lost is the tile
+label showing *where in the original recording* a clip came from — the one fact the folder-based
+surface cannot know. It was a deliberate trade: those timings are still on screen in the Cutter's
+own plan table and still recorded in the manifest.
+
+**Tests.** 57 new assertions in `tests/test_r15c_audio_review_consolidation.py`, plus the seam
+suites updated where they pinned the removed surface. Measured against the pristine parent
+(`892b9607`) rather than asserted: **43 of the 57 fail or error there.** The 14 that pass are the
+*preservation* controls — Audio Review still usable, the shared core intact, the manifest contract,
+the real renderer surviving the empty view the retirement hands it, the grid nonce that makes that
+repaint deliverable, the R14 inventory panels, the PR #100 startup upload protection, the saved
+voice-pair keys and the Raw Cutter's own handoff wording — which is exactly what makes them controls
+rather than coverage.
+
+Two things worth recording about *how* it was verified. First, `create_ui()` is never executed by
+the suite, so an orphaned widget reference would surface only as a `NameError` in the operator's
+browser; a scoped undefined-name walk over the real `create_ui` body confirms all **802** distinct
+Name loads resolve. Second, two of the new guards were themselves written wrong first and say so in
+their docstrings: a substring check for `audio_library_browse = gr.` matched the *surviving*
+`pref_audio_library_browse = gr.Button(`, and a `protected_dirs` source slice landed inside the
+comment explaining the protection. Both now resolve over the syntax tree — both are instances of the
+trap this repository has recorded repeatedly, reproduced by writing the guard the lazy way. The whole
+suite is green.
+
 ### Fixed — 2026-11-12 (R14-R1: building the interface no longer creates the shared cache folder)
 
 **Starting the GUI materialised a configured shared analysis-cache folder.** Nothing had to be

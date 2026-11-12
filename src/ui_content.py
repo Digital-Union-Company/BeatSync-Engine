@@ -2155,30 +2155,29 @@ INFO_AUDIO_BUTTONS = (
     "refuses a plan that no longer matches them."
 )
 
-LABEL_AUDIO_REVIEW = "🎧 Exported clips"
-INFO_AUDIO_REVIEW = (
-    "Pick a clip to hear it. Keep files it into your voice library under the name in the box; "
-    "Discard moves it to the Discarded folder. Discarding is quarantine, never deletion, and an "
-    "existing name is refused rather than overwritten."
-)
-LABEL_AUDIO_PLAYER = "Listen"
-LABEL_AUDIO_CLIP_NAME = "✏️ Save as"
-INFO_AUDIO_CLIP_NAME = (
-    "Edit the name before you keep it if you like — the extension is always taken from the real "
-    "file. Audio Layers plays files in filename order, so a leading number keeps a sequence in "
-    "order."
-)
-LABEL_AUDIO_KEEP = "✅ Keep → voice library"
-LABEL_AUDIO_DISCARD = "🗑️ Discard → quarantine"
-LABEL_AUDIO_FILE_REPORT = "Filing report"
-AUDIO_FILE_REPORT_INITIAL_TEXT = "Nothing has been filed yet."
-
-LABEL_AUDIO_LIBRARY = "✅ Voice library folder (where KEPT clips go)"
+# [FORK] Digital-Union (R15-C): eleven strings were removed from here with the Audio Cutter's own
+# review half, because nothing renders them any more:
+#
+#   LABEL_AUDIO_REVIEW, INFO_AUDIO_REVIEW          the "Exported clips" group header
+#   LABEL_AUDIO_CLIP_NAME, INFO_AUDIO_CLIP_NAME    the per-clip "Save as" box
+#   LABEL_AUDIO_FILE_REPORT,
+#   AUDIO_FILE_REPORT_INITIAL_TEXT                 that surface's own filing report
+#   LABEL_AUDIO_LIBRARY, LABEL_AUDIO_DISCARDED     its two destination labels -- the INFO_ strings
+#                                                  below are KEPT, because Audio Review reuses them
+#   LABEL_AUDIO_PLAYER, LABEL_AUDIO_KEEP,
+#   LABEL_AUDIO_DISCARD                            already dead before R15-C: R7.1's single-clip
+#                                                  player and its two buttons, superseded by the
+#                                                  gallery in R7.2 and never removed. They belong
+#                                                  to the surface this increment deletes, so they
+#                                                  go with it rather than being left behind as the
+#                                                  only residue of it.
+#
+# An unrendered UI string is not harmless: it reads as a control that exists, and the next person
+# to add a review surface finds two vocabularies for one concept.
 INFO_AUDIO_LIBRARY = (
     "Validated when you file a clip, never written to before that. It must not be inside the "
     "folder of clips being reviewed."
 )
-LABEL_AUDIO_DISCARDED = "🗑️ Discarded folder (quarantine, never deletion)"
 INFO_AUDIO_DISCARDED = (
     "A discarded clip is moved here intact, for you to deal with outside this tool. There is no "
     "retention expiry and no permanent delete."
@@ -2338,9 +2337,32 @@ LABEL_AUDIO_PREVIEW_DISCARDED = "\U0001f5d1\ufe0f Discarded folder (quarantine, 
 # because they do the same thing into the same place -- Media Library. The Audio Cutter's goes to
 # Audio Review and the Raw Cutter's to Video Review.
 LABEL_AUDIO_OPEN_IN_PREVIEW = "\U0001f4da Open results in Media Library"
+# [FORK] Digital-Union (R15-C): reworded, because this button is no longer one of two ways to
+# review an exported cut -- it is the only one, and the sentence has to say what it hands over and
+# what it still leaves to the operator. It also states the retirement plainly: an operator who was
+# part-way through reviewing another folder needs to know that page is being replaced, not silently
+# left behind a new folder name.
 INFO_AUDIO_OPEN_IN_PREVIEW = (
-    "Loads this cut's output folder into **Media Library → Audio Review** so you can classify it "
-    "later. It fills the folder in for you; you still press Scan Folder there."
+    "Available once a cut has written clips. It loads **that cut's own output folder** into "
+    "**Media Library → Audio Review**, which is where exported clips are kept or discarded. It "
+    "only fills the folder in — you still press Scan Folder there, and nothing is read, moved or "
+    "renamed until you do. Any review already open in Audio Review is cleared first, so a Keep or "
+    "Discard can never be applied to the folder you just navigated away from."
+)
+#: [FORK] Digital-Union (R15-C): pressed with no finished cut behind it. It names the reason rather
+#: than a folder, because there is no folder -- and deliberately points at Audio Review's own
+#: editable folder box, so reviewing clips this app did not just make is still one step away.
+AUDIO_HANDOFF_NONE_TEXT = (
+    "Cut some clips first — there is no finished cut to review yet.\n"
+    "You can also type or browse to any folder in Media Library → Audio Review and press "
+    "Scan Folder."
+)
+#: [FORK] Digital-Union (R15-C): the cut finished and wrote clips, but its folder has gone. The
+#: audio sibling of `CUT_HANDOFF_MISSING_TEXT`, and the same rule: reported, never repaired, and
+#: never silently replaced by a parent folder that still happens to exist.
+AUDIO_HANDOFF_MISSING_TEXT = (
+    "That cut's output folder is no longer there:\n{folder}\n"
+    "It may have been moved, renamed or deleted since the cut finished. Nothing was changed."
 )
 
 # [FORK] Digital-Union (Raw Cutter R11): the button now hands over the FINISHED JOB's own output

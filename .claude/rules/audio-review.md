@@ -8,6 +8,8 @@ paths:
   - "tests/test_audio_media_server.py"
   - "tests/test_audio_cutter.py"
   - "tests/test_audio_preview_tab.py"
+  - "src/beatsync_fork/cut_handoff.py"
+  - "tests/test_r15c_audio_review_consolidation.py"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
 > `.claude/rules/operating-policies.md`. GUI seams are in `.claude/rules/gui-integration.md`. The
@@ -16,11 +18,41 @@ paths:
 
 # R7 Raw Audio Cutter and R7.2 Audio review
 
-Two surfaces review exported audio clips — the Raw Audio Cutter's own review half, and the
-standalone 🎧 Audio Preview tab. Everything that is not Gradio and not HTTP lives in
-`beatsync_fork/audio_review.py`, and **both surfaces call it**: enumeration, paging, the tile
-markup, the decision vocabulary, the sort plan and the destination rules. A behaviour that is
-wrong is wrong in one place.
+**ONE surface reviews exported audio clips: Media Library → Audio Review.** That is R15-C, and it
+is the first thing to know about this subsystem, because much of the text below was written when
+there were two and still describes the shared machinery in the plural.
+
+Everything that is not Gradio and not HTTP lives in `beatsync_fork/audio_review.py`: enumeration,
+paging, the tile markup, the decision vocabulary, the sort plan and the destination rules. It is
+still **parameterised by an `_AudioSurface`** rather than inlined into its one caller — deliberately,
+because R15-B's Folder Batch is expected to want it — so a behaviour that is wrong is still wrong in
+one place.
+
+## R15-C: the Audio Cutter exports and hands off; it does not review
+
+The Raw Audio Cutter used to carry a duplicate of the whole workflow: its own destination pair,
+gallery, Confirm, sweep gate and sort. Reading any claim below about "both surfaces" or "two
+galleries", understand it as history — the second surface is gone, and with it
+`_AUDIO_SURFACE_CUT`, `_on_audio_confirm`, `_on_audio_proceed`, `_on_audio_cancel`,
+`_on_audio_destinations_change` and three `gr.State` slots. What is left of the cutter's review half
+is **one button**, `audio_open_preview_btn`.
+
+Rules that are now load-bearing:
+
+- **The shared core is untouched and must stay that way.** Removing a surface is not licence to trim
+  the engine under it. `_audio_confirm_core`, `_audio_sort`, `_audio_render`, `_audio_load_view`,
+  `_audio_merge_payload`, and every module under `beatsync_fork/` named in this file, are exactly
+  what they were. `tests/test_audio_cutter.py` pins their survival by name.
+- **The removed widget names are PREFIXES of surviving ones.** `audio_library_browse` is a substring
+  of `pref_audio_library_browse`; `audio_preview_library` begins with the removed
+  `audio_library_folder`'s stem. Assert removal over the **syntax tree**, never as a substring —
+  the first attempt at that guard reported two live widgets that had genuinely been deleted.
+- **`_AUDIO_CUT_REGISTRY` and the `/r7audio` mount are kept on purpose.** Nothing publishes into
+  that registry now, so the prefix answers `403 unknown_session` for everything — but
+  `MEDIA_PREFIX_CUTTER` is still the module-level **default** prefix for `media_url` and
+  `gallery_html`, so un-mounting it would leave that default pointing at a route Gradio would 404.
+  Narrowing that boundary is a separate change with its own evidence.
+- **The handoff is a `cut_handoff` record, not a path.** See "The handoff" below.
 
 ## The audio is NOT in the page, and the budget is gone rather than raised
 
@@ -64,15 +96,22 @@ claims exactly four prefixes and a test pins both halves of it. Audio needs no p
 decision route and no state route, so adding a prefix there would widen a reviewed security
 boundary to carry a feature that uses none of it.
 
-### Two registries, and that is structural
+### Two registries — historically necessary, now kept for a different reason
 
 `ClipRegistry.new_session` revokes **every previous session that owner holds**. That is correct
-within one review surface and wrong across two: a shared registry would let an Audio Preview scan
-silently revoke the Cutter's just-cut gallery, leaving every tile answering 403 with nothing on
+within one review surface and was wrong across two: a shared registry would have let an Audio Review
+scan silently revoke the Cutter's just-cut gallery, leaving every tile answering 403 with nothing on
 screen to explain it. So `_AUDIO_CUT_REGISTRY` and `_AUDIO_PREVIEW_REGISTRY` are separate
 instances, each **bound to its own prefix at middleware construction time** — the pairing is a
 construction-time fact, not a lookup that could resolve a token against the wrong map. Verified in
 the browser: a live token presented on the other surface's prefix answers `403 unknown_session`.
+
+**[R15-C] That revocation conflict no longer exists, because the cutter's gallery does not.** Both
+registries and both mounts are nevertheless kept, for the reason given at the top of this file:
+`MEDIA_PREFIX_CUTTER` is the module-level default prefix, so un-mounting it would point that default
+at an unmounted route. The practical state today is that nothing publishes into
+`_AUDIO_CUT_REGISTRY`, so `/r7audio` answers `403 unknown_session` for every request — which is the
+safe direction, and is the *reason* removing it needs its own change rather than being free.
 
 `ClipRegistry.publish_page` gained a `servable` **allowlist** parameter defaulting to the video
 `SERVABLE_SUFFIXES`, so every R5 call site is unchanged. It is an allowlist in both uses — never
@@ -96,23 +135,34 @@ discard a page of real decisions. A clip id that is not on the current page is i
 **Decisions still live in the page until Confirm**, so a reload loses them. The Clips Preview's
 durable journal is deliberately not duplicated for audio; do not half-implement one.
 
-## Two galleries in one document
+## Grid-relative lookup, which is why a second gallery was ever safe
 
 Each grid carries `data-store` and `data-counts` naming **its own** hidden field and counts box,
 and the client reads them off the grid the tile belongs to. R7.1 looked both up by document-wide
-id; two grids under that scheme would both write the Audio Cutter's field, so the Audio Preview
-tab's decisions would land on the cutter's clips — silently, and only once both tabs had been
-used. A third gallery would need no client change.
+id; two grids under that scheme would both write the Audio Cutter's field, so Audio Review's
+decisions would land on the cutter's clips — silently, and only once both tabs had been used.
 
-Every CSS selector is a **class**, not `#r7-grid`, for the same reason. The grid also carries a
-**nonce**: a `gr.HTML` update whose markup is byte-identical to the previous value is not
-delivered by the pinned Gradio, so Cancel and the empty state repaint deliberately.
+**[R15-C] One gallery exists now, and none of this is relaxed.** The mechanism is what lets a future
+surface — R15-B's Folder Batch — be added with **no client change at all**, so keep it: do not
+re-key anything on a document-wide id just because there is currently one grid to find. Likewise
+`AUDIO_GALLERY_CSS` is rendered **once**, in Audio Review; the cutter's duplicate copy went with its
+gallery. Every CSS selector is a **class**, not `#r7-grid`, which is exactly why deleting one copy
+left the surviving grid fully styled.
+
+The grid also carries a **nonce**: a `gr.HTML` update whose markup is byte-identical to the previous
+value is not delivered by the pinned Gradio, so Cancel, the empty state **and the R15-C handoff
+retirement** repaint deliberately.
 
 The **"Enable hover audio"** banner and every button that can move a file are matched by class
 (`.r7-enable-hover`, `.r7-release-audio`). Releasing the player before a move is the difference
 between a clip filing and winerror 32 — Windows will not rename a file a player still holds open —
 and `removeAttribute('src')` + `load()` is the mechanism, because `src=''` re-requests the page URL
 in Chrome.
+
+**[R15-C] Two buttons carry `.r7-release-audio` now, not four**: Audio Review's Confirm and Proceed.
+The cutter's pair went with its gallery, and with them the only controls outside Audio Review that
+could move an operator's clips. The matching is still by class, so nothing in the script changed and
+nothing needs to — which is the property to preserve, not the number two.
 
 ## Confirm is admitted by one KEPT clip, and the sweep is gated
 
@@ -218,12 +268,38 @@ its media allowlist.
 `empty_path` — and is untouched. Nothing about serving, authorization, the sort plan or filing
 changes: the refusal happens before the scan.
 
+## The handoff  [R15-C]
+
+`_on_audio_open_in_library` takes the finished cut's **`cut_handoff` record** — the Raw Cutter's own
+type, reused rather than copied — and not a path string. Four properties, each closing something:
+
+- **`build()` answers `None` below one published clip.** `audio_run_dir_state` was written whenever
+  a run directory had been *created*, so an export in which every clip failed still offered its
+  empty folder. `clips=` must therefore be `len(written)`, never `len(segments)`: a planned count
+  makes the record's only gate unreachable.
+- **`read()` re-validates it** coming back out of `gr.State`, where it is untrusted input.
+- **One `isdir`, asked at press time**, never cached. A record describes a job that finished, not a
+  disk that has stayed still. A folder that has gone is reported — never repaired, never silently
+  replaced by a parent that still exists.
+- **A successful handoff retires Audio Review's page; a refused one retires nothing.** This is R11's
+  F-1 hazard in audio: a new folder in the box while the gallery, counts and an armed sweep still
+  described the previous one meant Confirm sorted the previous folder. `_audio_handoff_retire_review`
+  hands back an **empty view** through the existing nine-output `_audio_preview_outputs`; that empty
+  view *is* the mechanism, and the widget updates are consequences — `_audio_sort` reads
+  `view.get('entries')` and finds none. The asymmetry matters: a mis-press must not cost an operator
+  the page they were working on.
+
+`loaded_text(record, destination=...)` names the section. The default stays `Video Review` so R11's
+wording and its pinned tests are byte-identical; the audio caller passes `DESTINATION_AUDIO_REVIEW`.
+Passing nothing would send the operator a confidently wrong instruction.
+
 ## Nothing scans as a side effect
 
 An explicit requirement, and the easy thing to get wrong once a folder box has a remembered value.
 Only the Scan button walks a folder. Loading preferences fills the box and reads nothing; the
-destination `.change()` handlers validate and write one read-only textbox; "Open results in Audio
-Preview" fills the other tab's box and selects the tab. Paging reuses the list the scan captured —
+destination `.change()` handlers validate and write one read-only textbox; "Open results in Media
+Library" fills Audio Review's box, sets its recursion tick from the record's shape and selects both
+the tab and the section. Paging reuses the list the scan captured —
 re-enumerating per page turn would renumber pages under the operator and charge a disk walk for a
 keystroke — and a **successful sort** re-enumerates, because files genuinely moved.
 

@@ -24,6 +24,7 @@ import os
 import pytest
 
 from beatsync_fork import audio_review as review
+from beatsync_fork import cut_handoff as handoff
 from beatsync_fork import user_prefs as prefs
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,26 +66,47 @@ def _registration(tree: ast.Module, widget: str, event: str) -> ast.Call:
     raise AssertionError(f"no {widget}.{event}(...) registration")
 
 
+def _resolve_name(tree: ast.Module, node: ast.AST) -> ast.AST:
+    """One level of list-variable indirection: a `Name` becomes whatever it was assigned."""
+    if not isinstance(node, ast.Name):
+        return node
+    for assign in ast.walk(tree):
+        if (isinstance(assign, ast.Assign) and len(assign.targets) == 1
+                and isinstance(assign.targets[0], ast.Name)
+                and assign.targets[0].id == node.id):
+            return assign.value
+    raise AssertionError(f"{node.id} was never assigned")
+
+
+def _names_in(tree: ast.Module, node: ast.AST) -> set:
+    """Every widget name in an `inputs=`/`outputs=` expression, through variables and `+`.
+
+    [FORK] Digital-Union (R15-C): concatenation is now resolved as well as plain variables. R15-C's
+    handoff writes four of its own widgets **plus** the nine Audio Review outputs, and the nine
+    arrive as `[...] + _audio_preview_outputs_list` precisely so that list stays the single place
+    they are enumerated -- a hand-copied second set of nine is how one gets forgotten and Gradio
+    starts aligning updates against the wrong components.
+
+    Resolving the `+` makes the assertion STRONGER, not laxer: it sees all thirteen names. The
+    alternative, loosening the shape check to accept any expression, would have made every
+    `outputs` assertion in this suite pass vacuously -- the exact trap the helper exists to avoid.
+    """
+    node = _resolve_name(tree, node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _names_in(tree, node.left) | _names_in(tree, node.right)
+    assert isinstance(node, (ast.List, ast.Tuple)), ast.unparse(node)
+    return {n.id for n in node.elts if isinstance(n, ast.Name)}
+
+
 def _wired(tree: ast.Module, widget: str, event: str, which: str) -> set:
-    """The widget names an event reads or writes, resolving ONE level of list indirection.
+    """The widget names an event reads or writes, resolving list indirection and concatenation.
 
     The Audio Preview registrations share their `outputs=` list on purpose -- all six write the
     same nine, assembled by one function -- so a plain substring check would see only the variable
     name and pass vacuously.
     """
     call = _registration(tree, widget, event)
-    node = next(kw for kw in call.keywords if kw.arg == which).value
-    if isinstance(node, ast.Name):
-        for assign in ast.walk(tree):
-            if (isinstance(assign, ast.Assign) and len(assign.targets) == 1
-                    and isinstance(assign.targets[0], ast.Name)
-                    and assign.targets[0].id == node.id):
-                node = assign.value
-                break
-        else:
-            raise AssertionError(f"{widget}.{event} {which}={node.id} was never assigned")
-    assert isinstance(node, (ast.List, ast.Tuple)), ast.unparse(node)
-    return {n.id for n in node.elts if isinstance(n, ast.Name)}
+    return _names_in(tree, next(kw for kw in call.keywords if kw.arg == which).value)
 
 
 def _tab_body(tree: ast.Module) -> str:
@@ -220,8 +242,14 @@ def test_the_tab_reads_a_folder_and_needs_no_cut_in_this_session(gui_tree: ast.M
     discovery, and must NOT read the cutter's review state, its source file or its plan."""
     scan = ast.unparse(_func(gui_tree, "_on_audio_preview_scan"))
     assert "fork_audio_review.discover_audio" in scan
-    for cutter_state in ("audio_review_state", "cut_plan_state", "audio_source",
-                         "_AUDIO_SURFACE_CUT", "_audio_probe", "_audio_plan"):
+    # [FORK] Digital-Union (R15-C): `audio_review_state` and `_AUDIO_SURFACE_CUT` are dropped from
+    # this list because neither exists any more -- asserting the absence of a deleted name is a
+    # guard that cannot fail, and a vacuous guard is worse than none. `audio_handoff_state` and
+    # `_on_audio_cut` replace them: both DO exist, and a Scan that reached either would make this
+    # tab depend on a cut again, which is exactly what the independence claim denies. Every name
+    # left here is real, so the guard still bites.
+    for cutter_state in ("audio_handoff_state", "cut_plan_state", "audio_source",
+                         "_audio_probe", "_audio_plan", "_on_audio_cut"):
         assert cutter_state not in scan, f"Scan depends on the cutter via {cutter_state}"
 
     read = _wired(gui_tree, "audio_preview_scan_btn", "click", "inputs")
@@ -355,21 +383,32 @@ def test_open_results_in_media_library_fills_the_box_and_scans_nothing(gui_tree:
     assert "audio_preview_folder" in written
     assert "main_tabs" in written, "the outer tab is not selected"
     assert "library_tabs" in written, "the inner section is not selected"
-    # It reads the run directory the cut recorded, never a widget the operator could have edited.
+    # [FORK] Digital-Union (R15-C): the recursion tick is written too, from the record's own shape
+    # rather than left at whatever the operator last used.
+    assert "audio_preview_recursive" in written
+    # It reads the finished cut's handoff record, never a widget the operator could have edited.
     read = _wired(gui_tree, "audio_open_preview_btn", "click", "inputs")
-    assert read == {"audio_run_dir_state"}
+    assert read == {"audio_handoff_state"}
 
 
 def test_open_results_says_so_plainly_when_there_is_nothing_to_open(gui_tree: ast.Module):
-    namespace = {"gr": _FakeGradio()}
-    exec(ast.unparse(_func(gui_tree, "_on_audio_open_in_library")), namespace)
+    """[FORK] Digital-Union (R15-C): the refusal is now driven by the record's own gate.
+
+    `None`, a non-dict, a record naming no directory and a record whose published-clip count is
+    zero all read as "no finished cut", which is what stops an export that wrote nothing from
+    offering its empty folder for review.
+    """
+    namespace = _handoff_namespace(gui_tree)
     handler = namespace["_on_audio_open_in_library"]
-    for empty in ("", None, "   "):
+    for empty in (None, "", "   ", {}, {"directory": "", "mode": "single", "clips": 3,
+                                       "outcome": "completed"},
+                  {"directory": "C:/x", "mode": "single", "clips": 0, "outcome": "completed"}):
         returned = handler(empty)
         # One value per output, on the failure path too -- Gradio aligns them positionally, so a
         # short tuple here would write the message into the wrong component.
-        assert len(returned) == 4, f"expected 4 values, got {len(returned)}"
-        assert "Cut some clips first" in returned[-1]
+        assert len(returned) == _HANDOFF_OUTPUT_COUNT, \
+            f"expected {_HANDOFF_OUTPUT_COUNT} values, got {len(returned)}"
+        assert "there is no finished cut to review yet" in returned[4]
 
 
 class _FakeGradio:
@@ -382,6 +421,59 @@ class _FakeGradio:
     @staticmethod
     def update(**kwargs):
         return dict(kwargs) or "UNCHANGED"
+
+
+#: Four of the handoff's own widgets, then the nine Audio Review outputs it repaints.
+_HANDOFF_OUTPUT_COUNT = 4 + 9
+
+
+def _handoff_namespace(tree: ast.Module) -> dict:
+    """The real handoff chain, AST-extracted and executed against a synthesised namespace.
+
+    [FORK] Digital-Union (R15-C). Five real functions are executed, not reimplemented:
+    `_on_audio_open_in_library`, `_audio_handoff_refused`, `_audio_handoff_retire_review`, the
+    nine-output assembler `_audio_preview_outputs` they go through, and `_audio_preview_page_label`
+    which it calls. `cut_handoff`, `audio_review`, `os` and the two refusal strings are the genuine
+    articles.
+
+    Only two things are stubbed, and both for the same reason -- they need a live registry that
+    cannot exist on a bare interpreter. `_audio_render` records the view it was handed, which is
+    what lets a test assert that the retirement passes an EMPTY one; `_AUDIO_SURFACE_PREVIEW` is an
+    opaque sentinel because nothing under test reads it.
+    """
+    import ui_content
+
+    rendered = []
+
+    def _audio_render(surface, view):
+        rendered.append((surface, view))
+        return ("GALLERY", "COUNTS")
+
+    namespace = {
+        "gr": _FakeGradio(),
+        "os": os,
+        "fork_handoff": handoff,
+        "fork_audio_review": review,
+        "_AUDIO_SURFACE_PREVIEW": object(),
+        "_audio_render": _audio_render,
+        "AUDIO_HANDOFF_NONE_TEXT": ui_content.AUDIO_HANDOFF_NONE_TEXT,
+        "AUDIO_HANDOFF_MISSING_TEXT": ui_content.AUDIO_HANDOFF_MISSING_TEXT,
+        "_rendered": rendered,
+    }
+    for name in ("_AUDIO_PREVIEW_OUTPUT_ORDER",):
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == name):
+                exec(ast.unparse(node), namespace)
+                break
+        else:
+            raise AssertionError(f"{name} is not a module-level assignment in gui.py")
+    for name in ("_audio_preview_page_label", "_audio_preview_outputs",
+                 "_audio_handoff_refused", "_audio_handoff_retire_review",
+                 "_on_audio_open_in_library"):
+        exec(ast.unparse(_func(tree, name)), namespace)
+    return namespace
 
 
 # =============================================================================================
@@ -613,7 +705,10 @@ def test_no_preview_registration_writes_a_render_or_source_widget(gui_tree: ast.
     written = _wired(gui_tree, button, "click", "outputs")
     for forbidden in ("status_output", "video_output", "process_btn", "source_state",
                       "prep_state", "variation_seed", "creative_preset", "cut_plan_state",
-                      "audio_review_state", "clips_gallery", "clips_confirm_btn"):
+                      # [FORK] Digital-Union (R15-C): `audio_handoff_state` replaces the deleted
+                      # `audio_review_state` for the reason given above -- a review event must not
+                      # be able to rewrite a finished cut's handoff record.
+                      "audio_handoff_state", "clips_gallery", "clips_confirm_btn"):
         assert forbidden not in written, f"{button} writes {forbidden}"
 
 
