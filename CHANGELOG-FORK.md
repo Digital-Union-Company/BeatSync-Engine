@@ -71,12 +71,43 @@ gains one line offering the review.
 R11 F-1 hazard and it is a real one: filling the folder box with a new folder while the gallery, the
 counts and an armed sweep all still described the *previous* one meant that pressing Confirm sorted
 the previous folder — and an armed sweep moved its unmarked clips into Discarded — while every
-visible label named the new one. The empty view is the mechanism and the widget updates are
-consequences of it: `_audio_sort` reads `view.get('entries')` and finds none, so Confirm, Proceed
-and the sort refuse because the page is gone, not because something in the browser went grey. The
-retirement is assembled through the existing nine-output `_audio_preview_outputs`, so there is one
-notion of "no current page". **Both refusal paths retire nothing** — a mis-press must not cost an
-operator the page they were working on.
+visible label named the new one. **Both refusal paths retire nothing** — a mis-press must not cost
+an operator the page they were working on.
+
+**The first attempt at that retirement was wrong, and independent review measured it.** It wrote an
+empty view into `audio_preview_state` and called that the mechanism. A `gr.State` write only changes
+what the **next** event is handed, and Gradio gives a handler its arguments at submit time — so a
+Confirm or Proceed **already in flight** still carried the previous folder's live page. Reproduced
+deterministically on `77184e44` with real files and the real registry: three clips left the retired
+folder under a terminal frame reading `✅ Sorted all 3 clip(s).` (F-1), and the retired page stayed
+fetchable over the media route afterwards (F-2).
+
+The correction uses the mechanism `.claude/rules/clips-preview.md` already requires — *"anything
+that needs to retire a page must call this rather than add a second notion of 'the current page'
+beside it"*. `_audio_retire_page` calls the registry's own **`revoke_owner`**, the audio sibling of
+the Clips Preview's `invalidate(owner)`: per-owner, not a decision, and it **clears the page's clip
+map**, which is why one revocation closes the decision path and the HTTP path together.
+`_audio_page_is_live` is the gate, and it asks the **registry** rather than the view — as gate 1b in
+`_audio_confirm_core`, before the payload is merged, before the plan is derived, before the
+destinations are validated and before any sort. Revocation happens **before** the repaint, because
+the repaint is the slow part to reach the browser. The handoff therefore takes an injected
+`gr.Request` again: a revocation has to know whose page to retire, and the earlier reasoning that
+this handler "owns no per-owner page" is exactly what left the retirement unable to stop an event
+already in flight. No new coordinator, no generation counter, no second review engine.
+
+**Measured both ways, with the positive control that makes it falsifiable.** Against the published
+head the delayed Confirm moves the files; against the corrected tree it refuses with
+`AUDIO_PAGE_RETIRED_TEXT`, every clip stays put, and the media route answers `unknown_session` — and
+in both trees an **ordinary** Confirm with no handoff still sorts correctly (1 kept, 2 discarded),
+so the gate is not simply refusing everything.
+
+**One residual is left open and stated narrowly [F-3].** A *scan* already in flight finishes by
+minting a fresh session for the folder it was scanning, so it can still republish that folder as a
+live page after the handoff; this surface has no generation counter to order the two, and adding one
+would be the forbidden second notion of the current page. The residual is bounded to presentation:
+the republished page is live, is the page the gallery is actually showing, and its own report names
+the folder it scanned, so a later Confirm acts on what is on screen. **Authority is consistent; the
+folder textbox can be stale.**
 
 **Navigation is still not an action.** The handoff scans nothing, classifies nothing, sorts nothing
 and moves nothing; the one filesystem question it asks is a single `isdir`, asked at press time
@@ -99,7 +130,9 @@ label showing *where in the original recording* a clip came from — the one fac
 surface cannot know. It was a deliberate trade: those timings are still on screen in the Cutter's
 own plan table and still recorded in the manifest.
 
-**Tests.** 57 new assertions in `tests/test_r15c_audio_review_consolidation.py`, plus the seam
+**Tests.** 65 assertions in `tests/test_r15c_audio_review_consolidation.py` — 57 for the increment
+and 8 added by the independent review for F-1/F-2, including the deterministic negative control and
+its positive control — plus the seam
 suites updated where they pinned the removed surface. Measured against the pristine parent
 (`892b9607`) rather than asserted: **43 of the 57 fail or error there.** The 14 that pass are the
 *preservation* controls — Audio Review still usable, the shared core intact, the manifest contract,

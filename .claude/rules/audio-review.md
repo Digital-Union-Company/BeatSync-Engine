@@ -283,11 +283,45 @@ type, reused rather than copied — and not a path string. Four properties, each
   replaced by a parent that still exists.
 - **A successful handoff retires Audio Review's page; a refused one retires nothing.** This is R11's
   F-1 hazard in audio: a new folder in the box while the gallery, counts and an armed sweep still
-  described the previous one meant Confirm sorted the previous folder. `_audio_handoff_retire_review`
-  hands back an **empty view** through the existing nine-output `_audio_preview_outputs`; that empty
-  view *is* the mechanism, and the widget updates are consequences — `_audio_sort` reads
-  `view.get('entries')` and finds none. The asymmetry matters: a mis-press must not cost an operator
-  the page they were working on.
+  described the previous one meant Confirm sorted the previous folder. The asymmetry matters: a
+  mis-press must not cost an operator the page they were working on.
+
+## Retiring an audio page: revoke, do not repaint  [R15-C / F-1, F-2]
+
+**A `gr.State` write is not a retirement, and getting this wrong cost a measured defect.** R15-C
+first implemented the handoff's retirement by handing an empty view back into
+`audio_preview_state` and calling that the mechanism. Independent review reproduced the
+consequence deterministically on `77184e44`: a Confirm **already in flight** — Gradio gives a
+handler its arguments at submit time, so it still carried the previous folder's page — sorted that
+folder anyway. Three real clips left the retired folder under a terminal frame reading
+`✅ Sorted all 3 clip(s).`, and the retired page stayed fetchable over the media route.
+
+The rule, which is the one `.claude/rules/clips-preview.md` already states for the video side —
+*"anything that needs to retire a page must call this rather than add a second notion of 'the
+current page' beside it"*:
+
+- **`_audio_retire_page` is the mechanism.** It calls the registry's own `revoke_owner`, the audio
+  sibling of the Clips Preview's `invalidate(owner)`. Per-owner, so another browser session keeps
+  its page; **not a decision**, so Keep/Discard marks survive untouched; and it **clears the page's
+  clip map**, which is why one revocation closes the decision path *and* the HTTP path.
+- **`_audio_page_is_live` is the gate**, and it asks the **registry** — never the view, a widget or
+  a module flag. `_audio_confirm_core` consults it as gate 1b, **before** the payload is merged,
+  before the plan is derived, before the destinations are validated and before any sort. A view
+  carrying no tokens is not live either; treating the empty view as live would re-open the hole.
+- **Revoke before repainting.** The repaint is the slow part to reach the browser; authority must
+  be gone when the handoff is handled, not when its response lands.
+- **The refusal paths revoke nothing**, and that is asserted against the registry rather than
+  against widget values.
+
+**What this does not promise — stated narrowly, do not widen [R15-C / F-3].** A *scan* already in
+flight finishes by minting a **fresh** session for the folder it was scanning, so it can still
+republish that folder as a live page after the handoff. This surface has no generation counter to
+order a scan against a retirement, and adding one would be exactly the second notion of "the
+current page" the rule above forbids. The residual is bounded to presentation, and the bound is the
+reason it is acceptable: the republished page is **live**, is the page the gallery is actually
+showing, and its own report names the folder it scanned — so a later Confirm acts on what is on
+screen. **Authority is consistent; the folder textbox can be stale.** Do not restate this as "the
+handoff fully orders a concurrent scan", and do not claim a browser-level proof that was not taken.
 
 `loaded_text(record, destination=...)` names the section. The default stays `Video Review` so R11's
 wording and its pinned tests are byte-identical; the audio caller passes `DESTINATION_AUDIO_REVIEW`.

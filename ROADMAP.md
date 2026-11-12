@@ -1569,9 +1569,19 @@ input" is not a new capability; **processing all audio streams is**.
 > **draft** pull request. It is **not merged**, **not deployed to the production installation**, and
 > **not owner-accepted**; nothing below should be read as shipped. What exists: the duplicated
 > surface is removed, the handoff carries the existing `cut_handoff` record so a cut that wrote
-> nothing offers nothing, and a successful handoff retires Audio Review's stale page. 57 new
-> assertions, of which **43 fail or error against the pristine parent** `892b9607`; the 14 that pass
-> there are the preservation controls, which is what makes them controls. The whole suite is green.
+> nothing offers nothing, and a successful handoff retires Audio Review's stale page. 65 assertions,
+> of which **43 fail or error against the pristine parent** `892b9607`; the 14 that pass there are
+> the preservation controls, which is what makes them controls. The whole suite is green.
+>
+> **Independently reviewed, and two MAJOR findings were reproduced and fixed.** The first
+> retirement was a `gr.State` repaint rather than a revocation, so a Confirm or Proceed already in
+> flight still sorted the folder the operator had navigated away from — three clips measured
+> leaving a retired folder under a terminal frame reading `✅ Sorted all 3 clip(s).` (F-1) — and the
+> retired page stayed fetchable over the media route (F-2). Both are closed by revoking the owner's
+> registry session through the existing `revoke_owner` and gating the shared confirm core on a
+> registry liveness read, with a positive control proving an ordinary Confirm still sorts. One
+> residual is left open and stated narrowly: a concurrent *scan* can still republish the old folder
+> as a live page, which is a presentation inconsistency rather than an authority one (F-3).
 > Verified by offline seam tests, by executing the real handoff chain, and by **building the whole
 > Blocks tree against the real pinned Gradio 6.19.0** — 513 components against the pristine parent's
 > 546, with every removed `elem_id` absent and every kept one present. That is a construction test,

@@ -2364,6 +2364,21 @@ AUDIO_HANDOFF_MISSING_TEXT = (
     "That cut's output folder is no longer there:\n{folder}\n"
     "It may have been moved, renamed or deleted since the cut finished. Nothing was changed."
 )
+#: [FORK] Digital-Union (R15-C review finding F-1): a Confirm or Proceed arrived carrying a page
+#: that has since been retired -- it was submitted before "Open results in Media Library" moved
+#: Audio Review to another folder, and Gradio hands a handler its arguments at submit time.
+#:
+#: It must say plainly that NOTHING MOVED, because the alternative wording an operator would assume
+#: from a refusal is that something half-happened. It must also not blame them: pressing Confirm and
+#: then the handoff is a perfectly ordinary pair of clicks, and before this refusal existed that
+#: pair silently sorted the folder they had just left.
+AUDIO_PAGE_RETIRED_TEXT = (
+    "⚠️  Nothing was moved — this review page is no longer the current one.\n"
+    "It was replaced while that press was on its way to the server, which happens when "
+    "“Open results in Media Library” loads a different folder.\n"
+    "Your Keep and Discard marks were not applied to anything. Press Scan Folder to review the "
+    "folder now loaded."
+)
 
 # [FORK] Digital-Union (Raw Cutter R11): the button now hands over the FINISHED JOB's own output
 # folder rather than the parent output widget, so it is named after what it does. It is available

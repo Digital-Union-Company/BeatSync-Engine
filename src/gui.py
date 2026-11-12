@@ -10517,6 +10517,69 @@ def _audio_page_decisions(view) -> dict:
             for clip_id, key in identity.items()}
 
 
+def _audio_page_is_live(surface, view) -> bool:
+    """Is the page this view describes still the owner's live page in the registry?
+
+    [FORK] Digital-Union (R15-C, review finding F-1). **The authority question, asked of the
+    server rather than of the request's own arguments.**
+
+    Every Gradio handler receives its inputs *by value at submit time*, so a Confirm or Proceed
+    that was already in flight still carries the page it was submitted with. R15-C's first attempt
+    retired a page by writing an empty view into `audio_preview_state`, which only changes what the
+    **next** event is given — so an event already holding the previous folder's view sorted that
+    folder anyway, and the terminal frame said `✅ Sorted all 3 clip(s).` Reproduced
+    deterministically before this gate existed.
+
+    The registry is the authority that already exists for this, and it is the one
+    `.claude/rules/clips-preview.md` requires be used: *"anything that needs to retire a page must
+    call this rather than add a second notion of 'the current page' beside it."* A revoked session
+    also **clears its page's clip map**, so there is nothing left to resolve — which is why one
+    question answers both halves: the decision path refuses here, and the media route refuses at
+    `open_authorized`.
+
+    `page_entries` is the read, not `resolve`: it asks about the *page*, needs no clip id, and goes
+    through the same `_session_by_id` gates, so a session that is unknown, revoked or malformed and
+    a page that is unknown or expired all answer the same way. A view with no tokens at all is not
+    live either — that is the empty view, and treating it as live would re-open the hole.
+
+    Deliberately NOT a new coordinator, a generation counter or a second notion of the current
+    page. It is one read of the registry the surface already owns.
+    """
+    session = (view or {}).get('session') or ''
+    page = (view or {}).get('page') or ''
+    if not session or not page:
+        return False
+    try:
+        surface.registry.page_entries(session, page)
+    except fork_clips.Refusal:
+        return False
+    return True
+
+
+def _audio_retire_page(surface, request) -> None:
+    """Revoke this owner's review session on `surface`. The real retirement.
+
+    [FORK] Digital-Union (R15-C, review findings F-1 and F-2). `revoke_owner` is the existing,
+    reviewed mechanism — the audio sibling of the Clips Preview's `invalidate(owner)`, which R11's
+    own F-1 added for exactly this reason. Three properties come with it rather than being
+    re-implemented here:
+
+    * it is **per-owner**, so another browser session keeps its own page and session id;
+    * it is **not a decision** — this class holds pages, not decisions, so the operator's kept and
+      discarded marks survive untouched and no durable store is written;
+    * a revoked page **clears its clip map**, so the retired folder's clips stop being fetchable
+      over the media route as well. That was finding F-2: before this, the previous folder's clips
+      stayed servable after the handoff.
+
+    A session with no browser identity has no page to retire; it still gets the repainted empty
+    state, which is what its own Scan would show anyway.
+    """
+    try:
+        surface.registry.revoke_owner(_audio_owner(request))
+    except fork_clips.Refusal:
+        pass
+
+
 def _audio_render(surface, view) -> tuple:
     """`(gallery_html, counts_line)` for a view. The one place either is produced."""
     tiles = _audio_tiles(view)
@@ -10694,6 +10757,12 @@ def _audio_confirm_core(surface, view, payload, library, discarded, armed_signat
     The order of the gates is the contract:
 
     1. **nothing loaded** -- nothing to do, and nothing is said about folders;
+    1b. **the page is still the live one** -- see `_audio_page_is_live`. [FORK] Digital-Union
+        (R15-C review finding F-1.) This gate is what makes a retirement real: a Confirm or Proceed
+        already in flight carries the page it was submitted with, so without asking the registry it
+        would sort a folder the operator has already navigated away from. It comes before the
+        decisions are folded in and before anything is validated, because a dead page should not
+        even be reasoned about;
     2. **the page's own decisions are folded in first**, so Confirm acts on what is on screen;
     3. **at least one clip must be kept.** This is R7.2's admission rule, replacing R7.1's
        "nothing may be undecided": the operator marks the good clips and presses Confirm;
@@ -10707,6 +10776,15 @@ def _audio_confirm_core(surface, view, payload, library, discarded, armed_signat
     if not view.get('entries'):
         gallery, counts = _audio_render(surface, view)
         return ("Nothing has been loaded to review yet.", view, gallery, counts, '', False, False)
+
+    if not _audio_page_is_live(surface, view):
+        # [FORK] Digital-Union (R15-C, F-1). The page this event was submitted with has been
+        # retired. Nothing moves, and the view is replaced with the empty one so the screen stops
+        # asserting a page the server no longer holds. Returning the *stale* view here would repaint
+        # a grid of dead credentials, which is a state the operator cannot act on.
+        retired = {}
+        gallery, counts = _audio_render(surface, retired)
+        return (AUDIO_PAGE_RETIRED_TEXT, retired, gallery, counts, '', False, False)
 
     view = _audio_merge_payload(view, payload)
     plan = fork_audio_review.plan_sort(_audio_tiles(view), _audio_page_decisions(view),
@@ -10970,7 +11048,7 @@ def _on_audio_preview_destinations_change(library_folder, discarded_folder, view
     return message
 
 
-def _on_audio_open_in_library(handoff):
+def _on_audio_open_in_library(handoff, request: gr.Request = None):
     """"Open results in Media Library": hand this cut's output folder to Audio Review.
 
     It only fills the folder box and selects the section. **It deliberately does not scan**,
@@ -11004,6 +11082,13 @@ def _on_audio_open_in_library(handoff):
     The refusal paths deliberately retire **nothing**. They change the report and nothing else, so
     a mis-press cannot cost an operator the page they were working on; a handoff that was refused
     has not moved Audio Review anywhere.
+
+    [FORK] Digital-Union (R15-C, review findings F-1 and F-2): the injected `gr.Request` is back,
+    and it is load-bearing. The retirement now **revokes the owner's registry session** rather than
+    only writing an empty view into `gr.State`, and a revocation needs to know whose page to
+    retire. An earlier version of this handler took no request on the reasoning that it "owns no
+    per-owner page" -- that reasoning was exactly wrong, and is what left the retirement unable to
+    stop an event that was already in flight.
     """
     record = fork_handoff.read(handoff)
     if record is None:
@@ -11017,7 +11102,8 @@ def _on_audio_open_in_library(handoff):
             gr.Tabs(selected='tab-audio-review')) \
         + _audio_handoff_retire_review(
             fork_handoff.loaded_text(
-                record, destination=fork_handoff.DESTINATION_AUDIO_REVIEW))
+                record, destination=fork_handoff.DESTINATION_AUDIO_REVIEW),
+            request)
 
 
 def _audio_handoff_refused(message):
@@ -11041,7 +11127,7 @@ def _audio_handoff_refused(message):
     return (gr.update(), gr.update(), gr.update(), gr.update(), message) + unchanged
 
 
-def _audio_handoff_retire_review(message):
+def _audio_handoff_retire_review(message, request):
     """Retire whatever Audio Review currently holds, and repaint it.
 
     [FORK] Digital-Union (R15-C), the audio sibling of `_cut_handoff_retire_review`. The handoff
@@ -11049,13 +11135,23 @@ def _audio_handoff_retire_review(message):
     actionable has to stop being actionable: the frozen page of entries, the decisions keyed against
     it, the counts, the page label and any sweep the operator had already armed.
 
-    **The empty view is the mechanism, and the widget updates are consequences of it.** For this
-    surface the server's per-owner page lives in `audio_preview_state`, so handing back `{}` is the
-    retirement itself: `_audio_sort` reads `view.get('entries')` and finds none, and
-    `_audio_confirm_core` refuses before it reaches a sort. Clearing the armed signature in the same
-    breath is what stops a sweep that was authorised for the *previous* batch from being replayed
-    against the next one -- and the signature is a change detector rather than a credential, so an
-    empty one authorises nothing even if a stale page tried to present it.
+    **`_audio_retire_page` is the mechanism; the empty view and the widget updates are consequences
+    of it.** [FORK] Digital-Union (R15-C review finding F-1) -- and that ordering is the whole
+    correction. This function first said the opposite: it wrote an empty view into
+    `audio_preview_state` and called *that* the retirement. A `gr.State` write only changes what the
+    **next** event is handed, so a Confirm or Proceed already in flight -- Gradio gave it its
+    arguments at submit time -- still carried the previous folder's live page and sorted it. Both
+    halves are now real:
+
+    * the registry session is **revoked**, so the decision path refuses (`_audio_page_is_live`) and
+      the media route refuses (`open_authorized`), whenever the event was submitted;
+    * the empty view and the cleared signature stop the *screen* asserting a page the server no
+      longer holds. A disabled control is not an authorization boundary, and this one is not asked
+      to be.
+
+    Revoking **before** returning the repaint matters: the repaint is the slow part to reach the
+    browser, and authority must be gone the instant the handoff is handled, not whenever the
+    response lands.
 
     It is assembled through `_audio_preview_outputs` rather than by listing nine updates, so there
     is exactly one notion of "no current page" and a tenth output could not be forgotten here.
@@ -11064,9 +11160,19 @@ def _audio_handoff_retire_review(message):
     operator has typed, not the folder being reviewed; the next Scan recomputes it, and Confirm
     re-validates both folders before moving a byte regardless of what it says.
 
-    This reaches no disk and mints no session: with no entries, `_audio_render` returns on the empty
-    branch, exactly as the Cancel path already does.
+    This reaches no disk and publishes no page: with no entries, `_audio_render` returns on the
+    empty branch, exactly as the Cancel path already does.
+
+    **What it does not promise, stated narrowly and not widened.** A *scan* that was already in
+    flight finishes by minting a fresh session for the folder it was scanning, so it can still
+    republish that folder as a live page after the handoff -- the audio surface has no generation
+    counter to order the two, and adding one would be a second notion of the current page that
+    `.claude/rules/clips-preview.md` forbids. The consequence is bounded to presentation: the
+    republished page is live, is the page the gallery is actually showing, and its own report names
+    the folder it scanned, so a later Confirm acts on what is on screen. Authority is consistent;
+    the folder textbox can be stale. See `.claude/rules/audio-review.md` (R15-C / F-3).
     """
+    _audio_retire_page(_AUDIO_SURFACE_PREVIEW, request)
     return _audio_preview_outputs(message, {}, gr.update(), gate=False, signature='')
 
 

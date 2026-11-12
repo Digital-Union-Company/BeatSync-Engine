@@ -36,12 +36,15 @@ review core.
 from __future__ import annotations
 
 import ast
+import json
 import os
 
 import pytest
 
 from beatsync_fork import audio_cutter as cutter
 from beatsync_fork import audio_review as review
+from beatsync_fork import clips_review as clips
+from beatsync_fork import collision
 from beatsync_fork import cut_handoff as handoff
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -132,36 +135,75 @@ _REPORT_AT = 4
 _VIEW_AT = 4 + 3
 
 
+#: The owner key the stubbed `_audio_owner` hands back. One operator throughout.
+_OWNER = "owner-under-test"
+
+
+class _Request:
+    """Stands in for the injected `gr.Request`. Nothing reads it but `_audio_owner`, which is
+    stubbed, so its only job is to be a distinct object the handler can pass along."""
+
+
+def _class_def(tree: ast.Module, name: str) -> ast.ClassDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError(f"no class {name}")
+
+
+def _audio_surface(tree: ast.Module, registry):
+    """A real `_AudioSurface`, built from the class in `gui.py` and a real registry."""
+    namespace = {}
+    exec(ast.unparse(_class_def(tree, "_AudioSurface")), namespace)
+    return namespace["_AudioSurface"](
+        "preview", registry, review.MEDIA_PREFIX_PREVIEW, review.GRID_PREVIEW,
+        "audio-preview-decisions", "audio-preview-counts",
+        "No audio clips loaded. Choose a folder and press Scan Folder.")
+
+
 @pytest.fixture
 def chain(gui_tree: ast.Module) -> dict:
-    """The real handoff chain against a synthesised namespace.
+    """The real handoff and review chain, on a **real `ClipRegistry`**.
 
-    Five real functions are executed rather than reimplemented: `_on_audio_open_in_library`,
-    `_audio_handoff_refused`, `_audio_handoff_retire_review`, the nine-output assembler
-    `_audio_preview_outputs`, and `_audio_preview_page_label`. `cut_handoff`, `audio_review`, `os`
-    and both refusal strings are the genuine articles.
+    [FORK] Digital-Union (R15-C review findings F-1/F-2): this fixture used to stub
+    `_AUDIO_SURFACE_PREVIEW` as a bare `object()` and assert only that an empty view *arrived*.
+    That is why the original suite passed while the retirement revoked nothing -- the authority the
+    retirement is supposed to destroy was not in the fixture at all. The registry is now genuine, so
+    "the page was retired" is a question with a real answer.
 
-    Only `_audio_render` and `_AUDIO_SURFACE_PREVIEW` are stubbed, and both for the same reason --
-    they need a live registry, which cannot exist on a bare interpreter. The stub RECORDS every view
-    it is handed, which is what lets the retirement tests assert that an empty one arrives.
+    Real: `clips_review.ClipRegistry`, `audio_review`, `cut_handoff`, `collision`, `os`, every
+    refusal string, and the `gui.py` functions listed below -- including the whole decision path
+    (`_audio_confirm_core`, `_audio_sort`, `_audio_merge_payload`) and the publish path
+    (`_audio_load_view`, `_audio_publish`).
+
+    Stubbed, and none of it decides anything under test: `_audio_durations` (it would shell out to
+    FFprobe), `_audio_owner` (it needs a live Gradio request) and `_collision_policy` (it reads the
+    operator's preferences file). `_audio_render` is the genuine one, so the empty-state repaint is
+    exercised rather than asserted.
     """
     import ui_content
 
-    rendered = []
-
-    def _audio_render(surface, view):
-        rendered.append(view)
-        return ("GALLERY", "COUNTS")
-
+    registry = clips.ClipRegistry()
     namespace = {
         "gr": _FakeGradio(),
         "os": os,
+        "json": json,
         "fork_handoff": handoff,
         "fork_audio_review": review,
-        "_AUDIO_SURFACE_PREVIEW": object(),
-        "_audio_render": _audio_render,
+        "fork_clips": clips,
+        "fork_collision": collision,
+        "ROOT_DIR": os.path.abspath(os.sep),
+        "_AUDIO_PREVIEW_REGISTRY": registry,
+        "_AUDIO_SURFACE_PREVIEW": _audio_surface(gui_tree, registry),
+        "_audio_durations": lambda entries: {},
+        "_audio_owner": lambda request: _OWNER,
+        "_collision_policy": lambda: collision.resolve_policy(None),
         "AUDIO_HANDOFF_NONE_TEXT": ui_content.AUDIO_HANDOFF_NONE_TEXT,
         "AUDIO_HANDOFF_MISSING_TEXT": ui_content.AUDIO_HANDOFF_MISSING_TEXT,
+        "AUDIO_PAGE_RETIRED_TEXT": ui_content.AUDIO_PAGE_RETIRED_TEXT,
+        "AUDIO_CONFIRM_DISABLED_TEXT": ui_content.AUDIO_CONFIRM_DISABLED_TEXT,
+        "AUDIO_SWEEP_GATE_HEADING": ui_content.AUDIO_SWEEP_GATE_HEADING,
+        "AUDIO_SWEEP_GATE_PROMPT": ui_content.AUDIO_SWEEP_GATE_PROMPT,
     }
     for node in gui_tree.body:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -171,12 +213,46 @@ def chain(gui_tree: ast.Module) -> dict:
             break
     else:
         raise AssertionError("_AUDIO_PREVIEW_OUTPUT_ORDER is not module-level in gui.py")
-    for name in ("_audio_preview_page_label", "_audio_preview_outputs",
-                 "_audio_handoff_refused", "_audio_handoff_retire_review",
-                 "_on_audio_open_in_library"):
+    for name in ("_audio_identities", "_audio_page_decisions", "_audio_tiles", "_audio_render",
+                 "_audio_publish", "_audio_load_view", "_audio_merge_payload",
+                 "_audio_resolved_destinations", "_audio_sort", "_audio_page_is_live",
+                 "_audio_retire_page", "_audio_confirm_core", "_audio_preview_page_label",
+                 "_audio_preview_outputs", "_audio_handoff_refused",
+                 "_audio_handoff_retire_review", "_on_audio_open_in_library"):
         exec(ast.unparse(_func(gui_tree, name)), namespace)
-    namespace["_views_rendered"] = rendered
+    namespace["_registry"] = registry
+    namespace["press"] = lambda record: namespace["_on_audio_open_in_library"](record, _Request())
     return namespace
+
+
+def _publish(chain, folder, names=("take_part_001.wav", "take_part_002.wav",
+                                   "take_part_003.wav")):
+    """Write real clips into `folder` and publish them as a live review page."""
+    os.makedirs(folder, exist_ok=True)
+    paths = []
+    for index, name in enumerate(names, start=1):
+        path = os.path.join(folder, name)
+        with open(path, "wb") as handle:
+            handle.write(b"RIFF" + bytes(200 + index))
+        paths.append(path)
+    view, note = chain["_audio_load_view"](
+        chain["_AUDIO_SURFACE_PREVIEW"], _Request(), paths, folder,
+        recursive=False, page_index=1, page_size=24)
+    assert view["entries"], f"the page did not publish: {note}"
+    return view, paths
+
+
+def _decide_every_clip(view):
+    """A payload that decides the whole page: keep the first, reject the rest.
+
+    Deciding **every** clip matters. A payload that leaves any clip unmarked trips the sweep gate,
+    which stops the sort for a reason that has nothing to do with page authority -- the first
+    version of this control did exactly that and read as "the retirement held" when it had not.
+    """
+    decisions = {view["entries"][0].clip_id: "SELECTED"}
+    for entry in view["entries"][1:]:
+        decisions[entry.clip_id] = "REJECTED"
+    return json.dumps({"decisions": decisions})
 
 
 def _record(directory, clips=3, outcome=handoff.OUTCOME_COMPLETED):
@@ -198,7 +274,7 @@ def test_a_successful_cut_hands_over_that_run_directory_and_not_its_parent(chain
     run.mkdir()
     parent = str(tmp_path)
 
-    out = chain["_on_audio_open_in_library"](_record(str(run)))
+    out = chain["press"](_record(str(run)))
     assert len(out) == _HANDOFF_OUTPUTS
     assert out[0] == {"value": str(run)}
     assert out[0]["value"] != parent, "the parent output folder was handed over"
@@ -219,7 +295,7 @@ def test_the_report_says_audio_review_and_never_video_review(chain, tmp_path):
     """
     run = tmp_path / "run"
     run.mkdir()
-    message = chain["_on_audio_open_in_library"](_record(str(run)))[_REPORT_AT]
+    message = chain["press"](_record(str(run)))[_REPORT_AT]
     assert "Audio Review" in message
     assert "Video Review" not in message
 
@@ -232,7 +308,7 @@ def test_a_partial_cut_is_not_described_as_a_clean_one(chain, tmp_path, outcome,
     """A cut with failures is still worth reviewing, and must not be reported as complete."""
     run = tmp_path / "run"
     run.mkdir()
-    message = chain["_on_audio_open_in_library"](_record(str(run), outcome=outcome))[_REPORT_AT]
+    message = chain["press"](_record(str(run), outcome=outcome))[_REPORT_AT]
     assert fragment in message
 
 
@@ -259,7 +335,7 @@ def test_nothing_reviewable_is_refused_in_words_and_navigates_nowhere(chain, bad
     nothing. `cut_handoff.build` answers None below one published clip, so the offer and the gate
     are the same object.
     """
-    out = chain["_on_audio_open_in_library"](bad)
+    out = chain["press"](bad)
     assert len(out) == _HANDOFF_OUTPUTS, "a short tuple would misalign every later output"
     assert out[0] == "UNCHANGED", "a refused handoff must not fill the folder box"
     assert out[1] == "UNCHANGED", "a refused handoff must not change the recursion tick"
@@ -274,7 +350,7 @@ def test_a_cut_whose_folder_has_since_gone_is_reported_not_repaired(chain, tmp_p
     exactly the substitution that would hand over three cuts instead of the missing one.
     """
     missing = str(tmp_path / "deleted_after_the_cut")
-    out = chain["_on_audio_open_in_library"](_record(missing))
+    out = chain["press"](_record(missing))
     assert len(out) == _HANDOFF_OUTPUTS
     assert out[0] == "UNCHANGED"
     assert missing in out[_REPORT_AT]
@@ -286,7 +362,7 @@ def test_a_file_where_the_run_directory_should_be_is_not_accepted(chain, tmp_pat
     """`isdir`, not `exists`: a file with the run directory's name is not a folder of clips."""
     impostor = tmp_path / "run"
     impostor.write_bytes(b"not a directory")
-    out = chain["_on_audio_open_in_library"](_record(str(impostor)))
+    out = chain["press"](_record(str(impostor)))
     assert out[0] == "UNCHANGED"
     assert "no longer there" in out[_REPORT_AT]
 
@@ -303,16 +379,24 @@ def test_a_successful_handoff_retires_whatever_audio_review_was_holding(chain, t
     an armed sweep moved its unmarked clips into Discarded -- while every visible label named the
     new one.
 
-    The empty view is the mechanism; the widget updates are consequences of it. `_audio_sort` reads
-    `view.get('entries')` and finds none, so Confirm, Proceed and the sort all refuse because the
-    page is gone, not because something in the browser went grey.
+    [FORK] Digital-Union (R15-C review finding F-1): this test's own explanation used to say "the
+    empty view is the mechanism", and that was the defect written down as a claim. The empty view is
+    a **consequence**; `_audio_retire_page` revoking the owner's registry session is the mechanism,
+    and the tests below assert it against a real registry rather than against widget values.
     """
     run = tmp_path / "run"
     run.mkdir()
-    out = chain["_on_audio_open_in_library"](_record(str(run)))
+    # A live page exists first, so the retirement has something real to destroy. Without this the
+    # assertions below would hold trivially, which is how the original version of this test passed
+    # against an implementation that revoked nothing.
+    live_view, _paths = _publish(chain, str(tmp_path / "being_reviewed"))
+    assert chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], live_view)
 
-    assert out[_VIEW_AT] == {}, "the page authority was not retired"
-    assert chain["_views_rendered"][-1] == {}, "the gallery was repainted from a surviving page"
+    out = chain["press"](_record(str(run)))
+
+    assert out[_VIEW_AT] == {}, "the page authority was not repainted away"
+    assert not chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], live_view), \
+        "the previous page is still live in the registry after the handoff"
     # The armed sweep signature is cleared, so a confirmation minted for the previous batch cannot
     # authorise a sweep of the next one.
     assert out[4 + 5] == "", "an armed sweep survived the handoff"
@@ -328,7 +412,7 @@ def test_a_refused_handoff_retires_nothing_at_all(chain, tmp_path):
     retirement safe to have: it fires only when the operator is actually being moved.
     """
     for bad in (None, _record(str(tmp_path / "gone"))):
-        out = chain["_on_audio_open_in_library"](bad)
+        out = chain["press"](bad)
         for index in range(_HANDOFF_OUTPUTS):
             if index == _REPORT_AT:
                 continue
@@ -345,8 +429,8 @@ def test_pressing_the_handoff_twice_is_idempotent(chain, tmp_path):
     run = tmp_path / "run"
     run.mkdir()
     record = _record(str(run))
-    first = chain["_on_audio_open_in_library"](record)
-    second = chain["_on_audio_open_in_library"](record)
+    first = chain["press"](record)
+    second = chain["press"](record)
 
     assert first[0] == second[0] == {"value": str(run)}
     assert first[_VIEW_AT] == second[_VIEW_AT] == {}
@@ -367,28 +451,32 @@ def test_switching_between_two_run_directories_leaves_no_residue_of_the_first(ch
     first_run.mkdir()
     second_run.mkdir()
 
-    first = chain["_on_audio_open_in_library"](_record(str(first_run), clips=4))
-    second = chain["_on_audio_open_in_library"](_record(str(second_run), clips=9))
+    first = chain["press"](_record(str(first_run), clips=4))
+    # Between the two handoffs the operator actually scans the first folder, so the second handoff
+    # has a real page to retire rather than retiring nothing twice over.
+    scanned, _paths = _publish(chain, str(first_run / "clips"))
+    assert chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], scanned)
+
+    second = chain["press"](_record(str(second_run), clips=9))
 
     assert first[0] == {"value": str(first_run)}
     assert second[0] == {"value": str(second_run)}
     assert str(first_run) not in second[_REPORT_AT], "the first folder leaked into the second report"
     assert "9 clip(s) written" in second[_REPORT_AT]
-    # Retired both times, not just the first.
+    # Retired both times, and the second retirement reached the page the first folder had published.
     assert second[_VIEW_AT] == {}
-    assert chain["_views_rendered"] == [{}, {}]
+    assert not chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], scanned), \
+        "the first folder's page survived the second handoff"
 
 
 def test_the_real_renderer_survives_the_empty_view_the_retirement_hands_it(gui_tree: ast.Module):
-    """The one thing the stubbed `chain` fixture cannot tell us.
+    """The renderer against the empty view the retirement hands it.
 
-    `_audio_render` is stubbed there because it needs a live registry, so the retirement tests prove
-    that `{}` *arrives* but not that the renderer survives it. If the real one raised on an empty
-    view, the handoff would 500 in the operator's browser and every test above would still pass.
-
-    So the genuine `_audio_tiles`, `_audio_page_decisions` and `_audio_render` are executed here
-    against the real `audio_review` module, with only the surface described by a stand-in carrying
-    the four ids it reads.
+    If the real `_audio_render` raised on an empty view, the handoff would 500 in the operator's
+    browser. The `chain` fixture above now executes the genuine renderer too, so this is the
+    narrower, direct statement of the same property: built from the real `audio_review` module with
+    nothing but a stand-in surface carrying the four ids it reads, so a failure here points at the
+    renderer rather than at anything in the handoff chain.
     """
     namespace = {"fork_audio_review": review}
     for name in ("_audio_tiles", "_audio_page_decisions", "_audio_render"):
@@ -629,11 +717,227 @@ def test_the_handoff_joins_no_concurrency_group_and_takes_no_render_lock(gui_tre
         assert forbidden not in body, f"the handoff reaches {forbidden}"
 
 
-def test_the_handoff_takes_no_injected_request(gui_tree: ast.Module):
-    """It owns no per-owner page: the view it retires arrives as a `gr.State` value and goes back
-    as one. An injected request here would imply a registry operation that does not happen."""
+def test_the_handoff_takes_an_injected_request_because_it_revokes(gui_tree: ast.Module):
+    """[FORK] Digital-Union (R15-C review finding F-1). This test previously asserted the OPPOSITE,
+    on the reasoning that the handoff "owns no per-owner page" and that an injected request "would
+    imply a registry operation that does not happen".
+
+    That reasoning was exactly backwards, and it is what let the defect through: the retirement has
+    to revoke the owner's registry session, a revocation needs to know *whose*, and the owner comes
+    only from the injected request. The request must be last and optional, the convention every
+    other audio handler follows so the function stays callable.
+    """
     func = _func(gui_tree, "_on_audio_open_in_library")
-    assert [a.arg for a in func.args.args] == ["handoff"], [a.arg for a in func.args.args]
+    args = [a.arg for a in func.args.args]
+    assert args == ["handoff", "request"], args
+    annotation = ast.unparse(func.args.args[-1].annotation or ast.Constant(None))
+    assert "gr.Request" in annotation, annotation
+    assert func.args.defaults, "the request has no default, so the handler is not callable without one"
+    # And the request is never a widget input -- a browser-supplied owner would let one session
+    # retire another's page.
+    assert "request" not in _wired(gui_tree, "audio_open_preview_btn", "inputs")
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R15-C review findings F-1 and F-2)
+#
+# The published head claimed: "the empty view IS the mechanism ... Confirm, Proceed and the sort
+# all refuse because the page is gone." That is true only of an event submitted AFTER the
+# retirement lands. Gradio hands a handler its arguments at submit time, so an event already in
+# flight still carried the previous folder's page -- and sorted it. Reproduced deterministically:
+# three clips moved out of the retired folder under a terminal frame reading
+# "Sorted all 3 clip(s)", and the retired page stayed servable over the media route.
+#
+# The correction uses the mechanism `.claude/rules/clips-preview.md` requires -- "anything that
+# needs to retire a page must call this rather than add a second notion of 'the current page'
+# beside it" -- which for this surface is the registry's own `revoke_owner`, the audio sibling of
+# the Clips Preview's `invalidate(owner)`.
+# =============================================================================================
+
+def test_a_delayed_confirm_cannot_sort_a_retired_folder(chain, tmp_path):
+    """F-1, the negative control, with real files and a real registry.
+
+    The schedule is the whole point and is placed deterministically rather than raced: the view is
+    captured first (which is what Gradio does at submit time), the handoff runs, and only then is
+    the Confirm delivered with that captured view.
+    """
+    folder_a = str(tmp_path / "run_A")
+    folder_b = str(tmp_path / "run_B")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (folder_b, library, discarded):
+        os.makedirs(path)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+
+    view_a, paths_a = _publish(chain, folder_a)
+    payload = _decide_every_clip(view_a)
+
+    # the handoff moves Audio Review to folder B
+    chain["press"](_record(folder_b, clips=1))
+
+    # the Confirm that was already on its way arrives, still carrying folder A's page
+    message, *_ = chain["_audio_confirm_core"](
+        chain["_AUDIO_SURFACE_PREVIEW"], view_a, payload, library, discarded, "",
+        app_root=str(tmp_path))
+
+    assert "Nothing was moved" in message, message
+    assert "no longer the current one" in message
+    # The filesystem is the real assertion. Every clip stays where it was; nothing was overwritten.
+    assert sorted(os.listdir(library)) == [], "a retired page moved a clip into the library"
+    assert sorted(os.listdir(discarded)) == [], "a retired page discarded a clip"
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths_a)
+
+
+def test_an_ordinary_confirm_still_sorts(chain, tmp_path):
+    """The not-vacuous half of F-1, and it is load-bearing.
+
+    A liveness gate that refused *everything* would satisfy the negative control above for entirely
+    the wrong reason and make the finding unfalsifiable. Same setup, no handoff: the sort must
+    happen, and the exact filesystem outcome is checked rather than the message.
+    """
+    folder = str(tmp_path / "run")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (library, discarded):
+        os.makedirs(path)
+
+    view, _paths = _publish(chain, folder)
+    message, *_ = chain["_audio_confirm_core"](
+        chain["_AUDIO_SURFACE_PREVIEW"], view, _decide_every_clip(view), library, discarded, "",
+        app_root=str(tmp_path))
+
+    assert "Sorted" in message, message
+    assert sorted(os.listdir(library)) == ["take_part_001.wav"]
+    assert sorted(os.listdir(discarded)) == ["take_part_002.wav", "take_part_003.wav"]
+    assert sorted(os.listdir(folder)) == [], "the reviewed folder should be empty after the sort"
+
+
+def test_a_delayed_proceed_cannot_sweep_a_retired_folder(chain, tmp_path):
+    """F-1 for the other button that moves files.
+
+    Proceed is the dangerous one: it carries the operator's agreement to discard **unmarked** clips,
+    so a stale Proceed would sweep a folder they had navigated away from. It routes through the same
+    core, and this pins that the gate covers it -- including with a signature that would otherwise
+    match, because the signature is a change detector and must authorise nothing on a dead page.
+    """
+    folder_a = str(tmp_path / "run_A")
+    folder_b = str(tmp_path / "run_B")
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (folder_b, library, discarded):
+        os.makedirs(path)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+
+    view_a, paths_a = _publish(chain, folder_a)
+    # keep one, leave the rest unmarked -> the sweep gate arms a signature
+    keep_only = json.dumps({"decisions": {view_a["entries"][0].clip_id: "SELECTED"}})
+    gate_message, _v, _g, _c, signature, show_gate, did_sort = chain["_audio_confirm_core"](
+        chain["_AUDIO_SURFACE_PREVIEW"], view_a, keep_only, library, discarded, "",
+        app_root=str(tmp_path))
+    assert show_gate and not did_sort and signature, gate_message
+
+    chain["press"](_record(folder_b, clips=1))
+
+    message, *_ = chain["_audio_confirm_core"](
+        chain["_AUDIO_SURFACE_PREVIEW"], view_a, keep_only, library, discarded, signature,
+        app_root=str(tmp_path))
+    assert "Nothing was moved" in message, message
+    assert sorted(os.listdir(discarded)) == [], "an armed sweep survived the retirement"
+    assert sorted(os.listdir(library)) == []
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths_a)
+
+
+def test_the_retired_page_stops_being_servable_over_the_media_route(chain, tmp_path):
+    """F-2. The page's media authority must die with the page.
+
+    Before the correction the retired folder's clips stayed fetchable after the handoff: the
+    retirement wrote a widget value and revoked nothing, so `resolve` still answered. `revoke_owner`
+    also **clears the page's clip map**, which is why one revocation closes both the decision path
+    and the HTTP path instead of needing two mechanisms.
+    """
+    folder_a = str(tmp_path / "run_A")
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    view_a, _paths = _publish(chain, folder_a)
+    registry = chain["_registry"]
+    clip_id = view_a["entries"][0].clip_id
+
+    # servable before
+    assert registry.resolve(view_a["session"], view_a["page"], clip_id) is not None
+
+    chain["press"](_record(folder_b, clips=1))
+
+    with pytest.raises(clips.Refusal) as refused:
+        registry.resolve(view_a["session"], view_a["page"], clip_id)
+    assert refused.value.status == 403
+
+
+def test_a_refused_handoff_revokes_nothing(chain, tmp_path):
+    """The asymmetry, now asserted against the registry rather than against widget values.
+
+    A mis-press must not cost an operator the page they were working on -- and that now means their
+    media and decision authority, not just their on-screen grid.
+    """
+    folder_a = str(tmp_path / "run_A")
+    view_a, _paths = _publish(chain, folder_a)
+    registry = chain["_registry"]
+    clip_id = view_a["entries"][0].clip_id
+
+    for refused_record in (None, _record(str(tmp_path / "never_existed"))):
+        chain["press"](refused_record)
+        assert registry.resolve(view_a["session"], view_a["page"], clip_id) is not None, \
+            "a refused handoff revoked the operator's live page"
+        assert chain["_audio_page_is_live"](chain["_AUDIO_SURFACE_PREVIEW"], view_a), \
+            "a refused handoff made the live page read as retired"
+
+
+def test_the_liveness_gate_asks_the_registry_and_nothing_else(gui_tree: ast.Module):
+    """Structural, so the gate cannot quietly become a widget check again.
+
+    `_audio_page_is_live` must read the surface's own registry. A gate that consulted the view, a
+    widget or a module-level flag would be the second notion of "the current page" that
+    `.claude/rules/clips-preview.md` forbids, and would fail for the same reason the first attempt
+    did.
+    """
+    body = ast.unparse(_func(gui_tree, "_audio_page_is_live"))
+    assert "surface.registry.page_entries" in body, body
+    assert "fork_clips.Refusal" in body
+    for forbidden in ("gr.update", "_audio_render", "os.path", "ScanCoordinator", "global "):
+        assert forbidden not in body, f"the liveness gate reaches {forbidden}"
+
+    retire = ast.unparse(_func(gui_tree, "_audio_retire_page"))
+    assert "surface.registry.revoke_owner" in retire, retire
+    assert "_audio_owner" in retire
+    for forbidden in ("new_session", "publish_page", "os.remove", "os.rename", "sort_clips"):
+        assert forbidden not in retire, f"the retirement reaches {forbidden}"
+
+
+def test_the_gate_runs_before_anything_is_merged_validated_or_moved(gui_tree: ast.Module):
+    """Order is the contract. A dead page must not even be reasoned about."""
+    body = ast.unparse(_func(gui_tree, "_audio_confirm_core"))
+    gate = body.index("_audio_page_is_live")
+    for later in ("_audio_merge_payload", "plan_sort", "validate_destinations", "_audio_sort"):
+        assert gate < body.index(later), f"{later} runs before the liveness gate"
+    assert "AUDIO_PAGE_RETIRED_TEXT" in body
+
+
+def test_the_retirement_revokes_before_it_repaints(gui_tree: ast.Module):
+    """The repaint is the slow part to reach the browser; authority must be gone immediately.
+
+    Asserted on statement order inside the function, because the two are not interchangeable: a
+    revocation issued after the response is assembled leaves a window in which the page is still
+    actionable.
+    """
+    func = _func(gui_tree, "_audio_handoff_retire_review")
+    statements = [ast.unparse(node) for node in func.body
+                  if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Constant)]
+    assert statements, "the function body is only a docstring"
+    assert "_audio_retire_page" in statements[0], statements
+    assert "_audio_preview_outputs" in statements[-1], statements
 
 
 def test_no_registration_anywhere_still_points_at_a_removed_handler(gui_tree: ast.Module):
