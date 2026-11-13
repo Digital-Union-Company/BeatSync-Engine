@@ -20,6 +20,65 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-13 (R15-C / F-5: a stale page turn republished the folder the operator left)
+
+**The F-3 fence below was threaded into the page turn as well, and there it could never work.** The
+epoch answers *"has a retirement happened since I read it?"*, which is the right question for a
+scan. A page turn reads it when the turn runs — **after** the handoff that retired its page — so the
+comparison matched and the stale page came straight back live.
+
+Measured on `cd2449ed`, the merged main, with the F-3 fence present and working. Four orderings,
+**two of them with no threading at all**, because a queued Gradio event normally runs after the one
+before it has finished:
+
+| ordering | stale turn published | Confirm on it |
+|---|---|---|
+| `Next` after a completed handoff | `Page 2 of 2.` — live page, 1 servable tile | `✅ Sorted all 1 clip(s).` — 1 real file left folder A |
+| `Previous` after a completed handoff | `Page 1 of 2.` — live page, 2 servable tiles | `✅ Sorted all 2 clip(s).` — 2 real files left folder A |
+| `Next` suspended mid-handler on a barrier | same | same |
+| `Previous` suspended mid-handler on a barrier | same | same |
+
+A **fifth** ordering — suspended between the fence and the mint — was already safe via the epoch,
+which is exactly why the hole survived review: the one interleaving a reviewer reaches for was the
+one that was covered.
+
+**The correction asks the right question rather than the same question earlier.**
+`ClipRegistry.new_session` gained `expected_page`, compared in the same locked step that mints via
+the private `_require_live_page`, so a publication that **replaces** a page is admitted only while
+the page it replaces is still the owner's live one. One question per path, and neither parameter is
+derived inside `gui.py`:
+
+```
+Scan              expected_epoch only   -- no source page exists to ask about
+page turn         expected_page only    -- a continuation; the epoch cannot see its own retirement
+post-sort rescan  expected_epoch only   -- its source page was deliberately claimed a moment ago
+```
+
+`expected_page` defaults to `None`, so every Clips Preview call site is byte-identical. No new
+coordinator, lock, thread or second notion of "the current page"; `_require_live_page` is private
+and called only from `new_session`, because a public entry point would invite exactly the
+check-then-act pattern F-3 and F-4 were. The turn's `_audio_page_epoch` read is **removed** rather
+than kept as defence in depth — it is a comparison that always matches, which reads as a fence and
+is not one.
+
+One consequence worth stating: the fence makes a turn **single-use**, so a double-clicked `Next`
+carrying the same stale view is refused rather than revoking the live page its predecessor just
+published. That is strictly better than the old behaviour, under which whichever response arrived
+last decided what the operator saw and the loser's grid answered `403` on every tile.
+
+**Verification.** 26 new tests, **19 of which fail against `cd2449ed`**; the 7 that pass are the six
+positive controls plus the already-safe ordering, so nothing passes for the wrong reason. The
+behavioural proof is tree-agnostic — one harness run against both trees, measuring real files moving
+on the baseline and not on the candidate — and all six positive controls are **byte-identical**
+between the two trees: ordinary paging in both directions, an edge press that publishes nothing and
+therefore retires nothing, a scan started after a handoff, a refused handoff, a second browser
+owner, and the re-scan after a successful sort. One draft of the stale-Confirm test passed against
+the baseline for the wrong reason — an empty payload trips the sweep gate rather than page authority
+— and now decides every clip on the page it is given.
+
+Full contract: `.claude/rules/audio-review.md` ("F-5: the epoch is the wrong question for a PAGE
+TURN").
+
 ### Fixed — 2026-11-13 (R15-C / F-3 and F-4: two lifecycle races that moved files)
 
 **Revoking the page was necessary and was not sufficient.** R15-C's retirement revokes the owner's
