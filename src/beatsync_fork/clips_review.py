@@ -281,7 +281,8 @@ class ClipRegistry:
             return self._epochs.get(key, 0)
 
     def new_session(self, owner: Any, scan_id: str = "",
-                    expected_epoch: int | None = None) -> str:
+                    expected_epoch: int | None = None,
+                    expected_page: tuple | None = None) -> str:
         """Open a review session for ``owner``, revoking that owner's previous sessions only.
 
         [FORK] Digital-Union (R15-C / F-3) ``expected_epoch``: refuse `409 superseded_scan` if the
@@ -290,11 +291,32 @@ class ClipRegistry:
         between the two -- which is the whole point, and what an equivalent check outside this
         method could not promise. ``None`` means "do not care" and leaves every pre-existing call
         site behaving exactly as before.
+
+        [FORK] Digital-Union (R15-C / F-5) ``expected_page``: refuse `409 superseded_page` unless
+        ``(session_id, page_token)`` is **still this owner's live page**. It answers a different
+        question from ``expected_epoch`` and neither subsumes the other:
+
+        * the epoch answers *"has a retirement happened since I read it?"*, which is the right
+          question for a **new** publication -- a Scan has no source page, so there is nothing else
+          to ask about;
+        * this answers *"is the page I am replacing still authoritative?"*, which is the only
+          question that means anything for a **continuation** of an existing review -- a page turn.
+
+        An epoch read *after* the retirement matches, so the epoch cannot fence a turn at all:
+        measured on `cd2449ed`, a Next carrying folder A's view published A as a live page with
+        tiles after a handoff to folder B, and a Confirm on it moved real files. Both page-turn
+        directions, and with no barrier -- the handoff simply finished first, which is what a queued
+        Gradio event normally does.
+
+        Every failure raises the **one** reason, exactly as :meth:`claim_page` does: a caller cannot
+        tell "retired" from "never existed" and does not need to.
         """
         key = _require_owner(owner)
         with self._lock:
             if expected_epoch is not None and self._epochs.get(key, 0) != int(expected_epoch):
                 raise Refusal(409, "superseded_scan")
+            if expected_page is not None:
+                self._require_live_page(key, expected_page)
             sessions = self._owners.get(key)
             if sessions is None:
                 sessions = OrderedDict()
@@ -314,6 +336,39 @@ class ClipRegistry:
                 _, old = sessions.popitem(last=False)
                 self._mark_revoked(old)
             return session_id
+
+    def _require_live_page(self, owner_key: str, expected_page: Any) -> None:
+        """Raise `409 superseded_page` unless ``expected_page`` is still ``owner_key``'s live page.
+
+        [FORK] Digital-Union (R15-C / F-5). **Called with ``self._lock`` already held**, by
+        :meth:`new_session` and only by it, which is the entire reason this is a separate method
+        rather than a public one: the check has to be atomic with the mint it guards, and a public
+        entry point would invite exactly the check-then-act call pattern that F-3 and F-4 were.
+
+        The owner key is the caller's own resolved owner, and the lookup goes through
+        ``self._owners[owner_key]`` rather than ``self._session_owner``, so one browser session can
+        never present another's tokens to mint a page of its own -- the session simply is not in its
+        owner's map. ``revoke_owner`` removes that map outright, so a retired owner answers here
+        before any page is examined.
+
+        Deliberately total: a malformed, absent or empty pair is **not** live. A view carrying no
+        tokens is the empty view, and treating it as live would re-open the hole -- the same stance
+        ``_audio_page_is_live`` takes in ``gui.py``.
+        """
+        try:
+            session_id, page_token = expected_page
+        except (TypeError, ValueError):
+            raise Refusal(409, "superseded_page") from None
+        if not (_valid_token(session_id) and _valid_token(page_token)):
+            raise Refusal(409, "superseded_page")
+        session = (self._owners.get(owner_key) or {}).get(session_id)
+        if session is None or session.revoked:
+            raise Refusal(409, "superseded_page")
+        page = session.pages.get(page_token)
+        if page is None or page.revoked:
+            raise Refusal(409, "superseded_page")
+        if not secrets.compare_digest(page.page_token, page_token):
+            raise Refusal(409, "superseded_page")
 
     def _mark_revoked(self, session: Session) -> None:
         session.revoked = True

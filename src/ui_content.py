@@ -2384,6 +2384,19 @@ AUDIO_PAGE_SUPERSEDED_NOTE = (
     "which happens when “Open results in Media Library” loads a different folder meanwhile.\n"
     "Nothing was moved, renamed or deleted. Press Scan Folder to read the folder now in the box."
 )
+#: [FORK] Digital-Union (R15-C / F-5): a PAGE TURN whose source page is no longer the live one.
+#:
+#: Separate from the note above on purpose. That one says the page "was replaced while it was being
+#: read", which describes a scan overtaken mid-walk; the measured page-turn ordering is the other
+#: way round -- the handoff had already finished before the turn was handled at all -- so reusing it
+#: would have described the wrong sequence of events to the operator. Both are truthful about the
+#: thing that matters, which is that nothing moved.
+AUDIO_PAGE_TURN_SUPERSEDED_NOTE = (
+    "\n\n⚠️  That page was not opened: the review page it came from is no longer the current one.\n"
+    "It was replaced before this request was handled, which happens when “Open results in Media "
+    "Library” loads a different folder.\n"
+    "Nothing was moved, renamed or deleted. Press Scan Folder to review the folder now in the box."
+)
 AUDIO_PAGE_RETIRED_TEXT = (
     "⚠️  Nothing was moved — this review page is no longer the current one.\n"
     "It was replaced while that press was on its way to the server, which happens when "

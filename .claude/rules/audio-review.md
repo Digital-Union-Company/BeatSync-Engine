@@ -313,11 +313,17 @@ current page' beside it"*:
 - **The refusal paths revoke nothing**, and that is asserted against the registry rather than
   against widget values.
 
-## The two races that revoking alone did not close  [R15-C / F-3, F-4]
+## The three lifecycle holes that revoking alone did not close  [R15-C / F-3, F-4, F-5]
 
-**Revoking is necessary and was not sufficient.** Both of the following were reproduced on
-`534cdb6f` with threading barriers — never sleeps, never a probabilistic race — and **both moved
-real files.**
+**Revoking is necessary and was not sufficient.** F-3 and F-4 were reproduced on `534cdb6f` with
+threading barriers — never sleeps, never a probabilistic race — and **both moved real files.** F-5
+was found afterwards, in the very fence that closed F-3, and needed **no barrier at all**.
+
+**The one sentence that generalises all three: ask the authority the question that the thing you
+are about to do actually depends on, in the same locked step that does it.** Each hole was a
+different way of getting that wrong — a read instead of a claim (F-4), a check beside the mint
+instead of inside it (F-3), and the *right* check in the right place asking the *wrong question*
+(F-5).
 
 ### F-4: a read cannot gate a mutation
 
@@ -374,6 +380,66 @@ So the fence lives **inside the registry**, as a per-owner **page epoch**:
 authority — the registry that already owns pages — and one lock. A scan the operator starts *after*
 a handoff reads the new epoch and behaves entirely normally; that positive control is what stops
 "nothing publishes" from passing for the wrong reason.
+
+### F-5: the epoch is the wrong question for a PAGE TURN
+
+**The fence above was threaded into the page turn as well, and there it could never work.** The
+epoch answers *"has a retirement happened since I read it?"* — which is the right question for a
+scan, because a scan reads it before walking the folder and a retirement during the walk moves it
+underneath. **A page turn reads it when the turn runs, which is after the handoff that retired its
+page**, so the comparison matched and the stale page came straight back live.
+
+Measured on `cd2449ed` — the merged main, with the F-3 fence present and working — in four
+orderings, **two of them with no threading at all**, because a queued Gradio event normally runs
+after the one before it has finished:
+
+```
+Next  after a completed handoff   ->  "Page 2 of 2."   live page, 1 tile   ->  Confirm moved 1 file
+Prev  after a completed handoff   ->  "Page 1 of 2."   live page, 2 tiles  ->  Confirm moved 2 files
+Next  suspended mid-handler       ->  same                                ->  same
+Prev  suspended mid-handler       ->  same                                ->  same
+```
+
+Each published folder A as a live registry page with servable tiles while the folder box named B,
+and a Confirm on it reported `✅ Sorted all N clip(s).` A **fifth** ordering — suspended between
+the fence and the mint — was already safe via the epoch, which is precisely why the hole survived
+review: the one interleaving a reviewer reaches for was the one that was covered.
+
+So a publication that **replaces** a page is fenced on that page, not on the epoch.
+`new_session(expected_page=(session, page))` compares it in the same locked step that mints, via the
+private `_require_live_page`. Exactly one question per path, and none of them is optional:
+
+```
+Scan              expected_epoch only   -- no source page exists to ask about
+page turn         expected_page only    -- a continuation; the epoch cannot see its own retirement
+post-sort rescan  expected_epoch only   -- its source page was deliberately claimed a moment ago
+```
+
+Four things not to undo:
+
+- **Do not put `source_page=` on the scan or the post-sort re-scan.** The re-scan's source page is
+  retired by the claim that precedes it by design, so a source-page fence there refuses the
+  publication the operator is waiting for immediately after a successful Confirm. A structural test
+  pins that only the page turn passes it.
+- **Do not restore the turn's `_audio_page_epoch` read "for defence in depth".** It is not defence;
+  it is a comparison that always matches, which reads as a fence and is not one. A test pins its
+  absence from the turn and its presence in the two callers that genuinely need it.
+- **The pair is passed even when it is empty.** A view with no tokens is not a live page, and
+  treating the empty view as one is the same hole in a different place — the stance
+  `_audio_page_is_live` already takes.
+- **`_require_live_page` stays private and is called only from `new_session`.** A public entry
+  point would invite exactly the check-then-act call pattern F-3 and F-4 were; a test pins the call
+  graph.
+
+The fence also makes a turn **single-use**: minting through a page retires it, so a double-clicked
+Next carrying the same stale view is refused rather than revoking the live page its predecessor just
+published. That is strictly better than the old behaviour, under which whichever response arrived
+last decided what the operator saw and the loser's grid answered `403` on every tile.
+
+**Six positive controls, all byte-identical before and after**, which is what establishes the fence
+is inert on every legitimate path: ordinary paging in both directions, an edge press ("Already on
+the last page") that publishes and therefore retires nothing, a scan started after a handoff, a
+refused handoff, a second browser owner, and the re-scan after a successful sort.
 
 `loaded_text(record, destination=...)` names the section. The default stays `Video Review` so R11's
 wording and its pinned tests are byte-identical; the audio caller passes `DESTINATION_AUDIO_REVIEW`.

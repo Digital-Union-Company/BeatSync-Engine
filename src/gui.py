@@ -10447,17 +10447,24 @@ def _audio_owner(request):
         getattr(request, 'session_hash', None) if request is not None else None)
 
 
-def _audio_publish(surface, owner, paths, page_index, page_size, expected_epoch=None):
+def _audio_publish(surface, owner, paths, page_index, page_size, expected_epoch=None,
+                   expected_page=None):
     """Mint a fresh session and one page of opaque clip ids for `paths`.
 
     Returns `(session_id, page_token, entries, start)`. This revokes the owner's previous session
     **on this surface only**, which is correct -- they have finished with the page it served -- and
     is why the two surfaces hold separate registries.
+
+    [FORK] Digital-Union (R15-C / F-5): `expected_page` is the **source page** a publication is
+    replacing, or `None` when there is not one. Both fences are handed straight to `new_session`,
+    which compares them inside the lock that mints -- neither is checked here, for the reason
+    `_audio_load_view` states.
     """
     total = len(paths)
     start, count = fork_audio_review.page_slice(page_index, total, page_size)
     frozen = fork_audio_review.freeze_paths(paths, start, count)
-    session_id = surface.registry.new_session(owner, expected_epoch=expected_epoch)
+    session_id = surface.registry.new_session(owner, expected_epoch=expected_epoch,
+                                              expected_page=expected_page)
     page_token, entries = surface.registry.publish_page(
         owner, session_id, int(fork_audio_review.resolve_page(page_index, total, page_size)),
         frozen, servable=fork_audio_review.SERVABLE_SUFFIXES)
@@ -10652,13 +10659,26 @@ def _audio_render(surface, view) -> tuple:
 
 
 def _audio_load_view(surface, request, paths, root, recursive, page_index, page_size,
-                     spans=None, decisions=None, names=None, epoch=None):
+                     spans=None, decisions=None, names=None, epoch=None, source_page=None):
     """Publish one page of `paths` and build the view. Returns `(view, note)`.
 
     [FORK] Digital-Union (R15-C / F-3): `epoch` fences the publication. This is the **only**
     function that publishes a page, so threading it here covers all three paths that can produce one
     -- Scan, a page turn, and the re-scan a successful sort performs. `None` means "unfenced" and is
     what any caller outside an event gets.
+
+    [FORK] Digital-Union (R15-C / F-5): `source_page` is the `(session, page)` pair this publication
+    **replaces**, for a caller that is continuing an existing review rather than starting one. It is
+    the fence a **page turn** needs, and the epoch is not: a turn reads the epoch after the
+    retirement it should be refused by, so the comparison matches and the stale page comes back
+    live. Exactly one of the two is the right question per path, which is why both are parameters
+    and neither is derived here:
+
+    ```
+    Scan              epoch only        -- no source page exists
+    page turn         source page only  -- a continuation; the epoch cannot see its own retirement
+    post-sort rescan  epoch only        -- its source page was deliberately claimed and retired
+    ```
 
     It is deliberately **not checked here.** It is handed to `new_session`, which compares it inside
     the lock that mints the session: a check in this function would be one more check-then-act, and
@@ -10691,12 +10711,17 @@ def _audio_load_view(surface, request, paths, root, recursive, page_index, page_
                        f"({refusal.reason}). Reload the page.")
     try:
         session_id, page_token, entries, start = _audio_publish(
-            surface, owner, paths, page_index, resolved_size, expected_epoch=epoch)
+            surface, owner, paths, page_index, resolved_size, expected_epoch=epoch,
+            expected_page=source_page)
     except fork_clips.Refusal as refusal:
         if refusal.reason == 'superseded_scan':
             # [FORK] Digital-Union (R15-C / F-3). The owner's page was retired while this was being
             # prepared -- in practice by their own handoff. Nothing was published.
             return empty, AUDIO_PAGE_SUPERSEDED_NOTE
+        if refusal.reason == 'superseded_page':
+            # [FORK] Digital-Union (R15-C / F-5). The page this turn was continuing from had already
+            # been retired. Nothing was published, and the note says so in the right tense.
+            return empty, AUDIO_PAGE_TURN_SUPERSEDED_NOTE
         return empty, (f"\n\u26a0\ufe0f  The preview gallery could not be opened ({refusal.reason}). "
                        f"The files are on disk either way.")
 
@@ -11059,13 +11084,24 @@ def _audio_preview_turn(payload, step, page_size, view, request):
         recursive=current.get('recursive', True), page_index=target, page_size=resolved_size,
         spans=current.get('spans'), decisions=current.get('decisions'),
         names=current.get('names'),
-        # [FORK] Digital-Union (R15-C / F-3): a page turn publishes a page, so it is fenced for
-        # exactly the same reason a scan is -- a turn that landed after a handoff would otherwise
-        # republish the folder the operator has left.
-        epoch=_audio_page_epoch(_AUDIO_SURFACE_PREVIEW, request))
-    if note == AUDIO_PAGE_SUPERSEDED_NOTE:
-        # [FORK] Digital-Union (R15-C / F-3): same reasoning as the scan. Announcing "Page 2 of 7"
-        # for a page that was never published would be the misleading half of the old behaviour.
+        # [FORK] Digital-Union (R15-C / F-5): the fence is the page this turn is REPLACING, not a
+        # freshly read epoch. A turn is a continuation of a review session, so the question that
+        # means something is "is the page I came from still the live one?" -- and that is the only
+        # question a retirement can be made to answer in time.
+        #
+        # This used to read `epoch=_audio_page_epoch(...)` here, and that could never work: the
+        # epoch is read when the turn runs, which is AFTER the handoff that retired the page, so it
+        # matched and the stale page was republished live. Measured on `cd2449ed` with no barrier at
+        # all -- the handoff simply finished first, as a queued Gradio event normally does -- in both
+        # directions, and a Confirm on the republished page moved real files out of folder A.
+        #
+        # The pair is passed even when it is empty: a view with no tokens is not a live page, and
+        # treating the empty view as one is the same hole in a different place.
+        source_page=(current.get('session') or '', current.get('page') or ''))
+    if note in (AUDIO_PAGE_SUPERSEDED_NOTE, AUDIO_PAGE_TURN_SUPERSEDED_NOTE):
+        # [FORK] Digital-Union (R15-C / F-3, F-5): same reasoning as the scan. Announcing
+        # "Page 2 of 7" for a page that was never published would be the misleading half of the old
+        # behaviour.
         return (note.strip(), turned)
     return (f"Page {turned.get('page_index', 1)} of "
             f"{fork_audio_review.page_count(len(paths), resolved_size)}." + note, turned)

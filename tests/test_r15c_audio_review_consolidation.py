@@ -202,6 +202,7 @@ def chain(gui_tree: ast.Module) -> dict:
         "AUDIO_HANDOFF_MISSING_TEXT": ui_content.AUDIO_HANDOFF_MISSING_TEXT,
         "AUDIO_PAGE_RETIRED_TEXT": ui_content.AUDIO_PAGE_RETIRED_TEXT,
         "AUDIO_PAGE_SUPERSEDED_NOTE": ui_content.AUDIO_PAGE_SUPERSEDED_NOTE,
+        "AUDIO_PAGE_TURN_SUPERSEDED_NOTE": ui_content.AUDIO_PAGE_TURN_SUPERSEDED_NOTE,
         "AUDIO_CONFIRM_DISABLED_TEXT": ui_content.AUDIO_CONFIRM_DISABLED_TEXT,
         "AUDIO_SWEEP_GATE_HEADING": ui_content.AUDIO_SWEEP_GATE_HEADING,
         "AUDIO_SWEEP_GATE_PROMPT": ui_content.AUDIO_SWEEP_GATE_PROMPT,
@@ -223,7 +224,9 @@ def chain(gui_tree: ast.Module) -> dict:
                  # [FORK] Digital-Union (R15-C / F-3, F-4): the claim, the epoch reader and the
                  # two real events the lifecycle tests drive end to end.
                  "_audio_claim_page", "_audio_page_epoch", "_audio_preview_scan_report",
-                 "_on_audio_preview_scan", "_on_audio_preview_confirm"):
+                 "_on_audio_preview_scan", "_on_audio_preview_confirm",
+                 # [FORK] Digital-Union (R15-C / F-5): the page-turn path, driven end to end.
+                 "_audio_preview_turn", "_on_audio_preview_prev", "_on_audio_preview_next"):
         exec(ast.unparse(_func(gui_tree, name)), namespace)
     namespace["_registry"] = registry
     namespace["press"] = lambda record: namespace["_on_audio_open_in_library"](record, _Request())
@@ -1294,8 +1297,13 @@ def test_the_epoch_is_compared_inside_the_mint_not_beside_it(gui_tree: ast.Modul
     for forbidden in ("is_current", "_AUDIO_SCANS", "ScanCoordinator"):
         assert forbidden not in load, f"_audio_load_view checks the epoch itself via {forbidden}"
     publish = ast.unparse(_func(gui_tree, "_audio_publish"))
-    assert "new_session(owner, expected_epoch=expected_epoch)" in publish, publish
-    for event in ("_on_audio_preview_scan", "_audio_preview_turn", "_on_audio_preview_confirm"):
+    assert "expected_epoch=expected_epoch" in publish, publish
+    assert "new_session(" in publish and "expected_epoch" in publish.split("new_session(", 1)[1]
+    # [FORK] Digital-Union (R15-C / F-5): `_audio_preview_turn` was in this list and is deliberately
+    # out of it now. The epoch is the wrong authority for a page turn -- a turn reads it AFTER the
+    # retirement it should be refused by, so the comparison always matched and the stale page came
+    # back live. It fences on its source page instead; see the F-5 section.
+    for event in ("_on_audio_preview_scan", "_on_audio_preview_confirm"):
         assert "_audio_page_epoch" in ast.unparse(_func(gui_tree, event)), event
 
 
@@ -1361,3 +1369,457 @@ def test_neither_correction_holds_a_lock_across_the_filesystem(gui_tree: ast.Mod
         body = ast.unparse(_func(gui_tree, name))
         for forbidden in (".acquire(", "threading.", "_lock"):
             assert forbidden not in body, f"{name} reaches {forbidden}"
+
+
+# =============================================================================================
+# R15-C / F-5: a STALE PAGE TURN could publish a fresh, live page for the folder just left
+#
+# The epoch fence F-3 added covers a SCAN, because a scan reads the epoch before it walks the
+# folder and a retirement landing during the walk moves the epoch underneath it. A PAGE TURN is a
+# different shape and the same fence cannot work for it: the turn reads the epoch when it runs,
+# which is AFTER the handoff that retired its page, so the comparison matches and the stale page
+# comes straight back live.
+#
+# Measured on `cd2449ed` -- the merged main these tests are written against -- in four orderings,
+# two of them with no barrier at all, because a queued Gradio event normally runs after the one
+# before it has finished. Each published folder A as a live page with tiles while the folder box
+# named B, and a Confirm on that page moved real files out of A.
+#
+# The correction asks the right question instead of the same question earlier: `new_session`
+# gained `expected_page`, compared in the same locked step that mints, so a publication that
+# REPLACES a page is admitted only while the page it replaces is still the owner's live one. A
+# scan has no source page and is unchanged; the post-sort re-scan deliberately has none either,
+# because its source page was just claimed.
+# =============================================================================================
+
+#: Three clips at two per page, so Next and Previous are both real turns.
+_TURN_PAGE_SIZE = 2
+#: The PREVIEW handlers return the nine `_audio_preview_outputs` directly, so these indices are
+#: NOT the handoff's 4+9 ones above. Conflating the two reads a page label as a report.
+_TURN_REPORT_AT, _TURN_GALLERY_AT, _TURN_VIEW_AT = 0, 1, 3
+
+
+def _turn_setup(chain, tmp_path, name="run_A"):
+    """A live page 1 of 2 over three real clips, plus the two destination folders."""
+    folder = str(tmp_path / name)
+    library = str(tmp_path / "VoiceLibrary")
+    discarded = str(tmp_path / "Discarded")
+    for path in (library, discarded):
+        os.makedirs(path, exist_ok=True)
+    os.makedirs(folder, exist_ok=True)
+    paths = []
+    for index, clip in enumerate(("take_part_001.wav", "take_part_002.wav",
+                                  "take_part_003.wav"), start=1):
+        target = os.path.join(folder, clip)
+        with open(target, "wb") as handle:
+            handle.write(b"RIFF" + bytes(300 + index))
+        paths.append(target)
+    view, note = chain["_audio_load_view"](
+        chain["_AUDIO_SURFACE_PREVIEW"], _Request(), paths, folder,
+        recursive=False, page_index=1, page_size=_TURN_PAGE_SIZE)
+    assert view["entries"], f"the page did not publish: {note}"
+    return folder, library, discarded, paths, view
+
+
+def _turn(chain, view, library, discarded, step=1):
+    handler = "_on_audio_preview_next" if step > 0 else "_on_audio_preview_prev"
+    return chain[handler]("", _TURN_PAGE_SIZE, library, discarded, view, _Request())
+
+
+def _page_live(chain, view):
+    try:
+        chain["_registry"].page_entries(view.get("session") or "", view.get("page") or "")
+    except clips.Refusal:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------------------------
+# the defect, in both directions, with no barrier at all
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("step,label", [(1, "Next"), (-1, "Previous")])
+def test_f5_a_page_turn_after_a_handoff_publishes_nothing(chain, tmp_path, step, label):
+    """The handoff finishes FIRST, then the stale turn is handled. Plain sequential code.
+
+    This is the ordering a queued Gradio event normally takes, and it is why this needs no
+    threading at all: the turn still carries folder A's view because Gradio handed it its
+    arguments at submit time, and on `cd2449ed` it minted a brand-new live session for A.
+    """
+    folder_a, library, discarded, paths, view = _turn_setup(chain, tmp_path)
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    if step < 0:
+        view = _turn(chain, view, library, discarded, 1)[_TURN_VIEW_AT]
+        assert view["page_index"] == 2
+
+    chain["press"](_record(folder_b, clips=1))
+    out = _turn(chain, view, library, discarded, step)
+
+    assert out[_TURN_VIEW_AT]["entries"] == (), f"{label} published a page for the folder just left"
+    assert not _page_live(chain, out[_TURN_VIEW_AT]), f"{label} minted a live registry session"
+    assert "r7-tile" not in out[_TURN_GALLERY_AT], f"{label} painted tiles for a retired folder"
+    assert "no longer the current one" in out[_TURN_REPORT_AT]
+    assert "Nothing was moved" in out[_TURN_REPORT_AT]
+    # The clips are all still in folder A, which is the only claim that matters.
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths)
+    assert os.listdir(library) == [] and os.listdir(discarded) == []
+
+
+@pytest.mark.parametrize("step,label", [(1, "Next"), (-1, "Previous")])
+def test_f5_a_page_turn_suspended_mid_handler_publishes_nothing(chain, tmp_path, step, label):
+    """The other ordering: the turn is already running when the handoff lands.
+
+    Suspended on an Event inside `_audio_merge_payload`, which is the first thing the turn calls --
+    so the handler has begun and has not yet computed any fence. Deterministic, not a sleep.
+    """
+    folder_a, library, discarded, paths, view = _turn_setup(chain, tmp_path)
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+    if step < 0:
+        view = _turn(chain, view, library, discarded, 1)[_TURN_VIEW_AT]
+
+    in_handler, handoff_done = _barrier_pair()
+    real_merge = chain["_audio_merge_payload"]
+
+    def barrier_merge(current, raw):
+        in_handler.set()
+        assert handoff_done.wait(timeout=30), "the handoff never completed"
+        return real_merge(current, raw)
+
+    chain["_audio_merge_payload"] = barrier_merge
+    thread, box = _run_in_thread(lambda: _turn(chain, view, library, discarded, step))
+    assert in_handler.wait(timeout=30), f"{label} never reached the barrier"
+    chain["press"](_record(folder_b, clips=1))
+    handoff_done.set()
+    thread.join(timeout=60)
+    assert "error" not in box, box.get("error")
+
+    out = box["value"]
+    assert out[_TURN_VIEW_AT]["entries"] == (), f"{label} published a page for the folder just left"
+    assert not _page_live(chain, out[_TURN_VIEW_AT])
+    assert "no longer the current one" in out[_TURN_REPORT_AT]
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths)
+    assert os.listdir(library) == [] and os.listdir(discarded) == []
+
+
+def test_f5_a_turn_suspended_immediately_before_the_mint_publishes_nothing(chain, tmp_path):
+    """The narrowest interleaving: the fence is already computed, the mint has not happened.
+
+    This one was ALREADY safe on `cd2449ed`, via the F-3 epoch -- which is exactly why the hole
+    survived review. It is kept because it is the ordering that proves the comparison is atomic
+    with the mint rather than merely early.
+    """
+    folder_a, library, discarded, paths, view = _turn_setup(chain, tmp_path)
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+
+    at_mint, handoff_done = _barrier_pair()
+    real_mint = chain["_registry"].new_session
+
+    def barrier_mint(owner, scan_id="", **kwargs):
+        at_mint.set()
+        assert handoff_done.wait(timeout=30), "the handoff never completed"
+        return real_mint(owner, scan_id, **kwargs)
+
+    chain["_registry"].new_session = barrier_mint
+    thread, box = _run_in_thread(lambda: _turn(chain, view, library, discarded, 1))
+    assert at_mint.wait(timeout=30), "the turn never reached the mint"
+    chain["press"](_record(folder_b, clips=1))
+    handoff_done.set()
+    thread.join(timeout=60)
+    assert "error" not in box, box.get("error")
+
+    assert box["value"][_TURN_VIEW_AT]["entries"] == ()
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths)
+
+
+def test_f5_a_stale_turn_leaves_no_page_a_later_confirm_could_act_on(chain, tmp_path):
+    """The consequence, stated as the thing that actually hurt: no files move.
+
+    On `cd2449ed` the republished page was live, so a Confirm on it reported
+    `Sorted all N clip(s)` and moved real files out of the folder the operator had left.
+    """
+    folder_a, library, discarded, paths, view = _turn_setup(chain, tmp_path)
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+
+    chain["press"](_record(folder_b, clips=1))
+    stale = _turn(chain, view, library, discarded, 1)[_TURN_VIEW_AT]
+    # EVERY clip on whatever page came back is decided. An empty payload would trip the sweep gate
+    # instead, and nothing would move for a reason that has nothing to do with page authority --
+    # which is a false negative that reads exactly like a pass. It did, on the first draft of this
+    # test: it passed against `cd2449ed`, where the stale page was live and the files DID move once
+    # the payload actually decided them.
+    payload = (_decide_every_clip(stale) if stale.get("entries")
+               else json.dumps({"decisions": {}}))
+    out = chain["_on_audio_preview_confirm"](
+        payload, library, discarded, _TURN_PAGE_SIZE, stale, "", _Request())
+
+    assert "Sorted" not in out[0], out[0]
+    assert sorted(os.listdir(folder_a)) == sorted(os.path.basename(p) for p in paths)
+    assert os.listdir(library) == [] and os.listdir(discarded) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# positive controls -- a fence that refused everything would satisfy the tests above
+# ---------------------------------------------------------------------------------------------
+
+def test_f5_ordinary_page_turning_still_works_in_both_directions(chain, tmp_path):
+    """Forward, past the end, back, and forward again -- every page live and correctly labelled."""
+    folder, library, discarded, _paths, view = _turn_setup(chain, tmp_path)
+
+    out = _turn(chain, view, library, discarded, 1)
+    assert out[_TURN_REPORT_AT].strip() == "Page 2 of 2."
+    assert len(out[_TURN_VIEW_AT]["entries"]) == 1 and _page_live(chain, out[_TURN_VIEW_AT])
+
+    edge = _turn(chain, out[_TURN_VIEW_AT], library, discarded, 1)
+    assert "Already on the last page" in edge[_TURN_REPORT_AT]
+
+    back = _turn(chain, edge[_TURN_VIEW_AT], library, discarded, -1)
+    assert back[_TURN_REPORT_AT].strip() == "Page 1 of 2."
+    assert len(back[_TURN_VIEW_AT]["entries"]) == 2 and _page_live(chain, back[_TURN_VIEW_AT])
+
+    again = _turn(chain, back[_TURN_VIEW_AT], library, discarded, 1)
+    assert again[_TURN_REPORT_AT].strip() == "Page 2 of 2."
+    assert _page_live(chain, again[_TURN_VIEW_AT])
+
+
+def test_f5_an_edge_press_does_not_retire_the_page_it_refused_to_turn(chain, tmp_path):
+    """"Already on the last page" publishes nothing, so it must also revoke nothing.
+
+    The early return happens before any fence is computed, and that is the point: a press that
+    changes nothing must leave the operator exactly where they were -- the discipline the whole
+    subsystem already follows for refusals.
+    """
+    folder, library, discarded, _paths, view = _turn_setup(chain, tmp_path)
+    page_two = _turn(chain, view, library, discarded, 1)[_TURN_VIEW_AT]
+    edge = _turn(chain, page_two, library, discarded, 1)
+    assert "Already on the last page" in edge[_TURN_REPORT_AT]
+    assert _page_live(chain, page_two), "an edge press retired the live page"
+    assert edge[_TURN_VIEW_AT]["page"] == page_two["page"]
+
+
+def test_f5_a_scan_the_operator_starts_after_a_handoff_is_entirely_normal(chain, tmp_path):
+    """A scan has no source page, so the new fence must not touch it -- and paging then works."""
+    folder_a, library, discarded, _paths, _view = _turn_setup(chain, tmp_path)
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    for clip in ("b_001.wav", "b_002.wav", "b_003.wav"):
+        with open(os.path.join(folder_b, clip), "wb") as handle:
+            handle.write(b"RIFF" + clip.encode())
+
+    chain["press"](_record(folder_b, clips=3))
+    out = chain["_on_audio_preview_scan"](
+        folder_b, False, _TURN_PAGE_SIZE, library, discarded, {}, _Request())
+    assert len(out[_TURN_VIEW_AT]["entries"]) == 2, out[_TURN_REPORT_AT]
+    assert _page_live(chain, out[_TURN_VIEW_AT])
+    assert "Found 3 audio clip(s)" in out[_TURN_REPORT_AT]
+
+    turned = _turn(chain, out[_TURN_VIEW_AT], library, discarded, 1)
+    assert turned[_TURN_REPORT_AT].strip() == "Page 2 of 2."
+    assert _page_live(chain, turned[_TURN_VIEW_AT])
+
+
+def test_f5_a_refused_handoff_leaves_the_page_turnable(chain, tmp_path):
+    """A mis-press must not cost the operator the review they were in the middle of."""
+    folder, library, discarded, _paths, view = _turn_setup(chain, tmp_path)
+    chain["press"](_record(str(tmp_path / "never_existed"), clips=1))
+    assert _page_live(chain, view), "a refused handoff retired the page"
+    out = _turn(chain, view, library, discarded, 1)
+    assert out[_TURN_REPORT_AT].strip() == "Page 2 of 2."
+    assert _page_live(chain, out[_TURN_VIEW_AT])
+
+
+def test_f5_the_fence_is_per_owner(chain, tmp_path):
+    """Owner B's handoff must not fence owner A's page turn."""
+    folder_a, library, discarded, _paths, view_a = _turn_setup(chain, tmp_path)
+    folder_b = str(tmp_path / "run_B")
+    os.makedirs(folder_b)
+    with open(os.path.join(folder_b, "other_001.wav"), "wb") as handle:
+        handle.write(b"RIFF")
+
+    other = type("OtherRequest", (), {})()
+    real_owner = chain["_audio_owner"]
+    chain["_audio_owner"] = lambda request: ("owner-B" if request is other
+                                             else real_owner(request))
+    chain["_on_audio_open_in_library"](_record(folder_b, clips=1), other)
+
+    out = _turn(chain, view_a, library, discarded, 1)
+    assert out[_TURN_REPORT_AT].strip() == "Page 2 of 2.", out[_TURN_REPORT_AT]
+    assert _page_live(chain, out[_TURN_VIEW_AT]), "another owner's handoff fenced this turn"
+
+
+def test_f5_a_successful_sort_still_republishes_the_folder(chain, tmp_path):
+    """The post-sort re-scan has NO source page -- its own was claimed -- so it must stay unfenced.
+
+    This is the control that would catch `expected_page` being threaded into the wrong caller: the
+    claim retires the page a moment earlier, so a source-page fence there would refuse the re-scan
+    and the operator would lose the folder immediately after a successful Confirm.
+    """
+    folder, library, discarded, paths, view = _turn_setup(chain, tmp_path)
+    out = chain["_on_audio_preview_confirm"](
+        _decide_every_clip(view), library, discarded, 24, view, "", _Request())
+    assert "Sorted all 2 clip(s)." in out[0], out[0]
+    # The third clip was never on page 1, so it is still there and is re-published by the re-scan.
+    assert len(out[_TURN_VIEW_AT]["entries"]) == 1, out[0]
+    assert _page_live(chain, out[_TURN_VIEW_AT])
+    assert sorted(os.listdir(library)) == ["take_part_001.wav"]
+    assert sorted(os.listdir(discarded)) == ["take_part_002.wav"]
+
+
+# ---------------------------------------------------------------------------------------------
+# the registry contract, and the structural promise that nothing new was invented
+# ---------------------------------------------------------------------------------------------
+
+def test_f5_expected_page_is_compared_inside_the_lock_that_mints():
+    """A direct registry test: the live page admits, every other shape refuses."""
+    registry = clips.ClipRegistry()
+    session = registry.new_session("owner")
+    page, _entries = registry.publish_page("owner", session, 1, [])
+
+    # The live pair admits, and minting through it retires it -- so the same pair cannot be used
+    # twice, which is what makes a turn single-use rather than replayable.
+    second = registry.new_session("owner", expected_page=(session, page))
+    assert second != session
+    with pytest.raises(clips.Refusal) as refused:
+        registry.new_session("owner", expected_page=(session, page))
+    assert refused.value.reason == "superseded_page"
+    assert refused.value.status == 409
+
+
+@pytest.mark.parametrize("pair", [
+    ("", ""), (None, None), "not-a-pair", (), ("only-one",),
+    ("wXy-not-a-real-session-token", "nor-is-this-one"),
+])
+def test_f5_a_malformed_or_absent_source_page_is_not_live(pair):
+    """Total by contract. The empty view is the one that matters: it carries no tokens, and
+    treating it as live is the same hole in a different place."""
+    registry = clips.ClipRegistry()
+    with pytest.raises(clips.Refusal) as refused:
+        registry.new_session("owner", expected_page=pair)
+    assert refused.value.reason == "superseded_page"
+
+
+def test_f5_one_owner_cannot_mint_through_another_owners_page():
+    """The lookup goes through the owner's own session map, so cross-owner tokens are not found."""
+    registry = clips.ClipRegistry()
+    session = registry.new_session("owner-A")
+    page, _entries = registry.publish_page("owner-A", session, 1, [])
+    with pytest.raises(clips.Refusal) as refused:
+        registry.new_session("owner-B", expected_page=(session, page))
+    assert refused.value.reason == "superseded_page"
+    # ... and owner A's page is untouched by the attempt.
+    assert registry.page_entries(session, page) == []
+
+
+def test_f5_retiring_an_owner_refuses_their_pending_page_turn():
+    """`revoke_owner` removes the owner's session map outright, which answers before any page."""
+    registry = clips.ClipRegistry()
+    session = registry.new_session("owner")
+    page, _entries = registry.publish_page("owner", session, 1, [])
+    registry.revoke_owner("owner")
+    with pytest.raises(clips.Refusal) as refused:
+        registry.new_session("owner", expected_page=(session, page))
+    assert refused.value.reason == "superseded_page"
+
+
+def test_f5_expected_page_defaults_to_none_so_every_other_call_site_is_unchanged():
+    """The default is what keeps Clips Preview and the scan path byte-identical."""
+    import inspect
+    signature = inspect.signature(clips.ClipRegistry.new_session)
+    assert signature.parameters["expected_page"].default is None
+    assert signature.parameters["expected_epoch"].default is None
+    registry = clips.ClipRegistry()
+    assert registry.new_session("owner")          # no fence, no refusal
+    assert registry.new_session("owner", "scan-id")
+
+
+def test_f5_only_the_page_turn_passes_a_source_page(gui_tree):
+    """Structural. The scan and the post-sort re-scan must stay epoch-only.
+
+    A `source_page=` on either of those would refuse the publication the operator is waiting for --
+    the re-scan's source page is claimed a moment earlier by design.
+    """
+    passing = set()
+    for node in ast.walk(gui_tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_audio_load_view"):
+            continue
+        if any(kw.arg == "source_page" for kw in node.keywords):
+            passing.add(node.lineno)
+    turn = _func(gui_tree, "_audio_preview_turn")
+    inside = {line for line in passing
+              if turn.lineno <= line <= (turn.end_lineno or turn.lineno)}
+    assert inside, "_audio_preview_turn does not fence its publication on its source page"
+    assert passing == inside, (
+        f"source_page= is passed outside the page turn, at lines {sorted(passing - inside)}")
+
+
+def test_f5_the_page_turn_no_longer_fences_on_a_freshly_read_epoch(gui_tree):
+    """The epoch read WAS the defect here: it is taken after the retirement it should see.
+
+    Pinned so it cannot come back as "defence in depth". It is not defence -- it is a comparison
+    that always matches, which reads as a fence and is not one.
+    """
+    body = ast.unparse(_func(gui_tree, "_audio_preview_turn"))
+    assert "_audio_page_epoch" not in body, (
+        "_audio_preview_turn reads the owner epoch again; it cannot see its own retirement")
+    # ... while the two callers that genuinely need it keep it.
+    for name in ("_on_audio_preview_scan", "_on_audio_preview_confirm"):
+        assert "_audio_page_epoch" in ast.unparse(_func(gui_tree, name)), name
+
+
+def _body_without_docstring(node: ast.FunctionDef) -> str:
+    """Source of a function with its docstring removed.
+
+    Load-bearing for every substring ban below. `_require_live_page`'s docstring has to say that it
+    runs with `self._lock` already held -- that is the single most important fact about it -- and a
+    naive substring ban then fires on the prose explaining the rule it is enforcing. This repository
+    has been caught by that trap repeatedly; see `.claude/rules/clips-preview.md`.
+    """
+    stripped = ast.parse(ast.unparse(node)).body[0]
+    if (stripped.body and isinstance(stripped.body[0], ast.Expr)
+            and isinstance(stripped.body[0].value, ast.Constant)
+            and isinstance(stripped.body[0].value.value, str)):
+        stripped.body = stripped.body[1:] or [ast.Pass()]
+    return ast.unparse(stripped)
+
+
+def test_f5_no_new_coordinator_lock_or_thread_was_introduced(gui_tree):
+    """The whole correction is one parameter on an existing method, under an existing lock."""
+    source = _body_without_docstring(_func(_registry_tree(), "_require_live_page"))
+    for forbidden in ("threading.", "Lock(", "Thread(", "self._lock"):
+        assert forbidden not in source, f"_require_live_page reaches {forbidden}"
+    body = _body_without_docstring(_func(gui_tree, "_audio_preview_turn"))
+    for forbidden in ("threading.", "_lock", ".acquire(", "Coordinator"):
+        assert forbidden not in body, f"_audio_preview_turn reaches {forbidden}"
+
+
+def _registry_tree():
+    with open(os.path.join(os.path.dirname(clips.__file__), "clips_review.py"),
+              encoding="utf-8") as handle:
+        return ast.parse(handle.read())
+
+
+def test_f5_require_live_page_is_private_and_called_only_from_new_session():
+    """A public entry point would invite exactly the check-then-act pattern F-3 and F-4 were."""
+    tree = _registry_tree()
+    callers = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_require_live_page"):
+            callers.add(node.lineno)
+    mint = _func(tree, "new_session")
+    assert callers, "_require_live_page is never called"
+    assert all(mint.lineno <= line <= (mint.end_lineno or mint.lineno) for line in callers), (
+        "_require_live_page is called from outside new_session, so it is no longer atomic "
+        "with the mint it guards")
