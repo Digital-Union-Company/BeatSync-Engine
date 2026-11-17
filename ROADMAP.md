@@ -1983,6 +1983,88 @@ A seventh commit, from the owner's own hands-on session rather than from a revie
 Encoding and the output profiles were not touched; 1080p · 25 fps still renders
 `1920×1080 @ 25/1`.
 
+### UX follow-ups — owner playtest, 2026-11-18 · **ACCEPTED SCOPE, NOT IMPLEMENTED**
+
+Three separate improvements observed by the owner on the installed GUI, with screenshots
+of Settings → Default folders and Media Library → Video Review. These are specific
+follow-ups to the **already deployed** UX Refresh, not retroactive claims that the
+previous work was never implemented. No dates, merge, installation or reprioritisation
+are authorised by this entry. Implement as bounded changes, not one all-or-nothing
+redesign. The independent Raw Cutter disk-full task R4-D remains separate.
+
+#### UX-ZERO-KEEP — Video Review can discard an entire loaded batch
+
+**Problem.** The deployed keep-only workflow is ideal when at least one clip is worth
+keeping: mark only those clips as Keep, then Confirm and explicitly approve sweeping
+the unmarked clips to Discarded. But the shared `SortPlan.can_sort` currently requires
+**at least one Keep**. With zero good clips the operator cannot continue, even after
+marking one clip Discard.
+
+**Desired behaviour.** Permit Confirm when the active loaded review page has at least
+one explicit Discard and zero Keeps; unmarked clips are swept into Discarded only
+after the existing exact-count Proceed/Cancel confirmation. Also offer a clear
+**Discard all loaded clips** action for a page with zero Keeps, so the operator need
+not manually reject a token clip. The action means **only the currently loaded,
+server-authoritative page/batch**, not the whole source directory, later pages,
+another browser session or an unscanned set. When any Keep is present, do not
+silently override it: use the existing keep-only Confirm path instead.
+
+Both paths must reuse the existing server-derived sort plan, the batch-specific
+two-step sweep signature, destination revalidation, same-volume no-overwrite
+`os.rename`, transfer reservation and actual move outcome reporting. Unmarked
+items are not pre-written as durable decisions merely to enable the bulk action.
+A refusal, stale page, changed destination or duplicate press moves nothing.
+A successful all-discard batch advances normally; a partial move retains the
+remaining items for retry. **Discard is a move to quarantine, never a deletion.**
+Focused tests cover zero-Keep/one-Discard, zero decisions/bulk action, stale
+page/snapshot, mixed Keep/Discard, failed moves, double-clicks and subsequent pages.
+
+#### UX-BROWSE-LAYOUT — Folder pickers visually belong to their inputs
+
+**Problem.** The previous UX Refresh documented a Browse button beside each
+Settings folder input, but the latest owner screenshots show awkwardly detached
+right-edge buttons in Settings and a separate button row far below the corresponding
+Media Library → Video Review folder fields.
+
+**Desired behaviour.** In Settings → Default folders and Media Library → Video
+Review, render each path textbox and its own **Browse...** in one visibly associated,
+compact, responsive row; keep its label and helper text with that exact input.
+Use consistent horizontal spacing/alignment on desktop and an intentional stacked
+layout on narrower viewports. Avoid oversized empty gaps, button/input mispairing,
+horizontal overflow and dense unreadable helper text. Preserve all existing
+preference values, browse handlers, path validation, scan behaviour, no-overwrite
+and guarded move rules. Loading Settings must still never scan or create folders.
+Validate real Gradio 6.19.0 layout at common desktop and narrow viewport widths,
+rather than claiming a CSS change is visually accepted from offline seam tests.
+
+#### UX-PREP-ACTIVITY — Prepare & Verify shows trustworthy in-flight state
+
+**Problem.** Prepare & Verify can run expensive source work with little feedback.
+Scan/Analyze already stream some structured progress, but long phases without an
+event may appear frozen. The separate **Verify Sources** handler currently returns
+one final string, and its button explicitly sets `show_progress='hidden'` — there
+is no reliable persistent in-page running signal for that operation.
+
+**Desired behaviour.** Immediately show a visible active indicator and the real
+phase for Scan Library, Analyze, Verify Sources and the bounded Sample Decode
+diagnostic where it can run long. Use real completed/total units only when
+instrumentation actually measures them; otherwise show an **indeterminate active**
+state and elapsed time if measured, not a fabricated percentage, throughput or ETA.
+Identify successful, refused/busy, failed and stale/superseded results distinctly.
+Preserve each operation's source identity, staleness/invalidation fences,
+non-blocking server-side shared mutex, actual non-cancellable boundaries,
+child-process ownership and current Gradio queue semantics; a second click must
+not silently queue behind active Verify. Do not mutate widgets from workers,
+create a second progress coordinator, or make Verify write cache/media.
+A status must not be claimed terminal while its worker still runs. Check real
+Gradio UI activity during a deliberately slow synthetic operation, plus focused
+stale-input, duplicate-click, no-event interval and exception regressions.
+
+**Status:** each of UX-ZERO-KEEP, UX-BROWSE-LAYOUT and UX-PREP-ACTIVITY is
+**ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**. The three may be implemented and
+tested separately; no code change, merge or deployment is authorised by this
+roadmap-only update.
+
 ---
 
 ## Status summary
@@ -2017,6 +2099,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R16** — Music Playlist Mode for Video Render | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner ideas 2026-11-03, scope accepted 2026-11-12). Ordered multiple songs with Move Up/Down, Shuffle and Sort by Name; one continuous soundtrack for beat/shot planning and rendering; visible order is frozen, no silent reshuffle. Existing single-track and R10 Repeat Music remain unchanged by default; playlist-repeat interaction is a future explicit decision |
 | **R17** — Chrome / Windows notifications on long-job completion | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner idea 2026-11-04, scope accepted 2026-11-12). Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional R17-B research (service worker / Push), NOT promised for V1 — **no service worker, Push server, daemon, background poller or extension is authorised**. Accepting the scope authorises no source work and no deploy |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
+| **UX follow-ups** — zero-Keep all-Discard, Browse alignment, Prepare & Verify activity | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner feedback 2026-11-18). Three bounded improvements: UX-ZERO-KEEP, UX-BROWSE-LAYOUT and UX-PREP-ACTIVITY. No changes to source, release state or product priority order |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
