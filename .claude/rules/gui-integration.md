@@ -586,6 +586,37 @@ automatically.
     names only `_CLIPS_SCANS.is_current`.
 
   Full contract: `.claude/rules/video-review-transfer.md`.
+- **Prepare & Verify's four operations stream in-flight activity, and the two diagnostics gate
+  inside GENERATORS now (UX-PREP-ACTIVITY).** Verify Sources and Sample Decode each returned one
+  final string with `show_progress='hidden'`, so an accepted click and a dead button looked
+  identical for as long as the work took.
+
+  ```
+  prep_verify_btn -> _verify_sources_frames   generator; _on_verify_sources_click = collected form
+  sample_btn      -> _sample_decode_frames    generator; _on_sample_decode_click  = collected form
+  both            -> _activity_frames         the ONE shared stream: worker thread + bounded poll
+  ```
+
+  * **The mutex, the holder token, the revision pin and the staleness comparison MOVED one function
+    inwards** — into the frames generators. The acquire/release site counts, the `finally`, the
+    clear-then-release order and `_RENDER_LOCK.locked()` appearing nowhere are all unchanged, and
+    the AST tests that pin them now name the generators.
+  * **`_activity_frames` joins its worker in its own `finally`, BEFORE the caller releases the
+    mutex.** `yield from` closes the inner generator first, so an abandoned event cannot free the
+    lock while an FFprobe child is still reading the disk. Abandoning is not a cancellation.
+  * **`inputs` and `outputs` are UNCHANGED on both events** — the activity is plain text inside the
+    one existing report textbox, so no second component joins a pinned `outputs` list and the
+    isolation contract (verification writes its own report and nothing else) survives untouched.
+  * **The collected forms keep their exact signatures and string returns**, because tests call them
+    directly and compare by equality. Do not collapse either pair.
+  * **`_run_prep_in_worker`'s event wait is now a bounded poll**, so Scan and Analyze stay visibly
+    alive through a phase that emits no `ProgressEvent`. Its notice goes in the existing
+    `prep_status`, so the preparation event wiring is byte-identical.
+  * **`_prep_phase` is one lock-guarded global**, sound because `_RENDER_LOCK` admits one operation
+    at a time — the same invariant the R5 revision pin rests on. Diagnostic only; nothing branches
+    on it.
+
+  Full contract: `.claude/rules/prep-activity.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -609,7 +640,8 @@ automatically.
 | Variant Lab **comparison / Apply Selected** seam, candidate count, batch state (C3) | `.claude/rules/variant-lab.md` **+** `.claude/rules/creative-presets.md` **+** `.claude/rules/audio-mixdown.md` — Apply writes both creative and audio widgets, so all three writer matrices apply |
 | voice clips, Smart Mix folder/roles/Amount/Level, the report panels | `.claude/rules/audio-mixdown.md` |
 | Media Library Preparation scan/analyze, batch size | `.claude/rules/library-preparation.md` |
-| the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) |
+| the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) — **+ `.claude/rules/prep-activity.md`** if you touch either frames generator, `_activity_frames`, `_prep_phase` or `_run_prep_in_worker`'s event wait |
+| the in-flight **activity** for Scan / Analyze / Verify / Sample, `_activity_frames`, `_verify_sources_frames`, `_sample_decode_frames`, `_prep_phase` or `prep_activity.py` (UX-PREP-ACTIVITY) | `.claude/rules/prep-activity.md` **+** `.claude/rules/source-verification.md` (the mutex, the pin and the staleness rule it must not disturb) **+** `.claude/rules/progress-events.md` (the generator-lifetime rule the join rests on, and the ETA ban it restates) |
 | Settings → **Video Analysis Cache**, the shared cache folder, the Import button, or Cache Management's analysis category | `.claude/rules/shared-analysis-cache.md` **+** `.claude/rules/stage5-cache-identity.md` (the directory is deliberately not part of identity) |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |
 | render modes, encoder branches, frame lock | `.claude/rules/pipeline-core.md` |
