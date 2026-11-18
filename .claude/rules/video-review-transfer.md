@@ -330,8 +330,20 @@ What matters **here** is that it adds no authority:
   lane of 1 would leave a duplicate press *queued* rather than letting the guard refuse it.
 * **The frame shape is the same contract.** The bulk gate is a refusal-shaped single frame that
   claims **no slot**, and `discard_all` is reached before admission, so nothing about "no Working
-  frame for a press that moves nothing" changes. The bulk path is gated *unconditionally*, so a
-  bulk press is **never** the `1 + N + 1` shape on its first press.
+  frame for a press that moves nothing" changes.
+* **A bulk press CAN be the `1 + N + 1` shape on its first press, and that is measured.** The bulk
+  path needs a gate *agreement* unconditionally — which is not the same as always showing the bulk
+  gate first. An ordinary sweep arming that still matches the freshly derived plan satisfies the
+  comparison, so a bulk press made while one is held sorts immediately: measured at **5 frames**
+  on a three-clip page carrying one explicit Discard and an ordinary arming, with the bulk heading
+  never shown. Do not "fix" this by re-gating on the intent, and do not write that the bulk gate is
+  always displayed. It is sound for a reason worth keeping: `bulk` is read **nowhere past the
+  gate** — not by `decision_of`, not by the reservation, not by the transfer — so it selects an
+  admission rule and a heading and cannot change where a file goes. The bulk rule admits only a
+  page with zero Keeps, and with zero Keeps the ordinary sweep and the bulk discard move the same
+  clips to the same folder, so the arming the operator agreed to describes exactly what happens.
+  The reverse direction is covered by the Keep refusal, which is reached *before* the signature
+  comparison.
 * **The release and the generation rule are the same ones.** `end` still lives in the one `finally`
   — including for an abandoned bulk event, where `yield from` propagates `GeneratorExit` unaltered
   — and the finished transfer still decides what it may publish from

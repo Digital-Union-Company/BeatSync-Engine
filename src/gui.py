@@ -12131,11 +12131,20 @@ def _clips_confirm_frames(armed='', request: gr.Request = None, *, discard_all=F
     # are revealed. The signature covers every clip id, its decision and both destinations, so
     # changing any of them voids the arming and the gate is shown again.
     #
-    # [FORK] UX-ZERO-KEEP: the bulk action is gated UNCONDITIONALLY. Ordinarily the gate exists
-    # for unmarked clips, so a page of explicit decisions needs no second press -- but a bulk
-    # action is a statement about clips the operator has not individually judged, and the counts
-    # and the destination are exactly what they have to see before it happens. One gate, one
-    # preview, one signature, one Proceed; the arming carries which intent was agreed.
+    # [FORK] UX-ZERO-KEEP: the bulk action NEEDS a gate agreement unconditionally. Ordinarily the
+    # gate exists for unmarked clips, so a page of explicit decisions needs no second press -- but
+    # a bulk action is a statement about clips the operator has not individually judged, and the
+    # counts and the destination are exactly what they have to see before it happens. One gate,
+    # one preview, one signature, one Proceed; the arming carries which intent was agreed.
+    #
+    # "Needs an agreement" is deliberately not "always shows the bulk gate first", and the
+    # difference is observable: an ordinary sweep arming that still matches this plan satisfies the
+    # comparison below, so a bulk press made while one is held sorts on its FIRST press. That is
+    # correct rather than a hole, and it rests on `bulk` being read nowhere past this gate -- it
+    # selects an admission rule and a heading, and never reaches `decision_of` or the transfer. The
+    # bulk rule admits only a page with zero Keeps, and with zero Keeps the ordinary sweep and the
+    # bulk discard move the same clips to the same folder, so the arming the operator agreed to
+    # describes exactly what happens. A Keep is refused above, before this is reached at all.
     needs_gate = bulk or plan.has_unmarked
     if needs_gate and armed_signature != plan.signature:
         preview = fork_clips.plan_preview_lines(

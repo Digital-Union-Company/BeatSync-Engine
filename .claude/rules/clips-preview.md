@@ -1051,9 +1051,18 @@ plan.can_discard_whole_page  0 Keeps, >= 1 clip                Discard all loade
   the same set the identities, the reservation and the sort are built from — so "all" cannot reach
   the folder, a later page, an earlier page or another browser session's page. A retired page
   (R11 / `invalidate`) refuses because `_clips_view` is empty, exactly as Confirm does.
-* **The bulk path is gated UNCONDITIONALLY**, even when every clip is already explicitly rejected
-  and the ordinary path would need no second press. A bulk action is a statement about clips the
-  operator has not individually judged, so the exact counts and the destination are shown first.
+* **The bulk path needs a gate AGREEMENT unconditionally**, even when every clip is already
+  explicitly rejected and the ordinary path would need no second press. A bulk action is a
+  statement about clips the operator has not individually judged, so the exact counts and the
+  destination are shown first.
+* **That is not the same as "the bulk gate is always shown", and the difference is measured.** An
+  ordinary sweep arming that still matches the freshly derived plan satisfies the comparison, so a
+  bulk press made while one is held sorts on its **first** press (measured: 5 frames, bulk heading
+  never shown). It is sound because `bulk` is read **nowhere past the gate** — it selects an
+  admission rule and a heading, and never reaches `decision_of`, the reservation or the transfer —
+  and because the bulk rule admits only a zero-Keep page, where the ordinary sweep and the bulk
+  discard move the same clips to the same folder. So the arming the operator agreed to describes
+  exactly what happens. Do not re-gate on the intent, and do not restate this as "always gated".
 * **It writes no durable decision.** The sweep is still "for this batch only": a clip that was
   never classified comes back `PENDING` on a re-scan, never as a rejection the operator never made.
 * **`plan_preview_lines` names the Media Library only when something is going into it.** With zero

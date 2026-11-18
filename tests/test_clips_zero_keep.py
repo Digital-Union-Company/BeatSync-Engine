@@ -422,6 +422,51 @@ def test_an_arming_from_a_different_batch_cannot_authorise_a_bulk_discard(world)
             assert os.path.isfile(entry.path), f"{armed!r} moved a file"
 
 
+def test_an_ordinary_arming_that_still_matches_admits_a_bulk_press_on_its_first_frame(world):
+    """What "gated unconditionally" does and does not mean, pinned because it is observable.
+
+    The bulk path needs a gate *agreement* on the current signature; it does not insist that the
+    agreement came from the bulk gate. So a bulk press made while an **ordinary** sweep arming is
+    still held and still matches sorts immediately -- `1 + N + 1`, with the bulk heading never
+    shown. An earlier draft of the rule claimed a bulk press is never that shape on its first
+    press; it is, and this is the measurement.
+
+    It is sound rather than a hole, for one reason worth keeping asserted: `bulk` is read **nowhere
+    past the gate**, so it selects an admission rule and a heading and can never reach
+    `decision_of`, the reservation or the transfer. The bulk rule admits only a zero-Keep page, and
+    with zero Keeps the ordinary sweep and the bulk discard move the same clips to the same folder
+    -- so the arming the operator agreed to describes exactly what happens. The opposite direction
+    (a Keep arriving) is refused before the signature is even compared, by
+    `test_a_keep_made_after_the_bulk_gate_was_armed_stops_the_batch`.
+    """
+    owner = "browser-session-1"
+    _scan(world, owner)
+    entries = list(world["ns"]["_clips_view"](owner)["entries"])
+    payload = _payload_of(entries)
+    _decide(world, owner, entries[0], _REJECTED)
+
+    # The ORDINARY gate, armed by an ordinary Confirm: a bare signature with no bulk prefix.
+    gated = _confirm_frames(world, owner, "")
+    assert len(gated) == 1
+    assert world["ui"]["CLIPS_SWEEP_GATE_HEADING"] in gated[0][_MESSAGE]
+    armed = gated[0][_ARMED]
+    assert armed and not armed.startswith(cr.DISCARD_ALL_ARM_PREFIX), armed
+
+    frames = _bulk_frames(world, owner, armed=armed)
+    assert len(frames) == len(entries) + 2, (
+        "the matching ordinary arming is accepted, so this is the Working/progress/terminal shape")
+    assert world["ui"]["CLIPS_DISCARD_ALL_GATE_HEADING"] not in frames[-1][_MESSAGE]
+
+    # And it did exactly what the arming the operator agreed to described: every clip into
+    # Discarded, bytes intact, nothing deleted and no Media Library created.
+    for entry in entries:
+        binned = _filed(world["rejected"], entry)
+        assert os.path.isfile(binned), frames[-1][_MESSAGE]
+        assert open(binned, "rb").read() == payload[entry.clip_id]
+        assert not os.path.exists(entry.path)
+    assert not os.path.exists(world["library"])
+
+
 def test_the_arming_token_round_trips_and_is_total():
     """Text in, text out. Anything that is not a usable token reads as "nothing is armed", which
     leads to the gate -- the direction in which nothing moves."""

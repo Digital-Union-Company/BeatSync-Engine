@@ -61,8 +61,12 @@ decision, no clock — and they authorise nothing: a token whose signature no lo
 derived plan fails the comparison and the gate is shown again. A bare signature still means the
 ordinary sweep, so no previously armed batch changes meaning. One Proceed, one Cancel.
 
-Preserved, each asserted rather than assumed: the two-step exact-count confirmation (the bulk path is
-gated **unconditionally**, even when every clip is already explicitly rejected); same-volume
+Preserved, each asserted rather than assumed: the two-step exact-count confirmation (the bulk path
+needs a gate **agreement** unconditionally, even when every clip is already explicitly rejected —
+though an *ordinary* arming that still matches the plan satisfies it, so a bulk press made while one
+is held sorts on its first press, measured and pinned by test: sound because `bulk` is read nowhere
+past the gate and the rule admits only a zero-Keep page, where both paths move the same clips to the
+same folder); same-volume
 no-overwrite `os.rename` with nothing deleted and nothing overwritten; destination validation on
 every press against the folders carried on the view; single-flight against duplicate, replayed and
 concurrent presses; truthful partial results with the remaining clips left in place and retryable;
