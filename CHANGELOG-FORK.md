@@ -20,6 +20,83 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-18 (UX-ZERO-KEEP: Video Review can file a page with nothing worth keeping)
+
+**The deployed keep-only workflow had no answer for a bad shoot.** Marking the good clips and
+pressing Confirm is right when at least one clip *is* good; the shared `SortPlan.can_sort` wants a
+Keep, so a page on which the operator marked every clip Discard still refused, and the on-screen
+instruction — *"Mark at least one clip to Keep"* — was one they could not follow. Reported by the
+owner from the installed GUI on 2026-11-18 and recorded as roadmap item **UX-ZERO-KEEP**.
+
+**Two routes forward, and one of them is new UI.**
+
+```
+0 Keeps, >= 1 explicit Discard   ->  Confirm, then the ordinary batch-bound Proceed
+0 Keeps, no decision at all      ->  "Discard all loaded clips", then the same Proceed
+>= 1 Keep                        ->  unchanged, and the bulk action REFUSES rather than overriding
+```
+
+`SortPlan` gained three **named** properties — `has_rejected`, `can_sort_discard_only` and
+`can_discard_whole_page` — and `can_sort` itself is **untouched**. That is deliberate rather than
+conservative: `gui._on_audio_confirm` is admitted by the same property, so widening it would have
+silently changed a second review surface nobody asked to change. One copy of a safety rule carrying
+two meanings is the same hazard as two copies carrying one.
+
+**A page with no decision on it at all still refuses an ordinary Confirm**, and that is a
+requirement rather than a leftover: a page nobody has judged must not be filable by one press.
+`clips_discard_all_btn` is the explicit statement that it is all rubbish, so the operator no longer
+has to reject a token clip to unlock a button.
+
+**It is a third entry point and not a third transfer.** `_clips_discard_all_frames` sets one
+keyword-only flag and `yield from`s `_clips_confirm_frames`, so the destination re-validation, the
+single-flight claim (R13), the F-1 snapshot re-read under the reservation, the F-2 identity rule,
+the one transfer engine (`iter_sorted_clips`), `collision.py` and the page-generation rule are all
+reached through exactly the code Confirm reaches them through. `discard_all` is **not a widget
+value**, and Gradio passes a click's `inputs` positionally, so the browser cannot ask for the bulk
+rule through the one input the handler takes.
+
+**Which confirmation was agreed rides on the arming token, as a prefix.** `arm_token` /
+`read_arm_token` / `DISCARD_ALL_ARM_PREFIX` are text in, text out — no path, no identity, no
+decision, no clock — and they authorise nothing: a token whose signature no longer matches a freshly
+derived plan fails the comparison and the gate is shown again. A bare signature still means the
+ordinary sweep, so no previously armed batch changes meaning. One Proceed, one Cancel.
+
+Preserved, each asserted rather than assumed: the two-step exact-count confirmation (the bulk path is
+gated **unconditionally**, even when every clip is already explicitly rejected); same-volume
+no-overwrite `os.rename` with nothing deleted and nothing overwritten; destination validation on
+every press against the folders carried on the view; single-flight against duplicate, replayed and
+concurrent presses; truthful partial results with the remaining clips left in place and retryable;
+**no durable decision written by the sweep**, so an unswept clip comes back `PENDING`; and the
+loaded, server-authoritative page as the only thing "all" can mean — never the folder, a later page,
+an earlier page or another browser session's page.
+
+Two smaller corrections fall out of it. `plan_preview_lines` names the Media Library only when
+something is actually going into it — with zero Keeps the old form printed an arrow at a folder the
+batch does not write and `iter_sorted_clips` does not create (byte-identical for Audio Review, whose
+gate is only ever reached with a Keep). And Confirm's enabled state, still derived from
+`store.counts()` in the same two functions and nowhere else (R5-P3 / F8), is now
+`counts[SELECTED] > 0 or counts[REJECTED] > 0`, with the client-side readiness hint tracking it so
+it cannot announce an enable that is not coming. `clips_discard_all_btn` deliberately carries no
+`interactive=` of its own: a second server-managed button state would mean widening every frame this
+tab's handlers emit, for presentation, and the authorization boundary here is never a widget.
+
+**Verification.** 26 new tests in `tests/test_clips_zero_keep.py` driving the shipped handlers
+against a real filesystem, a real durable store, the real registry and the real transfer guard,
+including an eight-press deterministic concurrency case (the winner is held at its first
+`note_progress` until every press has been through admission, so "exactly one sorted" is a statement
+about concurrency rather than about scheduling luck) and a real NTFS junction for the
+destination-revalidation case. `tests/test_clips_gui_integration.py`'s keep-only admission test is
+**replaced** by its two successors (zero-decision refusal, and zero-Keep-plus-one-Discard proceeding)
+rather than deleted, and the enabler-derivation and client-readiness guards now pin both halves of
+the new rule. `tests/test_gui_tabs.py`'s exact registration count goes 6 → **7** — the guard exists
+so a seventh registration is reviewed deliberately rather than slipping in, and it now also pins
+*which* registration the seventh is, because an exact count satisfied by a different seventh button
+would be a guard reporting a review it never had. Whole suite: **10,991 passed / 25 skipped**. No
+runtime, model, cache or installer change; nothing about *where* a file goes changed.
+
+Full contract: `.claude/rules/clips-preview.md` ("Three admission rules, one transfer") and
+`.claude/rules/video-review-transfer.md` ("A third entry point").
+
 ### Fixed — 2026-11-13 (R15-C / F-5: a stale page turn republished the folder the operator left)
 
 **The F-3 fence below was threaded into the page turn as well, and there it could never work.** The

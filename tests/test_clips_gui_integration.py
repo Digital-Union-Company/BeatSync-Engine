@@ -58,6 +58,9 @@ _HANDLERS = ("_clips_store", "_clips_state_unavailable_text", "_clips_unavailabl
              "_clips_decide", "_clips_state", "_on_clips_refresh",
              "_clips_confirm_only", "_clips_working_frame", "_clips_sorted_text",
              "_clips_confirm_frames", "_on_clips_confirm",
+             # [FORK] UX-ZERO-KEEP: the bulk action's entry point. Extracted rather than stubbed,
+             # because the property under test is that it reaches the SAME generator.
+             "_clips_discard_all_frames",
              # [FORK] R8 Final Polish: the sweep gate's Cancel half.
              "_on_clips_sweep_cancel")
 
@@ -579,6 +582,12 @@ def test_the_counters_tell_the_operator_that_refresh_enables_confirm(world):
     javascript = source[start:source.index('""".replace(', start)]
     assert "counts.SELECTED > 0" in javascript, (
         "[R8] readiness is now at least one KEPT clip, matching the server")
+    # [FORK] UX-ZERO-KEEP: and at least one explicitly DISCARDED clip, which is the rule the two
+    # server-side enablers derive from the durable record. The two must agree -- a client that
+    # still asked only about Keeps would never ask for the refresh that lights the button on a
+    # zero-keep page, leaving the operator to press Refresh by hand.
+    assert "counts.REJECTED > 0" in javascript, (
+        "[UX-ZERO-KEEP] the client's readiness answer must match the server's")
     assert "__REFRESH_HINT__" in javascript
     assert "CLIPS_REFRESH_TO_ENABLE_HINT" in source, "the wording lives in ui_content.py"
     for forbidden in ("interactive", "disabled = false", "removeAttribute('disabled')",
@@ -629,8 +638,18 @@ def test_only_the_record_can_ever_ENABLE_the_confirm_button():
     for name in enablers:
         node = next(n for n in tree.body
                     if isinstance(n, ast.FunctionDef) and n.name == name)
-        assert "counts[fork_clips.SELECTED] > 0" in ast.unparse(node), (
+        body = ast.unparse(node)
+        # [FORK] UX-ZERO-KEEP: both halves of the rule, pinned by value. An explicit Discard
+        # admits Confirm now, so an enabler that still looked only at SELECTED would leave the
+        # zero-keep workflow with a dark button and no route forward -- and one that looked at
+        # PENDING or at anything other than `counts` would have stopped deriving the state from
+        # the durable record, which is the invariant this test exists for.
+        assert "counts[fork_clips.SELECTED] > 0" in body, (
             f"{name} must derive the enabled state from the durable record")
+        assert "counts[fork_clips.REJECTED] > 0" in body, (
+            f"{name} must admit a page whose only decisions are explicit Discards")
+        assert "counts[fork_clips.PENDING]" not in body, (
+            f"{name} must not read undecided clips as readiness")
     refresh = next(n for n in tree.body
                    if isinstance(n, ast.FunctionDef) and n.name == "_on_clips_refresh")
     assert "interactive=False" in ast.unparse(refresh), (
@@ -862,14 +881,19 @@ def test_the_sweep_never_writes_a_decision_to_the_durable_record(world):
         "the sweep wrote a REJECTED decision the operator never made")
 
 
-def test_confirm_refuses_when_no_clip_is_kept(world):
-    """The admission rule that replaced "everything decided": at least one clip must be KEPT."""
+def test_confirm_refuses_a_page_with_no_decision_on_it_at_all(world):
+    """[FORK] UX-ZERO-KEEP -- replaces `test_confirm_refuses_when_no_clip_is_kept`.
+
+    That test marked one clip REJECTED and required a refusal, because the admission rule was
+    "at least one clip is KEPT". An explicit Discard now admits the page (see
+    `test_confirm_is_admitted_by_one_explicit_discard` below), so the property this preserves is
+    the one that genuinely must not change: a page nobody has decided anything about is **not**
+    filable by one press. The bulk action is the only way to act on such a page, and it says so.
+    """
     namespace = world["ns"]
     owner = "browser-session-1"
     _scan(world, owner)
     view = namespace["_clips_view"](owner)
-    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
-                               {"to": "REJECTED", "rev": 0})
 
     result = namespace["_on_clips_confirm"]("", world["request"](owner))
     assert world["ui"]["CLIPS_CONFIRM_DISABLED_TEXT"].split(".")[0] in result[4], result[4]
@@ -879,6 +903,40 @@ def test_confirm_refuses_when_no_clip_is_kept(world):
         assert os.path.isfile(entry.path), "a refused Confirm moves nothing at all"
     assert not os.path.exists(world["library"])
     assert not os.path.exists(world["rejected"])
+
+
+def test_confirm_is_admitted_by_one_explicit_discard_with_nothing_kept(world):
+    """[FORK] UX-ZERO-KEEP: zero Keeps plus one explicit Discard may proceed.
+
+    The owner's case: a page on which nothing is worth keeping. Marking one clip Discard used to
+    leave Confirm refusing, because the rule wanted a Keep the operator had no reason to make.
+    The two-step gate is unchanged -- the unmarked remainder still needs an explicit Proceed on
+    that exact batch -- and the Media Library is never even created, because nothing goes there.
+    """
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    entries = list(view["entries"])
+    payload = {entry.clip_id: open(entry.path, "rb").read() for entry in entries}
+    namespace["_clips_decide"](owner, view["session"], view["page"], entries[0],
+                               {"to": "REJECTED", "rev": 0})
+
+    gated = namespace["_on_clips_confirm"]("", world["request"](owner))
+    assert world["ui"]["CLIPS_SWEEP_GATE_HEADING"] in gated[4], gated[4]
+    assert gated[5] == {"visible": True} and gated[7], "the gate must arm this batch"
+    for entry in entries:
+        assert os.path.isfile(entry.path), "the gate must move nothing at all"
+
+    swept = namespace["_on_clips_confirm"](gated[7], world["request"](owner))
+    for entry in entries:
+        binned = os.path.join(world["rejected"], os.path.basename(entry.path))
+        assert os.path.isfile(binned), f"{entry.path} was not filed: {swept[4]}"
+        assert open(binned, "rb").read() == payload[entry.clip_id]
+        assert not os.path.exists(entry.path)
+    assert not os.path.exists(world["library"]), (
+        "an all-discard batch must not create the Media Library folder")
+    assert "Nothing was deleted" in swept[4], swept[4]
 
 
 # =============================================================================================

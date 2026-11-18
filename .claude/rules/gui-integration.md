@@ -586,6 +586,36 @@ automatically.
     names only `_CLIPS_SCANS.is_current`.
 
   Full contract: `.claude/rules/video-review-transfer.md`.
+- **Video Review's Confirm has THREE admission rules and still ONE transfer (UX-ZERO-KEEP).** A
+  page with nothing worth keeping could not be filed at all, because `plan.can_sort` wants a Keep.
+  Two further **named** rules on the shared `SortPlan` fix that, and `can_sort` itself is untouched
+  because Audio Review is admitted by it too.
+
+  ```
+  clips_confirm_btn      -> _clips_confirm_frames       can_sort  OR  can_sort_discard_only
+  clips_proceed_btn      -> _clips_confirm_frames       the arming decides which gate it completes
+  clips_discard_all_btn  -> _clips_discard_all_frames   can_discard_whole_page
+  ```
+
+  * **`_clips_discard_all_frames` sets one keyword-only flag and `yield from`s the generator.**
+    `discard_all` is **not a widget value**, and Gradio passes a click's `inputs` positionally, so
+    the browser cannot ask for the bulk rule through the one input the handler takes. No second
+    handler, no second guard call, no second signature, no second sort.
+  * **The arming token carries which confirmation was agreed**, as a prefix
+    (`fork_clips.arm_token` / `read_arm_token`). It authorises nothing — a token whose signature no
+    longer matches a freshly derived plan fails the comparison and the gate is shown again — and a
+    bare signature still means the ordinary sweep, so no previously armed batch changes meaning.
+  * **`clips_discard_all_btn` carries no `interactive=`.** A second server-managed button state
+    would mean widening every frame this tab's handlers emit, for presentation; the authorization
+    boundary here is never a widget, so the server refuses the press instead. The mover and
+    **enabler** identity sets in `tests/test_clips_gui_integration.py` are therefore unchanged —
+    what changed is the enablers' *derivation*, still from `store.counts()` and still in those two
+    functions only: `counts[SELECTED] > 0 or counts[REJECTED] > 0`.
+  * **The client-side readiness answer tracks it** (`counts.SELECTED > 0 || counts.REJECTED > 0`)
+    so the hint cannot announce an enable that is not coming. It still enables nothing.
+
+  Full contract: `.claude/rules/clips-preview.md` ("Three admission rules, one transfer") and
+  `.claude/rules/video-review-transfer.md` ("A third entry point").
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -596,7 +626,7 @@ automatically.
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
 | the Raw Cutter's **Activity & Performance** panel, `_cut_activity` / `_cut_activity_final`, `CUT_ACTIVITY_JS` or `raw_cutter_activity.py` (R12) | the R12 bullet above **+** `ROADMAP.md` R12 for the product contract — and `tests/test_raw_cutter_activity.py`, which executes the pure timer rules rather than asserting about them |
 | the **"Review these clips"** button, `cut_handoff_state`, `_cut_handoff`, `_on_cut_open_in_library`, `_CUT_BATCH_HANDOFF` or `cut_handoff.py` (R11) | the R11 bullet above **+** `ROADMAP.md` R11 for the product contract — and `tests/test_cut_handoff.py`, which executes the real `_on_cut_run` on every terminal path rather than asserting about it. `.claude/rules/clips-preview.md` too if you touch what Video Review does with the folder it receives |
-| Video Review's **Confirm / Proceed** path, `_clips_confirm_frames`, `_clips_working_frame`, `_CLIPS_TRANSFERS`, `iter_sorted_clips`, `TransferTally` or `transfer_guard.py` (R13) | `.claude/rules/video-review-transfer.md` **+** `.claude/rules/clips-preview.md` — the page lifecycle it decides against is the coordinator's, and `ROADMAP.md` R13 for the product contract |
+| Video Review's **Confirm / Proceed / Discard all loaded clips** path, `_clips_confirm_frames`, `_clips_discard_all_frames`, `_clips_working_frame`, `_CLIPS_TRANSFERS`, `iter_sorted_clips`, `TransferTally`, `transfer_guard.py` (R13), or any `SortPlan` admission rule (UX-ZERO-KEEP) | `.claude/rules/video-review-transfer.md` **+** `.claude/rules/clips-preview.md` — the page lifecycle it decides against is the coordinator's, and `ROADMAP.md` R13 / UX-ZERO-KEEP for the product contract. `.claude/rules/audio-review.md` too if you touch `SortPlan.can_sort`, which Audio Review is admitted by |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | the C3 2–4-candidate render seam, render mutex, continuation policy, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/render-worker.md` **+** `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |
