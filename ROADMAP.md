@@ -1983,7 +1983,7 @@ A seventh commit, from the owner's own hands-on session rather than from a revie
 Encoding and the output profiles were not touched; 1080p · 25 fps still renders
 `1920×1080 @ 25/1`.
 
-### UX follow-ups — owner playtest, 2026-11-18 · **ONE SOURCE-IMPLEMENTED, TWO PLANNED**
+### UX follow-ups — owner playtest, 2026-11-18 · **TWO SOURCE-IMPLEMENTED, ONE PLANNED**
 
 Three separate improvements observed by the owner on the installed GUI, with screenshots
 of Settings → Default folders and Media Library → Video Review. These are specific
@@ -2039,9 +2039,11 @@ and guarded move rules. Loading Settings must still never scan or create folders
 Validate real Gradio 6.19.0 layout at common desktop and narrow viewport widths,
 rather than claiming a CSS change is visually accepted from offline seam tests.
 
-#### UX-PREP-ACTIVITY — Prepare & Verify shows trustworthy in-flight state
+#### UX-PREP-ACTIVITY — Prepare & Verify shows trustworthy in-flight state · **SOURCE IMPLEMENTED, NOT MERGED OR INSTALLED**
 
-**Problem.** Prepare & Verify can run expensive source work with little feedback.
+**Implementation status (2026-11-19).** Source code is committed and pushed as **draft PR #109** (`feat/ux-prep-activity-r1` at `d26529ba3efceefbfdcd6c4f18866f2d3b9e3228`). The implementer reports **11,003 passed / 25 skipped** on bare CPython, including 39 new focused activity tests and a tested generator-close/join-before-mutex-release invariant. Scan/Analyze use the existing structured progress path with bounded activity pulses during otherwise silent phases; Verify Sources and Sample Decode now stream text-based activity inside their already-existing report boxes, while keeping collected-form compatibility for direct callers. No independent code review, isolated GUI smoke, merge, installation or owner runtime acceptance is claimed. **Verify Sources remains honestly indeterminate:** its bounded media-health sweep exposes no per-source progress callback, so a percentage or completed count would be invented. The installed baseline still has its prior behaviour.
+
+**Problem (deployed baseline).** Prepare & Verify can run expensive source work with little feedback.
 Scan/Analyze already stream some structured progress, but long phases without an
 event may appear frozen. The separate **Verify Sources** handler currently returns
 one final string, and its button explicitly sets `show_progress='hidden'` — there
@@ -2062,7 +2064,7 @@ A status must not be claimed terminal while its worker still runs. Check real
 Gradio UI activity during a deliberately slow synthetic operation, plus focused
 stale-input, duplicate-click, no-event interval and exception regressions.
 
-**Status:** **UX-ZERO-KEEP = SOURCE IMPLEMENTED / DRAFT PR #108 / NOT MERGED / NOT INSTALLED / GUI SMOKE PENDING / OWNER ACCEPTANCE PENDING**. **UX-BROWSE-LAYOUT** and **UX-PREP-ACTIVITY** remain **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**. They are independent bounded tasks; this roadmap-only update does not authorise a merge, deployment or production-media changes.
+**Status:** **UX-ZERO-KEEP = SOURCE IMPLEMENTED / DRAFT PR #108**; **UX-PREP-ACTIVITY = SOURCE IMPLEMENTED / DRAFT PR #109**. Both remain **NOT MERGED / NOT INSTALLED / GUI SMOKE PENDING / OWNER ACCEPTANCE PENDING**. **UX-BROWSE-LAYOUT = ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**. All are independent bounded tasks; this roadmap-only update does not authorise a merge, deployment or production-media changes.
 
 ---
 
@@ -2098,7 +2100,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R16** — Music Playlist Mode for Video Render | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner ideas 2026-11-03, scope accepted 2026-11-12). Ordered multiple songs with Move Up/Down, Shuffle and Sort by Name; one continuous soundtrack for beat/shot planning and rendering; visible order is frozen, no silent reshuffle. Existing single-track and R10 Repeat Music remain unchanged by default; playlist-repeat interaction is a future explicit decision |
 | **R17** — Chrome / Windows notifications on long-job completion | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner idea 2026-11-04, scope accepted 2026-11-12). Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional R17-B research (service worker / Push), NOT promised for V1 — **no service worker, Push server, daemon, background poller or extension is authorised**. Accepting the scope authorises no source work and no deploy |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
-| **UX follow-ups** — zero-Keep all-Discard, Browse alignment, Prepare & Verify activity | **UX-ZERO-KEEP SOURCE IMPLEMENTED** in draft PR #108 (`3de9ea7d`), source-tested/reviewed; **NOT MERGED / INSTALLED / GUI-ACCEPTED**. **UX-BROWSE-LAYOUT** and **UX-PREP-ACTIVITY** remain **ACCEPTED, NOT IMPLEMENTED** (owner feedback 2026-11-18). No change to product priority order |
+| **UX follow-ups** — zero-Keep all-Discard, Browse alignment, Prepare & Verify activity | **UX-ZERO-KEEP SOURCE IMPLEMENTED** in draft PR #108 (`3de9ea7d`); **UX-PREP-ACTIVITY SOURCE IMPLEMENTED** in draft PR #109 (`d26529ba`), tests reported green; both **NOT MERGED / INSTALLED / GUI-ACCEPTED**. **UX-BROWSE-LAYOUT ACCEPTED · NOT IMPLEMENTED**. No change to product priority order |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
