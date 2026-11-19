@@ -1135,9 +1135,14 @@ CLIPS_GALLERY_JS = r"""
     // `_clips_render_current`. The two must agree or the button lights at the wrong moment --
     // and the server is the authority either way, so a disagreement here only ever costs an
     // extra read or a late enable, never a wrong enable.
-    if (counts.TOTAL > 0 && counts.SELECTED > 0) { text += '\n' + __REFRESH_HINT__; }
+    // [FORK] UX-ZERO-KEEP: or at least one clip explicitly DISCARDED, which is the same rule
+    // `_clips_render_current` and `_on_clips_scan` now derive from the durable record. This file
+    // still decides nothing: it appends display text and presses the Refresh control the operator
+    // used to press by hand, and nothing here is permitted to touch the button at all.
+    const ready = counts.TOTAL > 0 && (counts.SELECTED > 0 || counts.REJECTED > 0);
+    if (ready) { text += '\n' + __REFRESH_HINT__; }
     box.value = text;
-    syncConfirm(counts.TOTAL > 0 && counts.SELECTED > 0);
+    syncConfirm(ready);
   }
 
   // [UX] Ask the server to re-derive the Confirm state, but only when the all-decided answer
@@ -11521,10 +11526,17 @@ def _clips_render_current(owner: str, report: str):
     # unfinished requirement rather than a deliberate difference -- an operator picking six good
     # shots out of two hundred had to click the other 194 before the button would light.
     #
+    # [FORK] UX-ZERO-KEEP: or at least one clip explicitly marked DISCARD. The keep-only rule left
+    # an operator who found nothing worth keeping with no way forward at all -- the button stayed
+    # dark however many clips they rejected, because a Keep was the only thing that lit it. An
+    # explicit Discard is a real decision about a real clip and admits the page too; a page with
+    # NO decision on it still refuses, which is what the bulk action exists for.
+    #
     # Nothing about the authority changed: still derived from `store.counts()`, the durable
     # record, and this is still the only place that moves the button.
     return (report, grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.SELECTED] > 0))
+            gr.update(interactive=counts[fork_clips.SELECTED] > 0
+                      or counts[fork_clips.REJECTED] > 0))
 
 
 def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, page_size,
@@ -11686,10 +11698,17 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     # unfinished requirement rather than a deliberate difference -- an operator picking six good
     # shots out of two hundred had to click the other 194 before the button would light.
     #
+    # [FORK] UX-ZERO-KEEP: or at least one clip explicitly marked DISCARD. The keep-only rule left
+    # an operator who found nothing worth keeping with no way forward at all -- the button stayed
+    # dark however many clips they rejected, because a Keep was the only thing that lit it. An
+    # explicit Discard is a real decision about a real clip and admits the page too; a page with
+    # NO decision on it still refuses, which is what the bulk action exists for.
+    #
     # Nothing about the authority changed: still derived from `store.counts()`, the durable
     # record, and this is still the only place that moves the button.
     return (report, grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.SELECTED] > 0))
+            gr.update(interactive=counts[fork_clips.SELECTED] > 0
+                      or counts[fork_clips.REJECTED] > 0))
 
 
 def _clips_decide(owner, session_id, page_token, entry, payload):
@@ -11900,7 +11919,30 @@ def _on_clips_confirm(armed='', request: gr.Request = None):
     return frame
 
 
-def _clips_confirm_frames(armed='', request: gr.Request = None):
+def _clips_discard_all_frames(armed='', request: gr.Request = None):
+    """"Discard all loaded clips": the same press, admitted by a rule the operator asked for.
+
+    [FORK] UX-ZERO-KEEP. A page with nothing marked at all is admitted by nothing -- not by
+    `can_sort`, which wants a Keep, and not by `can_sort_discard_only`, which wants an explicit
+    Discard. That is correct as a default: a page nobody has looked at must not be filable by one
+    press. What was missing is a way for the operator to *say* the whole page is rubbish, which is
+    the ordinary case for a bad shoot and previously meant rejecting a token clip to unlock a
+    button.
+
+    This is that statement, and it is deliberately **not a second transfer path**. It delegates to
+    `_clips_confirm_frames`, so every check, every refusal, the destination re-validation, the
+    single-flight claim, the snapshot re-read under the reservation, the one transfer engine and
+    the page-generation rule are reached through exactly the code Confirm reaches them through. A
+    separate handler would have been a separate copy of all of it, and each copy a place for one
+    of those checks to go missing.
+
+    `yield from` rather than a loop, so the frame sequence -- and `GeneratorExit` on an abandoned
+    event, which is what releases the transfer slot -- passes through unaltered.
+    """
+    yield from _clips_confirm_frames(armed, request, discard_all=True)
+
+
+def _clips_confirm_frames(armed='', request: gr.Request = None, *, discard_all=False):
     """Sort this page: SELECTED to the Media Library, REJECTED to the Discarded folder.
 
     [R13] **A generator**, and what the Confirm and Proceed buttons are wired to, so the Working
@@ -11939,8 +11981,41 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     unmarked clips are swept to Discarded **only** after an explicit Proceed on that exact batch.
     The durable record is never written by the sweep: see `decision_of` below.
 
+    [FORK] UX-ZERO-KEEP -- THREE ADMISSION RULES, ONE TRANSFER.
+
+    A page with nothing worth keeping had no way forward: `can_sort` wants a Keep, and the
+    operator had none to make. So the handler now states which rule admitted the press, and the
+    rules are named properties of the shared `SortPlan` rather than tests re-derived here:
+
+    ```
+    plan.can_sort                >= 1 Keep                      Confirm   (unchanged)
+    plan.can_sort_discard_only   0 Keeps, >= 1 explicit Discard  Confirm   (new)
+    plan.can_discard_whole_page  0 Keeps, >= 1 clip              Discard all loaded clips (new)
+    ```
+
+    `can_sort` itself is untouched, because Audio Review is admitted by it too and nobody asked to
+    change that surface.
+
+    `discard_all` is **keyword-only and is not a widget value**. It is set by one entry point,
+    `_clips_discard_all_frames`, and recovered on the Proceed that follows from the arming token's
+    own prefix -- so the browser cannot ask for the bulk rule by sending a different string in the
+    one input this handler takes. What it can do is present an arming that no longer matches a
+    freshly derived plan, which fails the comparison and shows the gate again.
+
+    Three properties of the bulk path that are requirements rather than consequences:
+
+    * **It only ever means the loaded, server-authoritative page.** The entries are `view`'s
+      frozen page -- the same set `identities`, the reservation and the sort are built from -- so
+      "all" cannot reach the folder, a later page, an earlier page or another session's page.
+    * **It always goes through the gate**, even when every clip is already explicitly rejected and
+      the ordinary path would need no confirmation. The operator asked for a bulk action; they see
+      the exact counts and the destination, and press Proceed, before anything moves.
+    * **It never overrides a Keep.** A page carrying one is refused in words, and the plan's own
+      rule says so too, so the refusal cannot drift from the admission.
+
     Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
-    page with no clip kept, destinations that no longer validate, a transfer already running --
+    page with no decision on it at all (or, for the bulk action, a page carrying a Keep),
+    destinations that no longer validate, a transfer already running --
     this page, this folder, or [F-2] a different folder holding some of these very clips -- and
     [F-1] a durable decision still being written, or one that landed while this press was deriving
     its plan.
@@ -12018,7 +12093,26 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
         view['entries'], {entry.clip_id: _decision(entry) for entry in view['entries']},
         view.get('library', ''), view.get('rejected', ''))
 
-    if not plan.can_sort:
+    # [FORK] UX-ZERO-KEEP: which confirmation is in play. `discard_all` is this press's own entry
+    # point; the prefix is the one the operator already agreed to at the gate, carried on the
+    # arming state. Either is enough, because reaching the gate requires the bulk rule to have
+    # admitted the press in the first place.
+    armed_signature, armed_discard_all = fork_clips.read_arm_token(armed)
+    bulk = bool(discard_all) or armed_discard_all
+
+    # The bulk action's one refusal of its own, and it is the reason it is a separate rule rather
+    # than a wider `can_sort`: a page with clips marked Keep is not a page the operator is asking
+    # to bin. Refused in words, before anything is claimed or validated, so nothing moves and no
+    # Keep is silently reinterpreted as a Discard.
+    if bulk and plan.keep:
+        yield _clips_confirm_only(
+            CLIPS_DISCARD_ALL_HAS_KEEPS_TEXT.format(kept=len(plan.keep)))
+        return
+
+    # Admission. The rules live on the plan; this names the one that applies and nothing more.
+    admitted = plan.can_discard_whole_page if bulk else (
+        plan.can_sort or plan.can_sort_discard_only)
+    if not admitted:
         yield _clips_confirm_only(
             f"❌ {CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
             f"{len(plan.unmarked)} of {plan.total} clip(s) are still undecided.")
@@ -12036,16 +12130,35 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     # still matches, NOTHING MOVES: the counts and the consequence are shown and Proceed/Cancel
     # are revealed. The signature covers every clip id, its decision and both destinations, so
     # changing any of them voids the arming and the gate is shown again.
-    if plan.has_unmarked and str(armed or '') != plan.signature:
+    #
+    # [FORK] UX-ZERO-KEEP: the bulk action NEEDS a gate agreement unconditionally. Ordinarily the
+    # gate exists for unmarked clips, so a page of explicit decisions needs no second press -- but
+    # a bulk action is a statement about clips the operator has not individually judged, and the
+    # counts and the destination are exactly what they have to see before it happens. One gate,
+    # one preview, one signature, one Proceed; the arming carries which intent was agreed.
+    #
+    # "Needs an agreement" is deliberately not "always shows the bulk gate first", and the
+    # difference is observable: an ordinary sweep arming that still matches this plan satisfies the
+    # comparison below, so a bulk press made while one is held sorts on its FIRST press. That is
+    # correct rather than a hole, and it rests on `bulk` being read nowhere past this gate -- it
+    # selects an admission rule and a heading, and never reaches `decision_of` or the transfer. The
+    # bulk rule admits only a page with zero Keeps, and with zero Keeps the ordinary sweep and the
+    # bulk discard move the same clips to the same folder, so the arming the operator agreed to
+    # describes exactly what happens. A Keep is refused above, before this is reached at all.
+    needs_gate = bulk or plan.has_unmarked
+    if needs_gate and armed_signature != plan.signature:
         preview = fork_clips.plan_preview_lines(
             plan, roots[fork_clips.ROLE_LIBRARY].real, roots[fork_clips.ROLE_REJECTED].real)
-        message = "\n".join([CLIPS_SWEEP_GATE_HEADING, ''] + preview
-                            + ['', CLIPS_SWEEP_GATE_PROMPT])
+        heading = CLIPS_DISCARD_ALL_GATE_HEADING if bulk else CLIPS_SWEEP_GATE_HEADING
+        prompt = CLIPS_DISCARD_ALL_GATE_PROMPT if bulk else CLIPS_SWEEP_GATE_PROMPT
+        message = "\n".join([heading, ''] + preview + ['', prompt])
         # [R13] One frame, and deliberately NOT a Working frame: the gate moves nothing, so
         # announcing work here would be the "dead button" complaint inverted -- a spinner for an
         # operation that has not been authorised yet. The slot is not claimed either, for the same
         # reason: a gate the operator never answers must not leave the page marked busy.
-        yield _clips_confirm_only(message, gate=True, signature=plan.signature)
+        yield _clips_confirm_only(
+            message, gate=True,
+            signature=fork_clips.arm_token(plan.signature, discard_all=bulk))
         return
 
     def decision_of(entry):
@@ -13804,6 +13917,20 @@ def create_ui() -> gr.Blocks:
                         clips_confirm_btn = gr.Button(
                             LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
                             elem_id='clips-confirm-button')
+                        # [FORK] UX-ZERO-KEEP: the explicit bulk action, for a page with nothing
+                        # worth keeping.
+                        #
+                        # It carries NO `interactive=` of its own, and that is deliberate rather
+                        # than an omission. Confirm's enabled state is derived from the durable
+                        # record in exactly two places (R5-P3 / F8) and adding a second
+                        # server-managed button state would mean widening every frame this tab's
+                        # handlers emit -- for presentation, since the authorization boundary here
+                        # is never a widget. The server refuses the press instead: a page with a
+                        # Keep on it is told so in words, and a retired or unscanned page is
+                        # refused by `_clips_view` being empty, exactly as Confirm is.
+                        clips_discard_all_btn = gr.Button(
+                            LABEL_CLIPS_DISCARD_ALL, variant='secondary',
+                            elem_id='clips-discard-all-button')
                         # [FORK] R8 Final Polish: the sweep gate, mirroring Audio Review exactly.
                         # Hidden until a Confirm finds unmarked clips, and the ONE thing that can
                         # authorise moving them. `clips_armed_state` holds the batch signature
@@ -15780,6 +15907,24 @@ def create_ui() -> gr.Blocks:
         # those checks would be a way around them.
         clips_proceed_btn.click(
             fn=_clips_confirm_frames,
+            inputs=[clips_armed_state],
+            outputs=_clips_confirm_outputs,
+            concurrency_limit=None,
+        )
+        # [FORK] UX-ZERO-KEEP: a THIRD entry point to the same generator, and the same eight
+        # outputs. `_clips_discard_all_frames` sets one keyword-only flag and delegates, so this is
+        # not a second sorting path: the destination validation, the single-flight claim, the
+        # snapshot re-read under the reservation, the one transfer engine and the page-generation
+        # rule are all the ones Confirm goes through. `concurrency_limit=None` for the same
+        # measured S2-A R3 reason as the two above -- a lane of 1 would QUEUE a duplicate press
+        # instead of letting `_CLIPS_TRANSFERS` refuse it.
+        #
+        # It sends the arming state too, so a Proceed is not the only way to complete the gate it
+        # opens: pressing the bulk action twice against an unchanged page is the same two-step
+        # agreement, and against a changed page the signature no longer matches and the gate is
+        # shown again.
+        clips_discard_all_btn.click(
+            fn=_clips_discard_all_frames,
             inputs=[clips_armed_state],
             outputs=_clips_confirm_outputs,
             concurrency_limit=None,

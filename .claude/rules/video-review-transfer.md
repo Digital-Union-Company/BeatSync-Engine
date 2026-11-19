@@ -313,11 +313,53 @@ Consequences, each covered by a test:
 * two locks, two spans, **never nested**: `_clips_view`, `newest` and even `invalidate` all still
   answer *while* a batch is being sorted.
 
+## A third entry point, and why it is not a third transfer (UX-ZERO-KEEP)
+
+`clips_discard_all_btn` is wired to `gui._clips_discard_all_frames`, which sets one keyword-only
+flag and `yield from`s `_clips_confirm_frames`. It is the operator's way to say "nothing on this
+page is worth keeping" without first rejecting a token clip to unlock a button; the admission rules
+and the arming token are `.claude/rules/clips-preview.md`.
+
+What matters **here** is that it adds no authority:
+
+* **One `begin`, one `begin_decision`, one `_conflicting_transfer`.** The bulk press claims the
+  slot at the same call site, with the same owner, `root_key` and identity set, after the same
+  refusals-that-change-nothing. The F-1 invariant and the F-2 identity rule are unchanged and cover
+  it for free — which they would **not** do for a second handler with its own claim.
+* **`concurrency_limit=None` on the third registration too**, for the measured S2-A R3 reason: a
+  lane of 1 would leave a duplicate press *queued* rather than letting the guard refuse it.
+* **The frame shape is the same contract.** The bulk gate is a refusal-shaped single frame that
+  claims **no slot**, and `discard_all` is reached before admission, so nothing about "no Working
+  frame for a press that moves nothing" changes.
+* **A bulk press CAN be the `1 + N + 1` shape on its first press, and that is measured.** The bulk
+  path needs a gate *agreement* unconditionally — which is not the same as always showing the bulk
+  gate first. An ordinary sweep arming that still matches the freshly derived plan satisfies the
+  comparison, so a bulk press made while one is held sorts immediately: measured at **5 frames**
+  on a three-clip page carrying one explicit Discard and an ordinary arming, with the bulk heading
+  never shown. Do not "fix" this by re-gating on the intent, and do not write that the bulk gate is
+  always displayed. It is sound for a reason worth keeping: `bulk` is read **nowhere past the
+  gate** — not by `decision_of`, not by the reservation, not by the transfer — so it selects an
+  admission rule and a heading and cannot change where a file goes. The bulk rule admits only a
+  page with zero Keeps, and with zero Keeps the ordinary sweep and the bulk discard move the same
+  clips to the same folder, so the arming the operator agreed to describes exactly what happens.
+  The reverse direction is covered by the Keep refusal, which is reached *before* the signature
+  comparison.
+* **The release and the generation rule are the same ones.** `end` still lives in the one `finally`
+  — including for an abandoned bulk event, where `yield from` propagates `GeneratorExit` unaltered
+  — and the finished transfer still decides what it may publish from
+  `_CLIPS_SCANS.is_current(owner, generation)` and nothing else.
+
+Do not give the bulk action its own handler, its own guard call, its own signature or its own sort.
+Two admission paths would be two places for the F-1 snapshot re-read and the F-2 identity claim to
+go missing, and the whole argument above is that there is exactly one.
+
 ## What R13 did NOT change, and must not acquire
 
 * **The two-step confirmation.** A batch with unmarked clips still needs an explicit Proceed on
   that exact signature, the signature is still a change detector rather than a credential, and the
   sweep still writes **no durable decision** — an unmarked clip swept to Discarded stays `PENDING`.
+  UX-ZERO-KEEP kept all three: it added a prefix recording *which* confirmation was agreed, not a
+  way to skip one.
 * **Collision behaviour.** `collision.SKIP` and `collision.SUFFIX` are reused as they are, read
   from the operator's saved preference. No date stamp, no hash, no hand-rolled counter — a test
   bans those names in the handler body. Single-flight is also what makes the named hazard
