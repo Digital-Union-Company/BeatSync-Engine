@@ -377,6 +377,58 @@ new `tests/test_raw_cutter_naming.py`. The 88 added tests cover the job-wide sou
 batch through the real handler and an executable negative control in which the superseded
 per-index rule fails the ordering requirement.
 
+
+#### R4-D — Disk-full protection for Raw Cutter exports · **ACCEPTED SCOPE — PLANNED, NOT IMPLEMENTED**
+
+**Owner incident, 2026-11-16.** A Folder Batch attempted 15 sources; 5 completed, 1 was
+partial and 9 failed. FFmpeg repeatedly returned `-28 (No space left on device)`; 580 of
+1,137 planned clips (8.2 GB) were reported written, then the final
+`batch_manifest.json` could not be saved with `Errno 28`. The trace supports output
+storage exhaustion, **not a finding of corrupt source video**. Which underlying volume
+failed (output versus any staging/temp location), and whether every reported clip is
+playable, remain unverified. Private source names and local filesystem paths are
+deliberately omitted from this public roadmap.
+
+**Required bounded hardening, separate from the scene detector and R2 research:**
+
+- **Preflight and between-clip capacity checks.** Check the actual destination and
+  staging/temp volumes used by the exporter, not an assumed drive letter. Show measured
+  available space and a clearly qualified headroom estimate where feasible. Refuse an
+  obviously unwritable job before spending minutes analysing it, and re-check before
+  subsequent clips. A successful preflight never claims a future write is guaranteed.
+- **Immediate storage-exhaustion stop.** Classify FFmpeg `No space left on device`,
+  Python `ENOSPC` and the equivalent Windows disk-full error as a distinct **output
+  storage failure**, not a broken video or a generic encoder fault. Stop scheduling
+  further exports/sources after the first confirmed storage-full failure; terminate
+  and reap any owned child processes safely, preserve the shared job lock and honour
+  actual Cancel semantics. Mark the current source partial if any verified clips
+  were published, and later sources not attempted, rather than generating repeated
+  failures for every clip in the queue.
+- **Keep completed results safe.** Preserve source videos and successfully published
+  clips; maintain staging, atomic no-overwrite publication and validation before a
+  clip counts as exported. Never delete existing user outputs, caches or media as an
+  automatic recovery. Do not present an incomplete MP4 as a finished clip.
+- **Recoverable progress and manifest truth.** Persist bounded, atomic per-source
+  checkpoints while space is still available, and reuse the existing manifest/report
+  mechanism rather than inventing another coordinator. If a physically full volume
+  still prevents the final manifest write, say so explicitly; never claim it was
+  saved. Keep R11's **Review these clips** handoff usable for the clips that really
+  exist even if the manifest is missing. A later attempt must use a fresh output
+  directory and must not silently overwrite the earlier partial run.
+- **Focused regression proof.** Fault-inject a full volume before the first clip and
+  after several successful clips, through both FFmpeg and manifest-write seams.
+  Assert one terminal storage-full outcome, no later FFmpeg export attempts, correct
+  completed/partial/not-attempted counters, no false success or corrupt published
+  clip, honest manifest warnings and continued review handoff. Check Single Video
+  and Folder Batch, NVENC and CPU paths at the shared error boundary, plus
+  cancellation and no-overwrite regressions. Run a small real-FFmpeg smoke only
+  in an isolated, disposable, safely bounded workspace; never fill a real drive.
+
+**Status:** accepted for the roadmap by the owner on 2026-11-17, not yet
+implemented, tested, merged, installed or owner-accepted. No release date or change
+to the existing numbered product priority order is implied.
+
+
 #### Remaining R4 ideas · **PLANNED, NOT IMPLEMENTED**
 
 - **Cancellation during an active FFmpeg segment**, rather than only between clips.
@@ -2108,6 +2160,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
+| **R4-D** — Raw Cutter disk-full protection and partial-run manifest | **ACCEPTED SCOPE · NOT IMPLEMENTED** (owner incident 2026-11-16; accepted 2026-11-17). Capacity checks on actual output/staging volumes, fail-fast on `ENOSPC`/FFmpeg `-28`, preserve already exported clips, durable checkpoints where possible, truthful missing-manifest reporting, and focused regressions. No other priority changes |
 
 ### Current priority order (product-owner decision)
 
