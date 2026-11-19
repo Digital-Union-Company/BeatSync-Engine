@@ -1927,8 +1927,14 @@ _SAMPLE_SEAM_FUNCTIONS = (
     "_verify_session_key", "_scoped_key",
     "_touch_verify_revision_locked", "_verify_revision",
     "_bump_verify_revision", "_begin_verify_session", "_end_verify_session",
-    "_on_verify_sources_click", "_on_verify_invalidate",
-    "_on_sample_decode_click", "_on_sample_invalidate",
+    # [FORK] UX-PREP-ACTIVITY: the phase slot and the shared activity stream. The mutex gate, the
+    # pin and the staleness comparison for BOTH operations now live in their frames generators --
+    # the functions the buttons are wired to -- so the seam has to execute those to be executing
+    # the real concurrency code. The two collected forms are kept in the list because every test
+    # below still drives them by name.
+    "_mark_prep_phase", "_prep_phase_now", "_activity_frames",
+    "_verify_sources_frames", "_on_verify_sources_click", "_on_verify_invalidate",
+    "_sample_decode_frames", "_on_sample_decode_click", "_on_sample_invalidate",
 )
 
 
@@ -1957,9 +1963,20 @@ def _load_p2_seam(cap=None):
     state = {"sample_calls": [], "verify_calls": [],
              "sample_impl": lambda path, seek: "SAMPLE_REPORT",
              "verify_impl": lambda folder, recursive: "VERIFY_REPORT"}
+    import queue as queue_module
+    import time as time_module
+    from beatsync_fork import prep_activity as prep_activity_module
     namespace = {
         "gr": _FakeSampleGradio,
         "threading": threading,
+        # [FORK] UX-PREP-ACTIVITY: what the shared activity stream needs. Real stdlib modules and
+        # the real pure formatting module; the cadence is read from the shipped assignment rather
+        # than restated, for the same reason `_VERIFY_REVISION_CAP` is.
+        "queue": queue_module,
+        "time": time_module,
+        "fork_prep_activity": prep_activity_module,
+        "_ACTIVITY_TICK_SECONDS": _gui_constant(tree, "_ACTIVITY_TICK_SECONDS"),
+        "_prep_phase": _gui_constant(tree, "_prep_phase"),
         "_RENDER_LOCK": threading.Lock(),
         "_VERIFY_FLAG_LOCK": threading.Lock(),
         # [FORK] S2-B P2 (Option B): the holder lookup reads the EXISTING active-render slot as
@@ -2255,7 +2272,11 @@ def test_the_holder_is_cleared_before_the_mutex_is_released():
     had already ended.
     """
     tree = _tree(_GUI)
-    handler = _func(tree, "_on_sample_decode_click")
+    # [FORK] UX-PREP-ACTIVITY: the mutex gate, the holder token and the staleness
+    # comparison now live in `_sample_decode_frames` -- the generator the button is wired
+    # to. `_on_sample_decode_click` is the collected form that drains it. The property
+    # asserted here is unchanged; only the function holding it moved.
+    handler = _func(tree, "_sample_decode_frames")
     body = [ast.unparse(node) for node in handler.body]
     finallies = [n for n in ast.walk(handler) if isinstance(n, ast.Try) and n.finalbody]
     assert finallies, "the release must sit in a finally"
@@ -2271,7 +2292,11 @@ def test_the_holder_is_cleared_before_the_mutex_is_released():
 def test_the_sample_marks_the_holder_only_after_acquiring():
     """Marking before the acquire would publish a holder that does not hold anything."""
     tree = _tree(_GUI)
-    body = [ast.unparse(node) for node in _func(tree, "_on_sample_decode_click").body]
+    # [FORK] UX-PREP-ACTIVITY: the mutex gate, the holder token and the staleness
+    # comparison now live in `_sample_decode_frames` -- the generator the button is wired
+    # to. `_on_sample_decode_click` is the collected form that drains it. The property
+    # asserted here is unchanged; only the function holding it moved.
+    body = [ast.unparse(node) for node in _func(tree, "_sample_decode_frames").body]
     acquire_at = next(i for i, s in enumerate(body)
                       if "_RENDER_LOCK.acquire(blocking=False)" in s)
     mark_at = next(i for i, s in enumerate(body) if "_mark_lock_holder(_LOCK_HOLDER_SAMPLE)" in s)
@@ -2602,7 +2627,10 @@ def test_the_sample_event_has_its_own_unlimited_lane(p2_gui_tree):
     keywords = _p2_click_keywords(p2_gui_tree, "sample_btn")
     assert "concurrency_id" not in keywords, keywords
     assert keywords.get("concurrency_limit") == "None", keywords
-    assert keywords.get("fn") == "_on_sample_decode_click", keywords
+    # [FORK] UX-PREP-ACTIVITY: the button is wired to the GENERATOR, so an accepted click can say
+    # so immediately instead of returning one string when the work is already over. The collected
+    # form keeps the name, the signature and the string return for every non-Gradio caller.
+    assert keywords.get("fn") == "_sample_decode_frames", keywords
     assert keywords.get("inputs") == "[sample_path, sample_seek]", keywords
     assert keywords.get("outputs") == "[sample_report]", keywords
     assert keywords.get("show_progress") == "'hidden'", keywords
@@ -3028,10 +3056,15 @@ def test_only_the_diagnostics_mark_the_holder_and_each_clears_before_release(p2_
     assert len(_calls_named(p2_gui_tree, "_mark_verification(True)")) == 1
     assert len(_calls_named(p2_gui_tree, "_mark_verification(False)")) == 1
     # Every mutex-owning diagnostic clears inside the same finally that releases, clear-then-release.
-    for handler, clear in (("_on_sample_decode_click", "_mark_lock_holder('')"),
+    #
+    # [FORK] UX-PREP-ACTIVITY: the two Prepare & Verify diagnostics gate inside their frames
+    # generators now, so that is where their clear-then-release `finally` lives. The Raw Cutter
+    # pair is untouched. Same assertion and same rule, with two names pointing at the functions
+    # that actually own the mutex.
+    for handler, clear in (("_sample_decode_frames", "_mark_lock_holder('')"),
                            ("_on_cut_run", "_mark_lock_holder('')"),
                            ("_on_cut_batch_run", "_mark_lock_holder('')"),
-                           ("_on_verify_sources_click", "_mark_verification(False)")):
+                           ("_verify_sources_frames", "_mark_verification(False)")):
         finallies = [n for n in ast.walk(_func(p2_gui_tree, handler))
                      if isinstance(n, ast.Try) and n.finalbody]
         assert finallies, handler

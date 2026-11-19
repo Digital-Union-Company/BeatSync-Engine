@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ import types
 
 import pytest
 
+from beatsync_fork import prep_activity as fork_prep_activity
 from beatsync_fork.library_prep import NeedReason, PrepStatus
 from beatsync_fork.media_verify import (
     DEFAULT_BUDGET_SECONDS,
@@ -908,10 +910,21 @@ class _FakeGradio:
 # spelling and still extracted, so every assertion below still exercises the shipped call chain.
 _CONCURRENCY_SEAM_FUNCTIONS = (
     "_mark_lock_holder", "_lock_holder_now", "_mark_verification",
+    # [FORK] UX-PREP-ACTIVITY: the phase slot. Same shape as the holder token above -- one
+    # lock-guarded module string, published by the running operation's worker thread and copied by
+    # the generator. Extracted rather than stubbed, because the seam's whole value is that it runs
+    # the SHIPPED mutex/pin/staleness code, and these are now on that path.
+    "_mark_prep_phase", "_prep_phase_now",
     "_busy_message", "_verify_busy_message", "_sample_busy_message",
     "_verify_session_key", "_scoped_key",
     "_touch_verify_revision_locked", "_verify_revision",
     "_bump_verify_revision", "_begin_verify_session", "_end_verify_session",
+    # [FORK] UX-PREP-ACTIVITY: the mutex gate, the pin and the staleness comparison now live in
+    # `_verify_sources_frames` -- the generator the button is wired to. `_on_verify_sources_click`
+    # is kept as the collected form and is still driven by every test below, which is exactly why
+    # BOTH must be in the seam: the assertions are about the real acquire/release and the real
+    # revision bookkeeping, and those moved one function inwards.
+    "_activity_frames", "_verify_sources_frames",
     "_on_verify_sources_click", "_on_verify_invalidate",
 )
 
@@ -954,6 +967,16 @@ def _load_concurrency_seam(cap=None):
     namespace = {
         "gr": _FakeGradio,
         "threading": threading,
+        # [FORK] UX-PREP-ACTIVITY: what the activity stream needs. `queue` and `time` are stdlib and
+        # are the real ones; `fork_prep_activity` is the real pure module, because its formatting is
+        # part of what these tests observe. `_ACTIVITY_TICK_SECONDS` is read from the shipped
+        # assignment rather than restated, for the same reason `_VERIFY_REVISION_CAP` is -- a
+        # literal here could drift from the cadence production actually uses.
+        "queue": queue,
+        "time": time,
+        "fork_prep_activity": fork_prep_activity,
+        "_ACTIVITY_TICK_SECONDS": _module_constant(tree, "_ACTIVITY_TICK_SECONDS"),
+        "_prep_phase": _module_constant(tree, "_prep_phase"),
         "_RENDER_LOCK": threading.Lock(),
         "_VERIFY_FLAG_LOCK": threading.Lock(),
         # [FORK] S2-B P2: the holder token and its three shipped values, read from the module
@@ -1190,8 +1213,12 @@ def test_the_render_gate_still_refuses_on_a_single_nonblocking_acquire(gui_tree)
     releases = [node for node in ast.walk(gui_tree)
                 if isinstance(node, ast.Call) and ast.unparse(node) == "_RENDER_LOCK.release()"]
     assert len(releases) == 6, f"one release per acquire, got {len(releases)}"
-    handler = ast.unparse(_func(gui_tree, "_on_verify_sources_click"))
-    tried = [n for n in ast.walk(_func(gui_tree, "_on_verify_sources_click"))
+    # [FORK] UX-PREP-ACTIVITY: the verification gate is now `_verify_sources_frames`. The release
+    # is still in a `finally` -- and it now additionally sits after the activity stream's own
+    # `finally` has joined the worker thread, so the mutex still covers the whole of the disk work
+    # even when the Gradio event is abandoned.
+    handler = ast.unparse(_func(gui_tree, "_verify_sources_frames"))
+    tried = [n for n in ast.walk(_func(gui_tree, "_verify_sources_frames"))
              if isinstance(n, ast.Try) and n.finalbody]
     assert tried, "the release must sit in a finally"
     assert "_RENDER_LOCK.release()" in ast.unparse(tried[0].finalbody[-1]) or \
@@ -2909,8 +2936,15 @@ def test_only_the_begin_end_pair_ever_assigns_the_pin(gui_tree):
 
 
 def test_the_click_captures_its_baseline_after_taking_the_mutex(gui_tree):
-    """Requirement A/J, structurally: the capture must not precede the acquire."""
-    body = ast.unparse(_func(gui_tree, "_on_verify_sources_click"))
+    """Requirement A/J, structurally: the capture must not precede the acquire.
+
+    [FORK] UX-PREP-ACTIVITY: asserted against `_verify_sources_frames`, which is where the mutex,
+    the pin and the staleness comparison now live -- the generator the button is wired to.
+    `_on_verify_sources_click` is the collected form that drains it, so asserting this ordering
+    there would be asserting it about a function that performs none of these steps. The property
+    and the required order are unchanged; only the function holding them moved.
+    """
+    body = ast.unparse(_func(gui_tree, "_verify_sources_frames"))
     acquire_at = body.index("_RENDER_LOCK.acquire(blocking=False)")
     begin_at = body.index("_begin_verify_session(session)")
     end_at = body.index("_end_verify_session(session, revision)")

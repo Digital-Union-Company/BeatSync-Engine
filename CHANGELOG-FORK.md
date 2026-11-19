@@ -100,6 +100,150 @@ runtime, model, cache or installer change; nothing about *where* a file goes cha
 
 Full contract: `.claude/rules/clips-preview.md` ("Three admission rules, one transfer") and
 `.claude/rules/video-review-transfer.md` ("A third entry point").
+### Fixed — 2026-11-19 (UX-PREP-ACTIVITY R2: an activity notice may only describe its own operation)
+
+**Accepted source-review finding on PR #109.** R1's Scan/Analyze activity notice was built with
+`phase=_prep_phase_now() or fork_prep_activity.PHASE_WORKING`, so it read the one global
+`_prep_phase` diagnostic slot. **That slot is written only by the mutex-holding Verify and Sample
+impls.** Scan and Analyze take no lock — they run on their own unlimited Gradio lanes through
+`prep_scan_btn.click` / `prep_analyze_btn.click` — so they genuinely overlap a Verify or a Sample,
+across events or across sessions, and a silent Scan tick rendered:
+
+```
+Scan Library — Reading media headers..   (00:01 elapsed)
+```
+
+One operation's phase under another operation's name, which is precisely the truthful-phase
+requirement the item exists to satisfy. Reproduced deterministically on the shipped seam before the
+correction (`_run_prep_in_worker` AST-extracted, a Verify phase published into the shared slot, one
+forced poll tick), and confirmed gone after it.
+
+**The correction is scoping, and it is one line of behaviour.** `_run_prep_in_worker`'s notice now
+names `fork_prep_activity.PHASE_WORKING` unconditionally. Scan and Analyze lose nothing: their real,
+detailed phases are already in the report box through `ProgressView`, and this line's job was only
+ever to prove the operation is alive through a stretch that emits no `ProgressEvent`.
+
+**R1's single-global argument was not wrong, it was over-claimed.** `_RENDER_LOCK` admits one
+operation at a time, so at most one phase is load-bearing *among the operations that take the lock*.
+The participant that broke it was a **reader** outside the lock. The slot is now scoped to the
+mutex-holding path on both sides:
+
+```
+WRITERS  _verify_sources_impl, _sample_decode_impl,
+         _verify_sources_frames, _sample_decode_frames     -- all hold _RENDER_LOCK
+READERS  _activity_frames                                  -- runs only inside those two generators
+```
+
+`test_every_writer_and_reader_of_the_phase_slot_holds_the_mutex` pins both as **exact sets** rather
+than banning a name, so a future read from an unlocked path fails in the suite rather than in front
+of an operator.
+
+**What this did NOT add:** no new coordinator, mutex, slot, phase vocabulary, progress protocol,
+GUI component or output. `ProgressView`, worker lifetime, the join-before-release ordering, the
+revision pin, the staleness rule, the four terminal states and both events' lanes are untouched;
+`beatsync_fork/prep_activity.py` is unchanged.
+
+**Verification.** Six new tests in `tests/test_prep_activity.py` (section 5b), driving the shipped
+Scan/Analyze path over the **same namespace** as the verification seam — deliberately one shared
+`_prep_phase`, because a second namespace would give each family its own slot and the test would
+pass vacuously. Covered: the forward leak for Scan *and* Analyze; the reverse direction with a real
+Verify stream and a real Scan stream alive simultaneously, each keeping its own phase and operation
+name; no phase outliving a terminated operation into a later Scan tick; and the two structural
+pins. Five of the six fail against the pre-fix line; the sixth confirms the already-correct
+post-termination behaviour the review also asked to check.
+
+### Added — 2026-11-19 (UX-PREP-ACTIVITY R1: Prepare & Verify shows trustworthy in-flight state)
+
+**Two of the four Prepare & Verify operations had no in-flight state at all.** Scan Library and
+Analyze already streamed structured `ProgressEvent`s through `ProgressView`. **Verify Sources and
+Sample Decode were plain functions returning one final string**, wired with
+`show_progress='hidden'` — so an accepted click and a dead button were indistinguishable for as
+long as the work took, and the work is a bounded sweep over a library that can hold thousands of
+files. Owner-approved roadmap item **UX-PREP-ACTIVITY** (draft PR #107).
+
+A function cannot say "working" and then work. That is R13's observation about Video Review's
+Confirm, and it is answered the same way:
+
+```
+prep_verify_btn -> _verify_sources_frames   generator; _on_verify_sources_click = collected form
+sample_btn      -> _sample_decode_frames    generator; _on_sample_decode_click  = collected form
+both            -> _activity_frames         ONE shared stream: worker thread + bounded poll
+```
+
+**The two collected forms are kept with their exact signatures and string returns**, because
+`test_media_verify.py` calls them directly and compares by equality and an AST test pins the
+parameter list. The buttons are wired to the generators; a caller that does not need frames does
+not have to care that they exist.
+
+**`inputs` and `outputs` are unchanged on both events.** `outputs=[prep_verify_report]` is pinned
+five ways across two accepted suites, and both report boxes are `gr.Textbox`, so the indicator is
+**plain text inside the one existing box** — no second component joins a pinned outputs list, and
+the isolation contract (verification writes its own report and nothing else, so it can neither
+enable a render nor move the preparation state machine) survives untouched.
+
+**The mutex, the holder token, the revision pin and the staleness comparison moved one function
+inwards and are otherwise identical** — same calls, same order, same `finally`, same
+clear-then-release, same acquire/release site counts, `_RENDER_LOCK.locked()` still nowhere. The
+AST tests that pinned them now name the generators, which is where those steps actually happen.
+
+**The join is before the release, and that ordering is load-bearing.** `progress-events.md` states
+that a generator's lifetime is its worker's lifetime because the caller's mutex is released the
+moment the generator returns. Verify and Sample hold `_RENDER_LOCK` across the stream, so an
+abandoned event that released it while the worker was still issuing FFprobe reads would let a
+render start into exactly the D0 disk contention the mutex exists to prevent. `_activity_frames`
+joins in its own `finally`, and `yield from` closes it first — so join, then the staleness
+decision, then clear the phase, then clear the token, then release. **Abandoning the event
+therefore waits for the work; that is not a cancellation and nothing is built on it as one.**
+
+**The honesty rules are the point.** Elapsed is always a real `perf_counter` reading and the pure
+module reads no clock at all (a test walks its AST for one). Counts render only as two real
+non-negative integers with `total > 0` — `bool` rejected first, since it subclasses `int` — and
+anything else falls back to indeterminate, because a count the module accepts becomes a determinate
+figure on screen. **No ETA, no rate, no throughput, ever**, not even when counts are known.
+Verify and Sample publish phases rather than counters, so a test asserts no frame of theirs shows a
+percentage or a `done / total`. The pulse is mechanical rather than decorative: a Gradio update
+byte-identical to the previous one is **not delivered** (the hazard the R5 grid nonce exists for),
+so without it a frame that rendered the same would simply not arrive and the panel would freeze
+while work continued.
+
+**Four terminal states stay distinct and verbatim** — the report, `SOURCE VERIFICATION FAILED` /
+`SAMPLE DECODE FAILED`, the busy refusal naming the real holder, and the superseded notice. The
+stream decorates none of them. **A refusal emits exactly one frame and no activity frame**: an
+indicator for work that was declined is the dead-button complaint inverted, and a test asserts the
+refusal still captures no revision, pins nothing, performs no work and does not run later when the
+mutex frees (the S2-A R3 defect, restated for this stream).
+
+`_prep_phase` is one lock-guarded module string shaped exactly like `_lock_holder`, and a single
+global is sound **for the reason the R5 revision pin is sound**: `_RENDER_LOCK` admits one
+operation at a time, so at most one phase is ever load-bearing. It is diagnostic only — nothing
+branches on it — and it is cleared in the `finally`, so a later operation can never show an
+earlier one's phase. Sample's phases come from wrapping the two injected seam callables rather than
+restating `run_sample_check`'s sequence, and the keyword set reaching it is still exactly
+`{probe, decode}` with two positional arguments, so the resource policy is **still enforced by
+omission**.
+
+**Scan and Analyze: `_run_prep_in_worker`'s event wait was unbounded**, so between two
+`ProgressEvent`s it yielded nothing and a phase emitting no event (a cold library's identity pass,
+a Qwen worker loading its model) left the panel frozen with nothing to distinguish working from
+wedged. It is now a one-second poll emitting a measured activity notice into the existing
+`prep_status`, so the preparation event wiring stays byte-identical. A timeout is not a sleep: an
+event arriving mid-interval is applied immediately.
+
+`media_verify.py`, `media_sample.py`, `library_prep.py` and `video_analysis.py` are **untouched** —
+no new cache write, no new probe, no new classification, no changed verdict, no new coordinator, job
+manager or background service, and nothing new in `gr.State`.
+
+**Verification.** `tests/test_prep_activity.py` — 38 tests in two halves: the pure module as
+ordinary imported code (every honesty rule, the bool/float/`None` count matrix, elapsed
+truncation, the pulse, the no-clock and no-runtime-import AST guards), and the **shipped handlers**
+through `test_media_verify.py`'s own seam loader — the real mutex, token, pin and staleness
+comparison with only the disk work stubbed. Those include a multi-tick silent phase asserting
+frames advance with a non-decreasing measured clock, all four terminal states proven to be four
+different strings, a counting-lock test proving exactly one release on both the success and the
+exception path, a two-thread duplicate press admitting exactly one, and a `KeyboardInterrupt` that
+propagates while still releasing everything. Whole suite: see the task report for the figure.
+
+Full contract: `.claude/rules/prep-activity.md`.
 
 ### Fixed — 2026-11-13 (R15-C / F-5: a stale page turn republished the folder the operator left)
 
