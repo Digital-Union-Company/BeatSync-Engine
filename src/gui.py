@@ -239,6 +239,12 @@ from beatsync_fork import raw_cutter_profiles as fork_profiles
 # clock-injected -- it owns the phase vocabulary, the two timers and the panel markup; this module
 # supplies the readings and the facts.
 from beatsync_fork import raw_cutter_activity as fork_activity
+# [FORK] Digital-Union (UX-PREP-ACTIVITY): the in-flight activity vocabulary for Prepare & Verify.
+# Pure and clock-free -- it owns the phase labels, the pulse and the rendered block, and the callers
+# below supply every measurement. It reuses `raw_cutter_activity.format_elapsed` rather than
+# defining a second elapsed formatter, and it starts nothing: `_RENDER_LOCK` is still the only
+# authority on whether Verify or Sample may run.
+from beatsync_fork import prep_activity as fork_prep_activity
 # [FORK] Digital-Union (Raw Cutter R11): the finished job's handoff record. Pure, and the gate on
 # whether review is offered at all lives in it -- a record exists only when clips really reached
 # disk, so "do not offer an empty folder" is a property of the record rather than a check a
@@ -1209,9 +1215,14 @@ CLIPS_GALLERY_JS = r"""
     // `_clips_render_current`. The two must agree or the button lights at the wrong moment --
     // and the server is the authority either way, so a disagreement here only ever costs an
     // extra read or a late enable, never a wrong enable.
-    if (counts.TOTAL > 0 && counts.SELECTED > 0) { text += '\n' + __REFRESH_HINT__; }
+    // [FORK] UX-ZERO-KEEP: or at least one clip explicitly DISCARDED, which is the same rule
+    // `_clips_render_current` and `_on_clips_scan` now derive from the durable record. This file
+    // still decides nothing: it appends display text and presses the Refresh control the operator
+    // used to press by hand, and nothing here is permitted to touch the button at all.
+    const ready = counts.TOTAL > 0 && (counts.SELECTED > 0 || counts.REJECTED > 0);
+    if (ready) { text += '\n' + __REFRESH_HINT__; }
     box.value = text;
-    syncConfirm(counts.TOTAL > 0 && counts.SELECTED > 0);
+    syncConfirm(ready);
   }
 
   // [UX] Ask the server to re-derive the Confirm state, but only when the all-decided answer
@@ -4841,6 +4852,62 @@ def _mark_verification(active: bool) -> None:
     _mark_lock_holder(_LOCK_HOLDER_VERIFY if active else '')
 
 
+# --------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (UX-PREP-ACTIVITY): WHICH phase the one running operation is in.
+#
+# Verify and Sample do their work on a worker thread while their generator emits activity frames,
+# and the generator cannot see inside the call it is waiting on. This slot is how the work tells it,
+# and it is deliberately the same shape as `_lock_holder` above: one module-level string, one small
+# lock, published by the worker and copied by the reader.
+#
+# **A single global slot is sound here for exactly the reason the R5 revision pin is sound --
+# but that soundness belongs to the MUTEX HOLDERS, and so the slot is scoped to them.**
+# `_RENDER_LOCK` admits at most ONE of render / verify / sample at a time, so among the operations
+# that take it at most one phase is ever load-bearing -- the same invariant `source-verification.md`
+# leans on when it says "at most one revision is load-bearing at any instant".
+#
+# **Scan and Analyze are NOT among them, and that is why they must not read this slot.** They run
+# on their own unlimited Gradio lanes through `prep_scan_btn.click` / `prep_analyze_btn.click` and
+# take no lock, so they genuinely can overlap a Verify or a Sample -- across sessions or across
+# events. UX-PREP-ACTIVITY R2 (accepted source review of PR #109) measured the consequence on the
+# shipped seam: with a Verify in `PHASE_MEDIA_HEADERS`, a silent Scan tick rendered
+# `Scan Library - Reading media headers`, attributing one operation's phase to another. So the
+# WRITERS of this slot are exactly the lock-holding Verify/Sample impls, and its READERS are
+# exactly the lock-holding `_activity_frames` stream. `_run_prep_in_worker` -- the one activity
+# path that does not hold the mutex -- names its own generic `PHASE_WORKING` unconditionally and
+# never consults this slot. The scoping is the fix; a second slot or a coordinator is not needed,
+# because the two families never have to describe each other.
+#
+# It is DIAGNOSTIC ONLY, and nothing branches on it. A stale, missing or late phase can only word a
+# line of text: it can never admit a worker, release a mutex, publish a report, change a verdict or
+# move a revision. `''` means "no phase has been published yet", which renders as the honest
+# `PHASE_STARTING` rather than guessing at one.
+# --------------------------------------------------------------------------------------------
+
+#: The phase label the running MUTEX-HOLDING operation (Verify / Sample) last published, or `''`
+#: for none. Scan and Analyze neither write nor read it -- see the paragraph above.
+_prep_phase: str = ''
+
+
+def _mark_prep_phase(phase: str) -> None:
+    """Publish the phase the running operation has just entered. Never raises.
+
+    Called from the operation's own worker thread. Putting a string in a lock-guarded global is the
+    only cross-thread action, so this is not "touching a Gradio component from a worker thread" --
+    the generator still does every widget update, exactly as `_run_prep_in_worker`'s
+    `event_callback` only ever calls `queue.put`.
+    """
+    global _prep_phase
+    with _VERIFY_FLAG_LOCK:
+        _prep_phase = str(phase or '')
+
+
+def _prep_phase_now() -> str:
+    """The current phase label, or `''` if none has been published."""
+    with _VERIFY_FLAG_LOCK:
+        return _prep_phase
+
+
 def _busy_message() -> str:
     """The accurate refusal for a RENDER caller that just failed to take `_RENDER_LOCK`.
 
@@ -5868,13 +5935,29 @@ def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
         state, fork_prep.summarize_analysis_run(result, submitted=len(subset)))
 
 
-def _run_prep_in_worker(work, state) -> Iterator[Tuple]:
+def _run_prep_in_worker(work, state, *,
+                        operation: str = fork_prep_activity.OPERATION_SCAN) -> Iterator[Tuple]:
     """Run one preparation step on a worker thread, streaming structured progress to the UI.
 
     Same shape as `process_video`, and for the same reasons: the pipeline prints to a stdout the GUI
     discards, Stage 1-4 and Stage 5 emit `ProgressEvent`s from worker threads, and Gradio components
     may only be touched from the generator. `work` takes ``(event_callback, console_logger)`` and
     returns the new preparation state.
+
+    [FORK] Digital-Union (UX-PREP-ACTIVITY): the event wait is now BOUNDED.
+
+    It used to be `status_queue.get()` with no timeout, so between two `ProgressEvent`s this
+    generator yielded nothing at all -- and a phase that emits no event (a long identity pass over a
+    cold library, or a Qwen worker loading its model) left the panel frozen on its last line with
+    nothing to distinguish "working" from "wedged". That is this item's complaint for the two
+    operations that already stream.
+
+    The wait is now a one-second poll, and a tick with no event emits an activity notice carrying
+    the pulse and a MEASURED elapsed reading. Three things it deliberately does not do: it invents
+    no count (the report box shows `ProgressView`'s real ones when they exist), it fabricates no
+    percentage or ETA, and it does not restate the phase `ProgressView` is already rendering -- the
+    notice says `Working` and the box says which stage. A timeout is not a sleep: an event arriving
+    mid-interval is applied immediately, so the cadence never delays anything.
     """
     status_queue: queue.Queue[object | None] = queue.Queue()
     result_queue: queue.Queue[object] = queue.Queue(maxsize=1)
@@ -5902,11 +5985,40 @@ def _run_prep_in_worker(work, state) -> Iterator[Tuple]:
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
+    started = time.perf_counter()
+    pulse = 0
+
+    def notice() -> str:
+        """The activity line: operation, pulse, and a measured elapsed reading. Never an estimate.
+
+        **The phase is this operation's own generic `PHASE_WORKING`, and `_prep_phase` is
+        deliberately not consulted.** That slot is published only by the mutex-holding Verify and
+        Sample impls; Scan and Analyze hold no lock, so reading it attributed another operation's
+        phase to this one -- measured as `Scan Library - Reading media headers` while a Verify was
+        in its header sweep (UX-PREP-ACTIVITY R2). Scan and Analyze lose nothing by it: their real,
+        detailed phases are already in the report box through `ProgressView`, and this line's job
+        is only to prove the operation is alive during a stretch that emits no event.
+        """
+        return fork_prep_activity.activity_line(fork_prep_activity.ActivityState(
+            operation=operation,
+            phase=fork_prep_activity.PHASE_WORKING,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            pulse=pulse))
+
     last_rendered = "Starting…"
-    yield _prep_busy_updates(state, last_rendered, "Working…")
+    yield _prep_busy_updates(state, last_rendered, notice())
 
     while True:
-        item = status_queue.get()
+        try:
+            item = status_queue.get(timeout=_ACTIVITY_TICK_SECONDS)
+        except queue.Empty:
+            # No event this interval. The operation is still running, so say so with a figure that
+            # was measured -- and advance the pulse, so this frame differs from the last one. A
+            # byte-identical Gradio update is not delivered, so a frame that looked the same would
+            # simply not arrive and the panel would freeze while work continued.
+            pulse += 1
+            yield _prep_busy_updates(state, last_rendered, notice())
+            continue
         if item is None:
             break
         if not isinstance(item, ProgressEvent):
@@ -5916,7 +6028,7 @@ def _run_prep_in_worker(work, state) -> Iterator[Tuple]:
         rendered = view.render()
         if rendered != last_rendered:
             last_rendered = rendered
-            yield _prep_busy_updates(state, rendered, "Working…")
+            yield _prep_busy_updates(state, rendered, notice())
 
     thread.join()
     yield _prep_ui_updates(result_queue.get())
@@ -5928,7 +6040,93 @@ def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tu
             folder_path, recursive, state,
             event_callback=event_callback, console_logger=console_logger),
         state,
+        operation=fork_prep_activity.OPERATION_SCAN,
     )
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (UX-PREP-ACTIVITY): the shared in-flight activity stream.
+# ---------------------------------------------------------------------------
+
+#: How often an in-flight frame is emitted while an operation runs. One second is the cadence the
+#: Raw Cutter's activity panel already ticks at, so the two surfaces feel the same, and it is slow
+#: enough that a long operation costs a bounded number of frames (600 for a ten-minute verify).
+#: It is a POLL TIMEOUT, not a sleep: a result arriving mid-interval is yielded immediately, so the
+#: cadence never delays a terminal answer.
+_ACTIVITY_TICK_SECONDS = 1.0
+
+
+def _activity_frames(operation: str, work, outcome: dict) -> Iterator[str]:
+    """Run `work()` on a worker thread, yielding in-flight activity text about once a second.
+
+    [FORK] Digital-Union (UX-PREP-ACTIVITY). A function cannot say "working" and then work -- the
+    same observation R13 made about Video Review's Confirm, reached here by the same route: Verify
+    Sources and Sample Decode returned one final string, so an accepted click and a dead button
+    were indistinguishable for as long as the work took.
+
+    This is deliberately the shape `_run_prep_in_worker` already uses, and for the same three
+    reasons: the work is blocking, Gradio components may only be touched from the generator, and
+    the worker's only cross-thread action is putting one object on a `Queue`. It is **not** a job
+    manager -- it starts one thread for one call, owns no registry, and schedules nothing.
+
+    `outcome` is filled in with ``ok`` and ``value`` rather than returned, because a generator's
+    return value is awkward to reach through `yield from` and this is driven by one.
+
+    **The `finally` JOINS, and that ordering is load-bearing.** `progress-events.md` states the rule
+    for `process_video`: a generator's lifetime is its worker's lifetime, because the caller's mutex
+    is released the moment the generator returns. Verify and Sample hold `_RENDER_LOCK` across this
+    stream, so if an abandoned event released that mutex while the worker was still issuing FFprobe
+    reads, a render could start into exactly the disk contention the mutex exists to prevent. With
+    `yield from`, closing the outer generator closes this one first -- so the join happens here,
+    *then* the caller's `finally` releases the lock. Abandoning the event therefore waits for the
+    work, exactly as abandoning a render does; it is not a cancellation and must not be called one.
+
+    Nothing is yielded from the `finally`: yielding during a close raises `RuntimeError`, which
+    would replace a clean join with a second failure (R13's rule, restated).
+    """
+    done: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        # Worker thread. One `queue.put` is its only cross-thread action -- no Gradio component is
+        # touched here, exactly as in `_run_prep_in_worker` and `process_video`.
+        try:
+            value = work()
+        except BaseException as exc:              # noqa: BLE001 - recorded, re-classified by caller
+            done.put((False, exc))
+        else:
+            done.put((True, value))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    started = time.perf_counter()
+    thread.start()
+    try:
+        # The immediate frame: an accepted request says so before it does anything, which is the
+        # whole requirement. Elapsed is a real reading rather than a literal zero, so this line is
+        # measured on the same basis as every frame after it.
+        yield fork_prep_activity.working_text(fork_prep_activity.ActivityState(
+            operation=operation,
+            phase=_prep_phase_now() or fork_prep_activity.PHASE_STARTING,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0))
+        pulse = 0
+        while True:
+            try:
+                ok, value = done.get(timeout=_ACTIVITY_TICK_SECONDS)
+            except queue.Empty:
+                # Still working. The phase comes from the operation itself and the clock from this
+                # thread; neither is predicted, and there is no count to show because nothing
+                # measured one.
+                pulse += 1
+                yield fork_prep_activity.working_text(fork_prep_activity.ActivityState(
+                    operation=operation,
+                    phase=_prep_phase_now() or fork_prep_activity.PHASE_STARTING,
+                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                    pulse=pulse))
+                continue
+            outcome['ok'] = ok
+            outcome['value'] = value
+            return
+    finally:
+        thread.join()
 
 
 # ---------------------------------------------------------------------------
@@ -5971,6 +6169,11 @@ def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
     #    `_prep_scan_impl`: duplicate grouping is a source-screen reporting feature and would be
     #    pure extra reads here.
     scan_started = time.perf_counter()
+    # [FORK] Digital-Union (UX-PREP-ACTIVITY): publish the phase this call is entering. Diagnostic
+    # only -- nothing here branches on it, and it reaches the screen through the activity stream's
+    # generator rather than from this thread. The labels are plain language on purpose: an operator
+    # reading "Listing files in the folder" knows what is happening.
+    _mark_prep_phase(fork_prep_activity.PHASE_ENUMERATING)
     try:
         input_set = scan_library_folder(folder, recursive=recursive, detect_duplicates=False)
     except (InputScanError, OSError) as exc:
@@ -5986,12 +6189,14 @@ def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
     #    produced PREPARED (old bytes) beside METADATA_OK (new bytes) under one COMPLETE banner.
     #    One `os.stat` per source, aligned BY POSITION so a duplicate path keeps its own
     #    observation. No hash, no second identity formula, nothing persisted.
+    _mark_prep_phase(fork_prep_activity.PHASE_FINGERPRINTING)
     baselines = fork_media_verify.fingerprint_sources(sources)
 
     # 3. The cache question, through the EXISTING Stage-5 classifier. No new key formula, no new
     #    completion rule, and the same Qwen enablement/model resolution the preparation workflow
     #    uses -- `_resolve_prep_qwen_runtime` is shared, not reimplemented.
     cache_started = time.perf_counter()
+    _mark_prep_phase(fork_prep_activity.PHASE_CACHE_RECORDS)
     qwen_enabled, model_path = _resolve_prep_qwen_runtime()
     classification = classify_library_sources(
         sources, enable_ai=qwen_enabled, qwen_model_path=model_path)
@@ -6009,9 +6214,11 @@ def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
     #    workers, a per-file timeout, and an overall budget after which unreached sources are
     #    reported as not checked rather than quietly omitted. The baselines from step 2 ride along,
     #    so each verdict can see whether its own file moved since its own classification.
+    _mark_prep_phase(fork_prep_activity.PHASE_MEDIA_HEADERS)
     run = fork_media_verify.verify_media_health(
         sources, probe_media_metadata, baselines=baselines)
 
+    _mark_prep_phase(fork_prep_activity.PHASE_REPORT)
     return fork_media_verify.format_verification_report(
         folder=folder, recursive=recursive, verified_at=verified_at,
         source_count=len(sources),
@@ -6053,6 +6260,49 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
     comparison is made while the entry is still pinned), *published or withheld*. R5's correction is
     entirely about the third state: before it, the entry could be evicted between the second and
     third, and its absence read back as "revision 0, nothing changed".
+
+    [FORK] Digital-Union (UX-PREP-ACTIVITY): this is the COLLECTED form of
+    `_verify_sources_frames`, kept because it is what every existing caller and test drives -- it
+    drains to the last frame, which is exactly the string this function returned before the
+    activity stream existed. The *button* is wired to the generator; a caller that does not need
+    in-flight frames should not have to care that they exist. (The same split R13 made between
+    `_on_clips_confirm` and `_clips_confirm_frames`, for the same reason.)
+    """
+    # `''` rather than a module constant: this initializer is UNREACHABLE (every path through the
+    # generator yields at least once), and the concurrency seam tests exec these handlers into a
+    # synthesized namespace that deliberately holds only the names the logic needs -- so naming a
+    # constant here would make the collected form depend on a module global it never returns.
+    frame = ''
+    for frame in _verify_sources_frames(folder_path, recursive, request):
+        pass
+    return frame
+
+
+def _verify_sources_frames(folder_path: str, recursive: bool,
+                           request: gr.Request = None) -> Iterator[str]:
+    """Verify Sources as a GENERATOR: say "working", then work, then answer.
+
+    [FORK] Digital-Union (UX-PREP-ACTIVITY). The mutex, the holder token, the revision pin and the
+    staleness comparison are **unchanged** -- same calls, same order, same `finally`. What is new is
+    that the accepted path streams activity frames while the work runs on a worker thread, so a long
+    verification is visibly alive instead of looking like a dead button for minutes.
+
+    Frame shape, which is the contract:
+
+    | Press | Frames |
+    |---|---|
+    | Refused (`_RENDER_LOCK` held by a render, another verify or a sample) | **exactly 1**, byte-for-byte the string the pre-activity function returned, and **no activity frame** |
+    | No folder named | **exactly 1** (the impl's own refusal, reached through the stream) |
+    | Accepted | **1 + N + 1** -- an immediate activity frame, one per tick, then the terminal answer |
+
+    **A refusal gets no activity frame, and nothing is pinned on that path.** An indicator for work
+    that was declined is the dead-button complaint inverted, and it is the same discipline R13
+    applies to the sweep gate and `ScanCoordinator` applies to a scan refused for a bad folder.
+
+    The four terminal answers stay **distinct and verbatim** -- the report, `SOURCE VERIFICATION
+    FAILED`, `_verify_busy_message()` and `PREP_VERIFY_STALE_TEXT`. The activity stream decorates
+    none of them; tests compare them by equality, and "completed", "failed", "refused" and
+    "superseded" lead an operator somewhere different.
     """
     # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): scoped to 'verify' so a sample-decode input edit
     # cannot invalidate this verification, and this folder edit cannot invalidate a sample.
@@ -6060,9 +6310,14 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
 
     if not _RENDER_LOCK.acquire(blocking=False):
         # Names the real holder: a render, or another verification already underway. Nothing is
-        # pinned and no revision is captured on this path -- a refused click leaves no state at all.
-        return _verify_busy_message()
+        # pinned and no revision is captured on this path -- a refused click leaves no state at all,
+        # and emits no activity frame, because nothing was started.
+        yield _verify_busy_message()
+        return
     _mark_verification(True)
+    # A fresh operation publishes no stale phase: the slot is cleared before the work starts, so the
+    # immediate frame reads `Starting` rather than inheriting whatever ran last.
+    _mark_prep_phase('')
     # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R5): pinned and captured together, AFTER the mutex is
     # held and BEFORE any work, so this session's revision cannot be evicted by other sessions'
     # churn while the verification it belongs to is still running. `stale` is decided inside the
@@ -6073,22 +6328,41 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
     # default -- the `finally` always assigns it, and the only way past it without one is an
     # exception propagating, which never reaches the comparison.
     revision = 0
+    outcome: dict = {}
     try:
         revision = _begin_verify_session(session)
-        try:
-            report = _verify_sources_impl(folder_path, recursive)
-        except Exception as exc:
+        # The work runs on a worker thread; this streams activity until it finishes. The inner
+        # generator's own `finally` joins that thread, and because `yield from` closes it first, the
+        # join completes BEFORE the mutex is released below -- so the lock still covers the whole of
+        # the disk work even when the operator abandons the event.
+        yield from _activity_frames(
+            fork_prep_activity.OPERATION_VERIFY,
+            lambda: _verify_sources_impl(folder_path, recursive),
+            outcome)
+        failure = None if outcome.get('ok') else outcome.get('value')
+        if failure is None:
+            report = outcome.get('value')
+        elif isinstance(failure, Exception):
             # Total: a verification that raised must report, not vanish behind Gradio's generic
-            # error and not leave the operator unable to tell whether anything ran.
+            # error and not leave the operator unable to tell whether anything ran. `print_exception`
+            # rather than `print_exc` because the exception was caught on the worker thread and is
+            # no longer the one being handled here.
             import traceback
-            traceback.print_exc()
-            report = (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
+            traceback.print_exception(type(failure), failure, failure.__traceback__)
+            report = (f"SOURCE VERIFICATION FAILED\n  {type(failure).__name__}: {failure}\n\n"
                       f"No analysis, cache change, media change or render was performed.")
+        else:
+            # Not an `Exception` -- `KeyboardInterrupt` or `SystemExit`. Propagated rather than
+            # reported, exactly as the pre-activity `except Exception` did: an interrupted operation
+            # is never described as a problem with the operator's files. The `finally` below still
+            # drops the pin, the token and the mutex.
+            raise failure
     finally:
         # The staleness decision happens HERE, while the entry is still pinned, and the pin is
         # released by the same locked call. Reached on every terminal path including a
         # `BaseException` propagating out, so the pin can never outlive its verification.
         stale = _end_verify_session(session, revision)
+        _mark_prep_phase('')
         # Cleared BEFORE the release, so a caller that fails the acquire a moment later attributes
         # the mutex to whoever actually holds it next.
         _mark_verification(False)
@@ -6099,8 +6373,9 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
     # newer "the folder changed" notice with an older answer about a folder that is no longer
     # selected. The failure text is withheld for the same reason: it names a folder too.
     if stale:
-        return PREP_VERIFY_STALE_TEXT
-    return report
+        yield PREP_VERIFY_STALE_TEXT
+        return
+    yield report
 
 
 def _on_verify_invalidate(request: gr.Request = None) -> str:
@@ -6156,11 +6431,29 @@ def _sample_decode_impl(video_path: str, seek_seconds) -> str:
     if isinstance(path, str) and not path:
         return PREP_SAMPLE_NO_PATH_TEXT
 
+    # [FORK] Digital-Union (UX-PREP-ACTIVITY): the phase is published from the SEAM rather than
+    # guessed at here. `run_sample_check` owns the order of its own work, so wrapping the two
+    # injected callables is the only place this layer can observe which one is running without
+    # duplicating the orchestrator's sequence -- and a duplicated sequence would be a second
+    # statement of the core's control flow, drifting the moment that core changed.
+    #
+    # The keyword set reaching `run_sample_check` is still exactly `{probe, decode}` and the
+    # positional arguments are still exactly two, so the resource policy is still enforced by
+    # omission: there is no new parameter, and no widget value can reach one.
+    def _probe_with_phase(*args, **kwargs):
+        _mark_prep_phase(fork_prep_activity.PHASE_STREAM_METADATA)
+        return probe_media_metadata(*args, **kwargs)
+
+    def _decode_with_phase(*args, **kwargs):
+        _mark_prep_phase(fork_prep_activity.PHASE_SAMPLE_DECODE)
+        return sample_decode_video(*args, **kwargs)
+
     verdict = fork_media_sample.run_sample_check(
         path, seek_seconds,
-        probe=probe_media_metadata,
-        decode=sample_decode_video,
+        probe=_probe_with_phase,
+        decode=_decode_with_phase,
     )
+    _mark_prep_phase(fork_prep_activity.PHASE_REPORT)
     return fork_media_sample.format_sample_report(verdict)
 
 
@@ -6186,6 +6479,35 @@ def _on_sample_decode_click(video_path: str, seek_seconds,
 
     `request` is Gradio's injected `gr.Request`, not a widget: it is read for `session_hash` only,
     defaults to `None` so the function stays callable without Gradio, and never reaches `gr.State`.
+
+    [FORK] Digital-Union (UX-PREP-ACTIVITY): the COLLECTED form of `_sample_decode_frames`, kept
+    because it is what existing callers and tests drive -- it drains to the last frame, which is
+    exactly the string this returned before the activity stream existed.
+    """
+    # Unreachable initializer, and deliberately not a module constant -- see
+    # `_on_verify_sources_click` for why the seam namespace makes that matter.
+    frame = ''
+    for frame in _sample_decode_frames(video_path, seek_seconds, request):
+        pass
+    return frame
+
+
+def _sample_decode_frames(video_path: str, seek_seconds,
+                          request: gr.Request = None) -> Iterator[str]:
+    """Sample Decode as a GENERATOR: say "working", then work, then answer.
+
+    [FORK] Digital-Union (UX-PREP-ACTIVITY). Structurally identical to `_verify_sources_frames`,
+    and that is the point -- it is the same activity stream over the third holder of one mutex, not
+    a second mechanism. The mutex, the holder token, the revision pin and the staleness comparison
+    are unchanged in call, order and `finally`.
+
+    A refusal is **exactly one frame and no activity frame**: nothing was started, so announcing
+    work would be a lie. The four terminal answers stay distinct and verbatim -- the report,
+    `SAMPLE DECODE FAILED`, `_sample_busy_message()` and `PREP_SAMPLE_STALE_TEXT`.
+
+    A bounded 30 s decode is short next to a library verification, but it is long enough to look
+    like a dead button, and the probe before it is unbounded in the operator's perception. The
+    stream costs one thread and one frame a second either way.
     """
     # Scoped to 'sample': this session's own file/seek edits invalidate it, a folder edit does not,
     # and another session's edits never do.
@@ -6194,29 +6516,46 @@ def _on_sample_decode_click(video_path: str, seek_seconds,
     if not _RENDER_LOCK.acquire(blocking=False):
         # Names the real holder -- render, verification, another sample, or honestly unknown for
         # the one-statement window before a holder publishes itself. Nothing is pinned and no
-        # revision is captured on this path: a refused click leaves no state at all.
-        return _sample_busy_message()
+        # revision is captured on this path: a refused click leaves no state at all, and no
+        # activity frame is emitted because nothing was started.
+        yield _sample_busy_message()
+        return
     _mark_lock_holder(_LOCK_HOLDER_SAMPLE)
+    _mark_prep_phase('')
     # Pinned and captured together, AFTER the mutex is held and BEFORE any work, so this session's
     # revision cannot be evicted by other sessions' churn while the sample it belongs to is still
     # running. `stale` is decided inside the same `finally` that drops the pin.
     revision = 0
+    outcome: dict = {}
     try:
         revision = _begin_verify_session(session)
-        try:
-            report = _sample_decode_impl(video_path, seek_seconds)
-        except Exception as exc:
+        # Same discipline as the verification stream: the inner generator's `finally` joins the
+        # worker before this function's `finally` releases the mutex, so an abandoned event cannot
+        # free the lock while an FFprobe or FFmpeg child is still reading the disk.
+        yield from _activity_frames(
+            fork_prep_activity.OPERATION_SAMPLE,
+            lambda: _sample_decode_impl(video_path, seek_seconds),
+            outcome)
+        failure = None if outcome.get('ok') else outcome.get('value')
+        if failure is None:
+            report = outcome.get('value')
+        elif isinstance(failure, Exception):
             # Total: a sample that raised must report, not vanish behind Gradio's generic error.
             import traceback
-            traceback.print_exc()
-            report = (f"SAMPLE DECODE FAILED\n  {type(exc).__name__}: {exc}\n\n"
+            traceback.print_exception(type(failure), failure, failure.__traceback__)
+            report = (f"SAMPLE DECODE FAILED\n  {type(failure).__name__}: {failure}\n\n"
                       f"No analysis, cache change, media change or render was performed.")
+        else:
+            # `KeyboardInterrupt` / `SystemExit`: propagated, never reported as a file problem --
+            # the same rule `media_sample` states for its own `except Exception`.
+            raise failure
     finally:
         # The staleness decision happens HERE, while the entry is still pinned, and the pin is
         # released by the same locked call. Reached on every terminal path including a
         # `BaseException` propagating out, so neither the pin, the holder token nor the mutex can
         # outlive this sample.
         stale = _end_verify_session(session, revision)
+        _mark_prep_phase('')
         _mark_lock_holder('')
         _RENDER_LOCK.release()
 
@@ -6225,8 +6564,9 @@ def _on_sample_decode_click(video_path: str, seek_seconds,
     # answer about a file or position that is no longer selected. The failure text is withheld for
     # the same reason: it names a path too.
     if stale:
-        return PREP_SAMPLE_STALE_TEXT
-    return report
+        yield PREP_SAMPLE_STALE_TEXT
+        return
+    yield report
 
 
 # ============================================================================================
@@ -7682,6 +8022,7 @@ def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
             state, live, batch_size,
             event_callback=event_callback, console_logger=console_logger),
         state,
+        operation=fork_prep_activity.OPERATION_ANALYZE,
     )
 
 
@@ -11595,10 +11936,17 @@ def _clips_render_current(owner: str, report: str):
     # unfinished requirement rather than a deliberate difference -- an operator picking six good
     # shots out of two hundred had to click the other 194 before the button would light.
     #
+    # [FORK] UX-ZERO-KEEP: or at least one clip explicitly marked DISCARD. The keep-only rule left
+    # an operator who found nothing worth keeping with no way forward at all -- the button stayed
+    # dark however many clips they rejected, because a Keep was the only thing that lit it. An
+    # explicit Discard is a real decision about a real clip and admits the page too; a page with
+    # NO decision on it still refuses, which is what the bulk action exists for.
+    #
     # Nothing about the authority changed: still derived from `store.counts()`, the durable
     # record, and this is still the only place that moves the button.
     return (report, grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.SELECTED] > 0))
+            gr.update(interactive=counts[fork_clips.SELECTED] > 0
+                      or counts[fork_clips.REJECTED] > 0))
 
 
 def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, page_size,
@@ -11760,10 +12108,17 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     # unfinished requirement rather than a deliberate difference -- an operator picking six good
     # shots out of two hundred had to click the other 194 before the button would light.
     #
+    # [FORK] UX-ZERO-KEEP: or at least one clip explicitly marked DISCARD. The keep-only rule left
+    # an operator who found nothing worth keeping with no way forward at all -- the button stayed
+    # dark however many clips they rejected, because a Keep was the only thing that lit it. An
+    # explicit Discard is a real decision about a real clip and admits the page too; a page with
+    # NO decision on it still refuses, which is what the bulk action exists for.
+    #
     # Nothing about the authority changed: still derived from `store.counts()`, the durable
     # record, and this is still the only place that moves the button.
     return (report, grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.SELECTED] > 0))
+            gr.update(interactive=counts[fork_clips.SELECTED] > 0
+                      or counts[fork_clips.REJECTED] > 0))
 
 
 def _clips_decide(owner, session_id, page_token, entry, payload):
@@ -11974,7 +12329,30 @@ def _on_clips_confirm(armed='', request: gr.Request = None):
     return frame
 
 
-def _clips_confirm_frames(armed='', request: gr.Request = None):
+def _clips_discard_all_frames(armed='', request: gr.Request = None):
+    """"Discard all loaded clips": the same press, admitted by a rule the operator asked for.
+
+    [FORK] UX-ZERO-KEEP. A page with nothing marked at all is admitted by nothing -- not by
+    `can_sort`, which wants a Keep, and not by `can_sort_discard_only`, which wants an explicit
+    Discard. That is correct as a default: a page nobody has looked at must not be filable by one
+    press. What was missing is a way for the operator to *say* the whole page is rubbish, which is
+    the ordinary case for a bad shoot and previously meant rejecting a token clip to unlock a
+    button.
+
+    This is that statement, and it is deliberately **not a second transfer path**. It delegates to
+    `_clips_confirm_frames`, so every check, every refusal, the destination re-validation, the
+    single-flight claim, the snapshot re-read under the reservation, the one transfer engine and
+    the page-generation rule are reached through exactly the code Confirm reaches them through. A
+    separate handler would have been a separate copy of all of it, and each copy a place for one
+    of those checks to go missing.
+
+    `yield from` rather than a loop, so the frame sequence -- and `GeneratorExit` on an abandoned
+    event, which is what releases the transfer slot -- passes through unaltered.
+    """
+    yield from _clips_confirm_frames(armed, request, discard_all=True)
+
+
+def _clips_confirm_frames(armed='', request: gr.Request = None, *, discard_all=False):
     """Sort this page: SELECTED to the Media Library, REJECTED to the Discarded folder.
 
     [R13] **A generator**, and what the Confirm and Proceed buttons are wired to, so the Working
@@ -12013,8 +12391,41 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     unmarked clips are swept to Discarded **only** after an explicit Proceed on that exact batch.
     The durable record is never written by the sweep: see `decision_of` below.
 
+    [FORK] UX-ZERO-KEEP -- THREE ADMISSION RULES, ONE TRANSFER.
+
+    A page with nothing worth keeping had no way forward: `can_sort` wants a Keep, and the
+    operator had none to make. So the handler now states which rule admitted the press, and the
+    rules are named properties of the shared `SortPlan` rather than tests re-derived here:
+
+    ```
+    plan.can_sort                >= 1 Keep                      Confirm   (unchanged)
+    plan.can_sort_discard_only   0 Keeps, >= 1 explicit Discard  Confirm   (new)
+    plan.can_discard_whole_page  0 Keeps, >= 1 clip              Discard all loaded clips (new)
+    ```
+
+    `can_sort` itself is untouched, because Audio Review is admitted by it too and nobody asked to
+    change that surface.
+
+    `discard_all` is **keyword-only and is not a widget value**. It is set by one entry point,
+    `_clips_discard_all_frames`, and recovered on the Proceed that follows from the arming token's
+    own prefix -- so the browser cannot ask for the bulk rule by sending a different string in the
+    one input this handler takes. What it can do is present an arming that no longer matches a
+    freshly derived plan, which fails the comparison and shows the gate again.
+
+    Three properties of the bulk path that are requirements rather than consequences:
+
+    * **It only ever means the loaded, server-authoritative page.** The entries are `view`'s
+      frozen page -- the same set `identities`, the reservation and the sort are built from -- so
+      "all" cannot reach the folder, a later page, an earlier page or another session's page.
+    * **It always goes through the gate**, even when every clip is already explicitly rejected and
+      the ordinary path would need no confirmation. The operator asked for a bulk action; they see
+      the exact counts and the destination, and press Proceed, before anything moves.
+    * **It never overrides a Keep.** A page carrying one is refused in words, and the plan's own
+      rule says so too, so the refusal cannot drift from the admission.
+
     Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
-    page with no clip kept, destinations that no longer validate, a transfer already running --
+    page with no decision on it at all (or, for the bulk action, a page carrying a Keep),
+    destinations that no longer validate, a transfer already running --
     this page, this folder, or [F-2] a different folder holding some of these very clips -- and
     [F-1] a durable decision still being written, or one that landed while this press was deriving
     its plan.
@@ -12092,7 +12503,26 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
         view['entries'], {entry.clip_id: _decision(entry) for entry in view['entries']},
         view.get('library', ''), view.get('rejected', ''))
 
-    if not plan.can_sort:
+    # [FORK] UX-ZERO-KEEP: which confirmation is in play. `discard_all` is this press's own entry
+    # point; the prefix is the one the operator already agreed to at the gate, carried on the
+    # arming state. Either is enough, because reaching the gate requires the bulk rule to have
+    # admitted the press in the first place.
+    armed_signature, armed_discard_all = fork_clips.read_arm_token(armed)
+    bulk = bool(discard_all) or armed_discard_all
+
+    # The bulk action's one refusal of its own, and it is the reason it is a separate rule rather
+    # than a wider `can_sort`: a page with clips marked Keep is not a page the operator is asking
+    # to bin. Refused in words, before anything is claimed or validated, so nothing moves and no
+    # Keep is silently reinterpreted as a Discard.
+    if bulk and plan.keep:
+        yield _clips_confirm_only(
+            CLIPS_DISCARD_ALL_HAS_KEEPS_TEXT.format(kept=len(plan.keep)))
+        return
+
+    # Admission. The rules live on the plan; this names the one that applies and nothing more.
+    admitted = plan.can_discard_whole_page if bulk else (
+        plan.can_sort or plan.can_sort_discard_only)
+    if not admitted:
         yield _clips_confirm_only(
             f"❌ {CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
             f"{len(plan.unmarked)} of {plan.total} clip(s) are still undecided.")
@@ -12110,16 +12540,35 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     # still matches, NOTHING MOVES: the counts and the consequence are shown and Proceed/Cancel
     # are revealed. The signature covers every clip id, its decision and both destinations, so
     # changing any of them voids the arming and the gate is shown again.
-    if plan.has_unmarked and str(armed or '') != plan.signature:
+    #
+    # [FORK] UX-ZERO-KEEP: the bulk action NEEDS a gate agreement unconditionally. Ordinarily the
+    # gate exists for unmarked clips, so a page of explicit decisions needs no second press -- but
+    # a bulk action is a statement about clips the operator has not individually judged, and the
+    # counts and the destination are exactly what they have to see before it happens. One gate,
+    # one preview, one signature, one Proceed; the arming carries which intent was agreed.
+    #
+    # "Needs an agreement" is deliberately not "always shows the bulk gate first", and the
+    # difference is observable: an ordinary sweep arming that still matches this plan satisfies the
+    # comparison below, so a bulk press made while one is held sorts on its FIRST press. That is
+    # correct rather than a hole, and it rests on `bulk` being read nowhere past this gate -- it
+    # selects an admission rule and a heading, and never reaches `decision_of` or the transfer. The
+    # bulk rule admits only a page with zero Keeps, and with zero Keeps the ordinary sweep and the
+    # bulk discard move the same clips to the same folder, so the arming the operator agreed to
+    # describes exactly what happens. A Keep is refused above, before this is reached at all.
+    needs_gate = bulk or plan.has_unmarked
+    if needs_gate and armed_signature != plan.signature:
         preview = fork_clips.plan_preview_lines(
             plan, roots[fork_clips.ROLE_LIBRARY].real, roots[fork_clips.ROLE_REJECTED].real)
-        message = "\n".join([CLIPS_SWEEP_GATE_HEADING, ''] + preview
-                            + ['', CLIPS_SWEEP_GATE_PROMPT])
+        heading = CLIPS_DISCARD_ALL_GATE_HEADING if bulk else CLIPS_SWEEP_GATE_HEADING
+        prompt = CLIPS_DISCARD_ALL_GATE_PROMPT if bulk else CLIPS_SWEEP_GATE_PROMPT
+        message = "\n".join([heading, ''] + preview + ['', prompt])
         # [R13] One frame, and deliberately NOT a Working frame: the gate moves nothing, so
         # announcing work here would be the "dead button" complaint inverted -- a spinner for an
         # operation that has not been authorised yet. The slot is not claimed either, for the same
         # reason: a gate the operator never answers must not leave the page marked busy.
-        yield _clips_confirm_only(message, gate=True, signature=plan.signature)
+        yield _clips_confirm_only(
+            message, gate=True,
+            signature=fork_clips.arm_token(plan.signature, discard_all=bulk))
         return
 
     def decision_of(entry):
@@ -13902,6 +14351,20 @@ def create_ui() -> gr.Blocks:
                         clips_confirm_btn = gr.Button(
                             LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
                             elem_id='clips-confirm-button')
+                        # [FORK] UX-ZERO-KEEP: the explicit bulk action, for a page with nothing
+                        # worth keeping.
+                        #
+                        # It carries NO `interactive=` of its own, and that is deliberate rather
+                        # than an omission. Confirm's enabled state is derived from the durable
+                        # record in exactly two places (R5-P3 / F8) and adding a second
+                        # server-managed button state would mean widening every frame this tab's
+                        # handlers emit -- for presentation, since the authorization boundary here
+                        # is never a widget. The server refuses the press instead: a page with a
+                        # Keep on it is told so in words, and a retired or unscanned page is
+                        # refused by `_clips_view` being empty, exactly as Confirm is.
+                        clips_discard_all_btn = gr.Button(
+                            LABEL_CLIPS_DISCARD_ALL, variant='secondary',
+                            elem_id='clips-discard-all-button')
                         # [FORK] R8 Final Polish: the sweep gate, mirroring Audio Review exactly.
                         # Hidden until a Confirm finds unmarked clips, and the ONE thing that can
                         # authorise moving them. `clips_armed_state` holds the batch signature
@@ -15608,8 +16071,14 @@ def create_ui() -> gr.Blocks:
         # lane, is what bounds the actual disk reads to one at a time.
         #
         # Deliberately NOT `CANCEL_CONCURRENCY_ID`: that lane belongs to Cancel and is untouched.
+        # [FORK] Digital-Union (UX-PREP-ACTIVITY): wired to the GENERATOR, so an accepted click
+        # says so immediately and keeps saying so. `_on_verify_sources_click` is kept as the
+        # collected form for every non-Gradio caller. `inputs`, `outputs`, the absent
+        # `concurrency_id` and `concurrency_limit=None` are all UNCHANGED -- the activity lives
+        # inside the one report textbox, so no second component joins the outputs and the pinned
+        # isolation contract (verification writes its own report and nothing else) still holds.
         prep_verify_btn.click(
-            fn=_on_verify_sources_click,
+            fn=_verify_sources_frames,
             inputs=[prep_folder, prep_recursive],
             outputs=[prep_verify_report],
             show_progress='hidden',
@@ -15644,8 +16113,11 @@ def create_ui() -> gr.Blocks:
         # Deliberately NOT `CANCEL_CONCURRENCY_ID`: that lane belongs to Cancel and is untouched.
         #
         # `request: gr.Request` is injected by annotation and is deliberately absent from `inputs`.
+        # [FORK] Digital-Union (UX-PREP-ACTIVITY): the generator, exactly as the Verify event
+        # above. `_on_sample_decode_click` remains the collected form; `inputs`, `outputs` and
+        # the lane are unchanged.
         sample_btn.click(
-            fn=_on_sample_decode_click,
+            fn=_sample_decode_frames,
             inputs=[sample_path, sample_seek],
             outputs=[sample_report],
             show_progress='hidden',
@@ -15878,6 +16350,24 @@ def create_ui() -> gr.Blocks:
         # those checks would be a way around them.
         clips_proceed_btn.click(
             fn=_clips_confirm_frames,
+            inputs=[clips_armed_state],
+            outputs=_clips_confirm_outputs,
+            concurrency_limit=None,
+        )
+        # [FORK] UX-ZERO-KEEP: a THIRD entry point to the same generator, and the same eight
+        # outputs. `_clips_discard_all_frames` sets one keyword-only flag and delegates, so this is
+        # not a second sorting path: the destination validation, the single-flight claim, the
+        # snapshot re-read under the reservation, the one transfer engine and the page-generation
+        # rule are all the ones Confirm goes through. `concurrency_limit=None` for the same
+        # measured S2-A R3 reason as the two above -- a lane of 1 would QUEUE a duplicate press
+        # instead of letting `_CLIPS_TRANSFERS` refuse it.
+        #
+        # It sends the arming state too, so a Proceed is not the only way to complete the gate it
+        # opens: pressing the bulk action twice against an unchanged page is the same two-step
+        # agreement, and against a changed page the signature no longer matches and the gate is
+        # shown again.
+        clips_discard_all_btn.click(
+            fn=_clips_discard_all_frames,
             inputs=[clips_armed_state],
             outputs=_clips_confirm_outputs,
             concurrency_limit=None,

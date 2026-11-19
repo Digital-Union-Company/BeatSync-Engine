@@ -267,7 +267,19 @@ def test_the_clips_tab_writes_no_render_or_source_widget(source: str):
     # [FORK] R8 Final Polish: SIX, not four. Keep-only classification adds the sweep gate's
     # Proceed and Cancel, mirroring Audio Review. Still an exact count rather than a
     # minimum, so a seventh registration has to be reviewed deliberately.
-    assert block.count(".click(") == 6, "expected exactly six Video Review registrations"
+    #
+    # [FORK] UX-ZERO-KEEP: SEVEN, and this is that deliberate review. The seventh is
+    # `clips_discard_all_btn`, the explicit bulk action for a page with nothing worth keeping.
+    # It is a third *entry point* and not a third transfer: it is wired to
+    # `_clips_discard_all_frames`, which sets one keyword-only flag and `yield from`s
+    # `_clips_confirm_frames`, so the destination validation, the single-flight claim, the
+    # snapshot re-read under the reservation, the one transfer engine and the page-generation
+    # rule are the ones Confirm goes through. It writes the same eight outputs through the same
+    # assembler, which is why the forbidden-name sweep above still covers it unchanged.
+    assert block.count(".click(") == 7, "expected exactly seven Video Review registrations"
+    # And the new one is this one, by name: an exact count that passed for a *different* seventh
+    # registration would be the guard reporting a review it never had.
+    assert block.count("clips_discard_all_btn.click(") == 1, block
 
 
 def test_the_clips_handlers_take_an_injected_request_not_a_widget(tree: ast.Module, source: str):
