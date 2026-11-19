@@ -853,9 +853,14 @@ CLIPS_GALLERY_INITIAL_HTML = (
 # [FORK] R8 Final Polish: the old text described the pre-keep-only rule ("every clip on the page
 # is decided"), which is no longer how Confirm is admitted. Video Review now matches Audio Review:
 # mark the good clips, and the rest are handled through an explicit, batch-specific gate.
+#
+# [FORK] UX-ZERO-KEEP: "to Keep" became "to Keep or to Discard", and the bulk action is named.
+# The old first sentence was an instruction the operator could not always follow: a page with no
+# good clip on it has no Keep to mark, and the button stayed dark however many clips they rejected.
 CLIPS_CONFIRM_DISABLED_TEXT = (
-    "Mark at least one clip to Keep. Anything you leave undecided is offered for the Discarded "
-    "folder in a second step that you confirm separately — nothing moves until then."
+    "Mark at least one clip to Keep or to Discard. Anything you leave undecided is offered for "
+    "the Discarded folder in a second step that you confirm separately — nothing moves until "
+    "then. If none of these clips is worth keeping, use Discard all loaded clips below."
 )
 
 CLIPS_SWEEP_GATE_HEADING = (
@@ -863,6 +868,26 @@ CLIPS_SWEEP_GATE_HEADING = (
 )
 CLIPS_SWEEP_GATE_PROMPT = (
     "Press Proceed to sort it exactly as listed, or Cancel to go back and mark more clips."
+)
+# [FORK] UX-ZERO-KEEP: the same gate, the same Proceed and the same Cancel, reached by the
+# explicit bulk action rather than by leaving clips unmarked — so only the wording changes, and it
+# says what was asked for. The counts between these two lines are the ordinary
+# `plan_preview_lines` over the ordinary plan: one preview, one signature, one Proceed.
+CLIPS_DISCARD_ALL_GATE_HEADING = (
+    "⚠️  You asked to discard every clip on this page. Nothing has moved yet — here is exactly "
+    "what that would do:"
+)
+CLIPS_DISCARD_ALL_GATE_PROMPT = (
+    "Press Proceed to move all of them to the Discarded folder, or Cancel to go back. Nothing is "
+    "deleted — every clip stays on disk, in the Discarded folder."
+)
+# The one refusal the bulk action has of its own. An operator with clips marked Keep is not asking
+# for those to be binned, so the action declines rather than overriding a decision they made.
+CLIPS_DISCARD_ALL_HAS_KEEPS_TEXT = (
+    "❌ Nothing was started: {kept} clip(s) on this page are marked Keep.\n"
+    "Discard all loaded clips never overrides a Keep. Press Confirm to file this page as it "
+    "stands, or set those clips back to undecided first if you really do want everything "
+    "discarded."
 )
 CLIPS_SWEEP_CANCELLED_TEXT = (
     "Cancelled. Nothing was moved and every decision is exactly as you left it."
@@ -882,6 +907,10 @@ INFO_CLEAR_VARIATIONS = (
 
 LABEL_CLIPS_PROCEED = "➡️ Proceed — sort it as listed"
 LABEL_CLIPS_SWEEP_CANCEL = "↩️ Cancel — go back and mark more clips"
+# [FORK] UX-ZERO-KEEP: the explicit bulk action, for a page with nothing worth keeping. It names
+# "loaded" rather than "all" on purpose -- it means the clips in the gallery the server is holding
+# right now, never the folder, never a later page and never another session's page.
+LABEL_CLIPS_DISCARD_ALL = "🗑️ Discard all loaded clips"
 # [R5-P3 / F8] Classifying posts straight to the server rather than through a Gradio event, which
 # is deliberate -- but it means a decision cannot re-enable the Confirm button by itself. Without
 # this line the operator would see "Undecided 0" beside a greyed-out Confirm and no explanation.
@@ -1156,8 +1185,11 @@ STATUS_CACHE_IMPORT_DONE = (
     "Nothing was deleted from either folder."
 )
 
+# [FORK] UX-ZERO-KEEP: readiness is now "at least one clip is marked", because an explicit
+# Discard admits Confirm too. The wording has to match the server's rule or it would announce an
+# enable that is not coming -- and the server is the authority either way.
 CLIPS_REFRESH_TO_ENABLE_HINT = (
-    "At least one clip kept — Confirm is being enabled from the server's record."
+    "At least one clip is marked — Confirm is being enabled from the server's record."
 )
 # [UX V3] Why a clip stayed where it was. Each of these means the original is untouched: the
 # sorter only ever renames, so anything short of success leaves the file exactly as it was.

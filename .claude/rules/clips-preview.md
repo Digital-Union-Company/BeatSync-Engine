@@ -4,6 +4,7 @@ paths:
   - "src/clips_media_server.py"
   - "tests/test_clips_review.py"
   - "tests/test_clips_media_server.py"
+  - "tests/test_clips_zero_keep.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -1014,11 +1015,89 @@ app**. The admission rule became "at least one clip is KEPT" under R8 Final Poli
 undecided". The P1 statement is preserved as history in *What is implemented, and what deliberately
 is not* above, which is scoped to P1 and says so.
 
-What is true now: Confirm is enabled when the durable record holds at least one KEPT clip, and
-pressing it moves this page's clips — SELECTED to the Media Library, REJECTED to the Discarded
-folder — through `sort_decided_clips` / `iter_sorted_clips` and `collision.py`. Unmarked clips need
-an explicit, batch-specific Proceed first. Every move is one same-volume no-overwrite `os.rename`;
-nothing is deleted, nothing is overwritten and a cross-volume request is refused in words.
+What is true now: Confirm is enabled when the durable record holds at least one KEPT clip **or at
+least one explicitly DISCARDED clip** (UX-ZERO-KEEP, below), and pressing it moves this page's
+clips — SELECTED to the Media Library, REJECTED to the Discarded folder — through
+`sort_decided_clips` / `iter_sorted_clips` and `collision.py`. Unmarked clips need an explicit,
+batch-specific Proceed first. Every move is one same-volume no-overwrite `os.rename`; nothing is
+deleted, nothing is overwritten and a cross-volume request is refused in words.
+
+### Three admission rules, one transfer (UX-ZERO-KEEP)
+
+**The keep-only rule left an operator with nothing worth keeping unable to continue at all.**
+`can_sort` wants a Keep, so a page on which every clip was marked Discard still refused — the
+button stayed dark however many clips were rejected, and the stated instruction ("Mark at least one
+clip to Keep") was one the operator could not follow. The owner reported it from the installed GUI;
+the scope is roadmap item **UX-ZERO-KEEP**.
+
+```
+plan.can_sort                >= 1 Keep                        Confirm                   (unchanged)
+plan.can_sort_discard_only   0 Keeps, >= 1 explicit Discard    Confirm                   (new)
+plan.can_discard_whole_page  0 Keeps, >= 1 clip                Discard all loaded clips  (new)
+```
+
+* **`can_sort` is deliberately NOT widened**, and that is the first thing not to undo. Audio Review
+  is admitted by the same property (`gui._on_audio_confirm`), so widening it would silently change
+  a second review surface nobody asked to change — one copy of a safety rule carrying two meanings,
+  which is the same hazard as two copies carrying one. The model grows two further **named** rules
+  instead and the video handler states which one admitted the press.
+* **A page with no decision on it at all still refuses.** That is not an oversight to be tidied
+  later: a page nobody has judged must not be filable by one press. `can_sort_discard_only` wants
+  an *explicit* Discard, and unmarked is not a decision.
+* **The bulk action is the only route for such a page**, and it never overrides a Keep — a page
+  carrying one is refused in words (`CLIPS_DISCARD_ALL_HAS_KEEPS_TEXT`), and
+  `can_discard_whole_page` says the same thing, so the refusal cannot drift from the admission.
+* **It means the LOADED, server-authoritative page.** The entries are the registry's frozen page —
+  the same set the identities, the reservation and the sort are built from — so "all" cannot reach
+  the folder, a later page, an earlier page or another browser session's page. A retired page
+  (R11 / `invalidate`) refuses because `_clips_view` is empty, exactly as Confirm does.
+* **The bulk path needs a gate AGREEMENT unconditionally**, even when every clip is already
+  explicitly rejected and the ordinary path would need no second press. A bulk action is a
+  statement about clips the operator has not individually judged, so the exact counts and the
+  destination are shown first.
+* **That is not the same as "the bulk gate is always shown", and the difference is measured.** An
+  ordinary sweep arming that still matches the freshly derived plan satisfies the comparison, so a
+  bulk press made while one is held sorts on its **first** press (measured: 5 frames, bulk heading
+  never shown). It is sound because `bulk` is read **nowhere past the gate** — it selects an
+  admission rule and a heading, and never reaches `decision_of`, the reservation or the transfer —
+  and because the bulk rule admits only a zero-Keep page, where the ordinary sweep and the bulk
+  discard move the same clips to the same folder. So the arming the operator agreed to describes
+  exactly what happens. Do not re-gate on the intent, and do not restate this as "always gated".
+* **It writes no durable decision.** The sweep is still "for this batch only": a clip that was
+  never classified comes back `PENDING` on a re-scan, never as a rejection the operator never made.
+* **`plan_preview_lines` names the Media Library only when something is going into it.** With zero
+  Keeps the old form printed an arrow at a folder this batch does not write and that
+  `iter_sorted_clips` does not create. Audio Review's gate is only ever reached with at least one
+  Keep, so that line is byte-identical there.
+
+**The arming token carries WHICH confirmation was given, as a prefix.** The gate has always armed
+one batch by handing `SortPlan.signature` back and requiring it on the next press; what a signature
+cannot express is which of two *intents* was agreed, and a page admitted only by the bulk rule needs
+the following Proceed to know that is what it is completing. `arm_token` /
+`read_arm_token` / `DISCARD_ALL_ARM_PREFIX` are that, and they are text in / text out — no path, no
+identity, no decision, no clock. The prefix selects an admission rule the operator asked for; it
+**authorises nothing**, because a token whose signature no longer matches a freshly derived plan
+fails the comparison and the gate is shown again. A bare signature still reads as the ordinary
+keep-or-discard confirmation, so no previously armed batch changes meaning.
+
+**One Proceed, one Cancel, one transfer.** `gui._clips_discard_all_frames` sets one keyword-only
+flag and `yield from`s `_clips_confirm_frames`; `discard_all` is **not a widget value** and Gradio
+passes a click's `inputs` positionally, so the browser cannot ask for the bulk rule by sending a
+different string in the one input the handler takes. Every check, refusal, the destination
+re-validation, the single-flight claim, the snapshot re-read under the reservation, the one transfer
+engine and the page-generation rule are reached through exactly the code Confirm reaches them
+through. Do not give the bulk action its own handler, its own gate, its own signature or its own
+sort — see `.claude/rules/video-review-transfer.md`, whose whole F-1/F-2 argument rests on there
+being one admission authority.
+
+**Confirm's button state still comes only from `store.counts()`**, in the same two places
+(`_clips_render_current`, `_on_clips_scan`), and the derivation is now
+`counts[SELECTED] > 0 or counts[REJECTED] > 0`. The client-side readiness hint matches it
+(`counts.SELECTED > 0 || counts.REJECTED > 0`) because the two must agree or the hint announces an
+enable that is not coming — but the client still decides nothing and still may not touch the
+button. **The bulk button carries no `interactive=` at all**: adding a second server-managed button
+state would mean widening every frame this tab's handlers emit, for presentation, and the
+authorization boundary here is never a widget. The server refuses the press instead.
 
 **The transfer is single-flight, observable and server-authoritative (R13).** `iter_sorted_clips`
 is the generator form of `sort_decided_clips` — one engine, yielding each `MoveOutcome` after its

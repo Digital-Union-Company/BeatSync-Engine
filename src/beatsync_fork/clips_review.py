@@ -1732,6 +1732,47 @@ class SortPlan:
         """At least one clip is kept. This is the whole admission rule."""
         return bool(self.keep)
 
+    # -----------------------------------------------------------------------------------------
+    # [FORK] UX-ZERO-KEEP: the two admission rules a page with NOTHING worth keeping needs.
+    #
+    # `can_sort` is deliberately untouched. It is the rule Audio Review is admitted by
+    # (`gui._on_audio_confirm`), and widening it here would silently change a second review
+    # surface that nobody asked to change -- the exact "two copies of a safety rule" hazard this
+    # module's own header warns about, inverted into one copy with two meanings.
+    #
+    # So the model grows two further *named* rules instead, and the video handler states which one
+    # it is admitting under. Each is a property of the plan rather than a test the caller
+    # re-derives, because the plan is the one thing both the gate preview and the sort read.
+    # -----------------------------------------------------------------------------------------
+
+    @property
+    def has_rejected(self) -> bool:
+        """At least one clip was EXPLICITLY marked Discard. Unmarked clips are not rejections."""
+        return bool(self.rejected)
+
+    @property
+    def can_sort_discard_only(self) -> bool:
+        """Nothing kept, and at least one clip explicitly marked Discard.
+
+        The operator who looked at a page and found nothing worth keeping could not previously
+        continue at all: `can_sort` wanted a Keep they had no reason to make. One explicit Discard
+        is a real decision about a real clip, and it is enough -- the unmarked remainder still
+        needs the ordinary batch-bound sweep confirmation before it moves anywhere.
+        """
+        return not self.keep and bool(self.rejected)
+
+    @property
+    def can_discard_whole_page(self) -> bool:
+        """What the explicit "Discard all loaded clips" action needs: zero Keeps, and clips.
+
+        Deliberately **not** "zero decisions": a page of explicit Discards is also a page with
+        nothing kept, and an operator who marked three of eight and then asked for the rest to go
+        the same way means exactly what the action says. What it refuses is a page carrying a
+        Keep, because filing a kept clip into Discarded would override a decision the operator
+        made rather than add one they asked for.
+        """
+        return not self.keep and self.total > 0
+
 
 def plan_sort(items: Iterable[Any], decisions: Any,
               library: Any = "", discarded: Any = "") -> SortPlan:
@@ -1777,7 +1818,12 @@ def plan_preview_lines(plan: SortPlan, library: Any = "", discarded: Any = "") -
     that stated at the moment they are asked to agree to it.
     """
     lines = [f"{len(plan.keep)} clip(s) selected to KEEP."]
-    if library:
+    # [FORK] UX-ZERO-KEEP: name the Media Library only when something is actually going into it.
+    # With zero Keeps the old form printed "0 clip(s) selected to KEEP." followed by an arrow at
+    # the library folder, which reads as a destination this batch is about to write. It is not,
+    # and `iter_sorted_clips` does not even create it. Audio Review's gate is only ever reached
+    # with at least one Keep, so this is byte-identical there.
+    if plan.keep and library:
         lines.append(f"    → {library}")
     lines.append(f"{len(plan.rejected)} clip(s) explicitly rejected.")
     if plan.unmarked:
@@ -1786,6 +1832,57 @@ def plan_preview_lines(plan: SortPlan, library: Any = "", discarded: Any = "") -
         lines.append(f"    → {discarded}")
     lines.append("Nothing will be permanently deleted.")
     return lines
+
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] UX-ZERO-KEEP: the arming token, which carries WHICH confirmation the operator gave.
+#
+# The sweep gate arms one batch by handing its `SortPlan.signature` back to the browser and
+# requiring it on the next press. That is unchanged, and the signature is still a change detector
+# rather than a credential -- nothing is authorised by presenting it, because the plan is
+# re-derived and both destinations re-validated on every press.
+#
+# What the signature cannot express is which of two *intents* was agreed, and with a bulk
+# discard-all action there are now two. A page with zero Keeps and zero Discards is admitted only
+# by the explicit action, so the Proceed that follows it has to know that is what it is completing
+# -- otherwise Proceed would re-derive a plan nothing admits and refuse the confirmation the
+# operator just gave. One shared Proceed button is the point: a second one would be a second path
+# to a transfer, and every check on it would be a second copy.
+#
+# So the intent is a prefix on the token, parsed server-side and never trusted for anything else.
+# It selects an admission rule the operator explicitly asked for; it can authorise nothing on its
+# own, because a prefix attached to a signature that no longer matches the freshly derived plan
+# simply fails the comparison and the gate is shown again.
+#
+# Text in, text out: no path, no identity, no decision and no clock.
+# ---------------------------------------------------------------------------------------------
+
+#: Marks an arming token as "the operator agreed to discard the whole loaded page".
+DISCARD_ALL_ARM_PREFIX = "discard-all:"
+
+
+def arm_token(signature: Any, discard_all: bool = False) -> str:
+    """The value the gate hands the browser, and the only thing it will accept back."""
+    text = str(signature or '')
+    if not text:
+        return ''
+    return f"{DISCARD_ALL_ARM_PREFIX}{text}" if discard_all else text
+
+
+def read_arm_token(token: Any) -> tuple:
+    """``(signature, discard_all)`` from whatever came back out of the arming state.
+
+    Total, and deliberately forgiving about *shape* while being exact about *content*: anything
+    that is not a string becomes ``('', False)``, which is the same answer an absent arming gives
+    and leads to the same place -- the gate, with nothing moved. A bare signature with no prefix
+    reads as the ordinary keep-or-discard confirmation, which is what every pre-existing arming
+    is, so no previously armed batch changes meaning.
+    """
+    if not isinstance(token, str) or not token:
+        return ('', False)
+    if token.startswith(DISCARD_ALL_ARM_PREFIX):
+        return (token[len(DISCARD_ALL_ARM_PREFIX):], True)
+    return (token, False)
 
 
 @dataclass
