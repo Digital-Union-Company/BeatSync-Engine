@@ -626,6 +626,80 @@ BUILD_ID_CSS = """
 .bs-build-id p { font-size: 0.85em; opacity: 0.72; }
 """
 
+# [FORK] Digital-Union (UX-BROWSE-LAYOUT): a folder field and its own folder-picker button, as one
+# visibly associated row.
+#
+# The owner's screenshots showed two different failures with one cause -- a picker that does not
+# read as belonging to any particular field. On the review tab the buttons sat in rows of their
+# own BELOW the fields, so two `scale=0` buttons bunched at the left of one row while the two
+# fields they filled spanned the row above; the second button therefore sat under the FIRST
+# field. That half is fixed structurally, by putting each field and its button in one row, and no
+# rule here is load-bearing for it.
+#
+# What this stylesheet fixes is the remaining half, and the cause was READ OFF THE PINNED BUILD
+# rather than guessed: `gr.Row` defaults to `equal_height=False`, which renders the class
+# `unequal-height`, whose only rule in gradio 6.19.0's stylesheet is `align-items: flex-start`. A
+# labelled field's block is [label][input][info], so top-aligning the row puts the button level
+# with the LABEL -- floating above the input it fills, with the input's own height of empty space
+# beneath it. That is the "detached" button in the screenshots.
+#
+# Four rules, deliberately the four weakest that do the job:
+#
+#   `align-items: flex-end`  -- the button moves from the top of the field's block to the bottom,
+#                               level with the input instead of with the label above it;
+#   `flex: 0 0 auto`         -- and does not grow into the space the field should have;
+#   `min-width: 0`           -- lets the FIELD shrink below its content width, which is what stops
+#                               a long placeholder forcing the row wider than the viewport;
+#   `flex-wrap: wrap`        -- and if the row still cannot fit, the button wraps to the next line
+#                               instead of overflowing horizontally.
+#
+# **Stated exactly, because it is a partial fix.** `flex-end` puts the button level with the input
+# only for a field with no `info=` helper text -- which is eight of the nine Settings fields. Where
+# `info` IS present (the three review fields, and the render destination) the field's block extends
+# below the input, so the button lands level with that helper line rather than with the input. No
+# cross-axis rule can do better, because the overshoot is text *inside* the field's own block; the
+# alternatives are height arithmetic, which the note above rules out, or dropping helper text the
+# roadmap requires be kept with its field. Bottom-adjacent beats floating-above-the-input either
+# way, and the structural pairing is what carries the association regardless.
+#
+# The media query then makes that stacking INTENTIONAL rather than incidental on a narrow screen:
+# full-width field, full-width button underneath it. `640px` is not an invented number -- it is
+# gradio 6.19.0's own most-used breakpoint (12 rules in the shipped stylesheet, more than any
+# other), so this stacks on the same scale the surrounding app already reflows on rather than
+# introducing a second, competing one.
+#
+# Scoped to one class that nothing else uses, so it can reach no other control on the page. No
+# negative margins and no height arithmetic tuned against one Gradio version -- the BUILD_ID_CSS
+# note above states why that shape is avoided here, and the same reasoning applies: every
+# property below degrades to ordinary flex behaviour if the surrounding markup changes.
+BROWSE_ROW_CSS = """
+.bs-browse-row {
+    align-items: flex-end !important;
+    gap: 8px !important;
+    flex-wrap: wrap !important;
+}
+
+.bs-browse-row > * {
+    min-width: 0 !important;
+}
+
+.bs-browse-row button {
+    flex: 0 0 auto !important;
+    white-space: nowrap !important;
+}
+
+@media (max-width: 640px) {
+    .bs-browse-row {
+        flex-direction: column !important;
+        align-items: stretch !important;
+    }
+
+    .bs-browse-row button {
+        width: 100% !important;
+    }
+}
+"""
+
 # [FORK] Digital-Union (R5 Clips Preview Selector, P1): gallery interaction.
 #
 # Decisions POST to `/r5decide`, the server's own authorized endpoint, and NOT through a Gradio
@@ -12271,7 +12345,8 @@ def create_ui() -> gr.Blocks:
 
     app = gr.Blocks(title=UI_BROWSER_TITLE.format(version=FORK_VERSION, build=build_label),
                     theme='ocean',
-                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS + BUILD_ID_CSS)
+                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS + BUILD_ID_CSS
+                        + BROWSE_ROW_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -13726,7 +13801,28 @@ def create_ui() -> gr.Blocks:
                     # comment does not name the alternative.
                     with gr.Tab(LABEL_SECTION_VIDEO_REVIEW, id='tab-video-review'):
                         gr.Markdown(INFO_TAB_CLIPS_PREVIEW)
-                        with gr.Row():
+                        # [FORK] Digital-Union (UX-BROWSE-LAYOUT): one field per row, with its OWN
+                        # picker beside it -- the pattern the Settings tab already uses.
+                        #
+                        # What was here before: a row of fields, then a row of buttons underneath.
+                        # With two `scale=0` buttons in that lower row both bunched at its left,
+                        # the button that filled the DISCARDED field sat directly under the MEDIA
+                        # LIBRARY field, and the one that filled the clips folder sat under a row
+                        # whose other half was the subfolders checkbox. Every picker therefore
+                        # pointed at the wrong thing, which is a correctness problem in the only
+                        # sense a layout can have one: the operator cannot tell what a control does.
+                        #
+                        # The fix is structural, so it does not depend on the stylesheet landing:
+                        # a button in the same row as exactly one field, immediately after it,
+                        # belongs to that field however the row is painted. The class only tidies
+                        # the vertical alignment and the narrow-screen stacking.
+                        #
+                        # Nothing about behaviour moves with the markup. Same widgets, same
+                        # `elem_id`s, same labels, same helper text, same saved-preference reads,
+                        # same handlers and the same event registrations -- the pickers, the scan,
+                        # the decisions, the confirmation gate and the single-flight transfer are
+                        # all untouched.
+                        with gr.Row(elem_classes='bs-browse-row'):
                             clips_input = gr.Textbox(
                                 label=LABEL_CLIPS_INPUT,
                                 info=INFO_CLIPS_INPUT,
@@ -13734,17 +13830,19 @@ def create_ui() -> gr.Blocks:
                                 placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
                                 elem_id='clips-input-folder',
                             )
+                            clips_input_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-input-browse')
+                        # The subfolders switch is a scan OPTION rather than a path, so it gets its
+                        # own row instead of sharing one with a field whose picker it is not.
+                        with gr.Row():
                             clips_recursive = gr.Checkbox(
                                 value=True,
                                 label=LABEL_CLIPS_RECURSIVE,
                                 info=INFO_CLIPS_RECURSIVE,
                                 elem_id='clips-recursive',
                             )
-                        with gr.Row():
-                            clips_input_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='clips-input-browse')
-                        with gr.Row():
+                        with gr.Row(elem_classes='bs-browse-row'):
                             clips_library = gr.Textbox(
                                 label=LABEL_CLIPS_LIBRARY,
                                 info=INFO_CLIPS_LIBRARY,
@@ -13752,6 +13850,10 @@ def create_ui() -> gr.Blocks:
                                 placeholder=r"J:\Media Library",
                                 elem_id='clips-library-folder',
                             )
+                            clips_library_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-library-browse')
+                        with gr.Row(elem_classes='bs-browse-row'):
                             clips_rejected = gr.Textbox(
                                 label=LABEL_CLIPS_REJECTED,
                                 info=INFO_CLIPS_REJECTED,
@@ -13759,10 +13861,6 @@ def create_ui() -> gr.Blocks:
                                 placeholder=r"J:\Discarded",
                                 elem_id='clips-rejected-folder',
                             )
-                        with gr.Row():
-                            clips_library_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='clips-library-browse')
                             clips_rejected_browse = gr.Button(
                                 LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                                 elem_id='clips-rejected-browse')
@@ -14269,7 +14367,7 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown(f"**{LABEL_PREF_GROUP_VIDEO}**")
                     # [FORK] R8: where finished renders go. The one destination that used to be a
                     # fixed property of the installation; see `get_render_output_dir`.
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_render_output = gr.Textbox(
                             label=LABEL_PREF_RENDER_OUTPUT,
                             value=_pref(fork_prefs.RENDER_OUTPUT),
@@ -14279,7 +14377,7 @@ def create_ui() -> gr.Blocks:
                         pref_render_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-render-output-browse')
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_raw_output = gr.Textbox(
                             label=LABEL_PREF_RAW_OUTPUT,
                             value=_pref(fork_prefs.RAW_CUTTER_OUTPUT),
@@ -14291,7 +14389,7 @@ def create_ui() -> gr.Blocks:
 
                     gr.Markdown(f"**{LABEL_PREF_GROUP_AUDIO}**")
                     # [FORK] R7: the Audio Cutter's output, remembered the same way.
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_audio_output = gr.Textbox(
                             label=LABEL_PREF_AUDIO_OUTPUT,
                             value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
@@ -14303,7 +14401,7 @@ def create_ui() -> gr.Blocks:
 
                     gr.Markdown(
                         f"**{LABEL_PREF_GROUP_REVIEW}**\n\n{INFO_PREF_GROUP_REVIEW}")
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_library = gr.Textbox(
                             label=LABEL_CLIPS_LIBRARY,
                             value=_pref(fork_prefs.CLIPS_LIBRARY),
@@ -14312,7 +14410,7 @@ def create_ui() -> gr.Blocks:
                         pref_library_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-library-browse')
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_rejected = gr.Textbox(
                             label=LABEL_CLIPS_REJECTED,
                             value=_pref(fork_prefs.CLIPS_REJECTED),
@@ -14327,7 +14425,7 @@ def create_ui() -> gr.Blocks:
                     # keys, the widgets and the saved values are all unchanged; only the framing
                     # and the position are.
                     gr.Markdown(f"**{LABEL_PREF_VOICE_PAIR}**\n\n{INFO_PREF_VOICE_PAIR}")
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_audio_library = gr.Textbox(
                             label=LABEL_PREF_AUDIO_LIBRARY,
                             value=_pref(fork_prefs.AUDIO_LIBRARY),
@@ -14336,7 +14434,7 @@ def create_ui() -> gr.Blocks:
                         pref_audio_library_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-audio-library-browse')
-                    with gr.Row():
+                    with gr.Row(elem_classes='bs-browse-row'):
                         pref_audio_discarded = gr.Textbox(
                             label=LABEL_PREF_AUDIO_DISCARDED,
                             value=_pref(fork_prefs.AUDIO_DISCARDED),
@@ -14363,7 +14461,7 @@ def create_ui() -> gr.Blocks:
                     with gr.Accordion(label=LABEL_PREF_AUDIO_OVERRIDES,
                                       open=_audio_overrides_in_use()):
                         gr.Markdown(INFO_PREF_AUDIO_OVERRIDES)
-                        with gr.Row():
+                        with gr.Row(elem_classes='bs-browse-row'):
                             pref_audio_preview_library = gr.Textbox(
                                 label=LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
                                 value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
@@ -14372,7 +14470,7 @@ def create_ui() -> gr.Blocks:
                             pref_audio_preview_library_browse = gr.Button(
                                 LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                                 elem_id='pref-audio-preview-library-browse')
-                        with gr.Row():
+                        with gr.Row(elem_classes='bs-browse-row'):
                             pref_audio_preview_discarded = gr.Textbox(
                                 label=LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
                                 value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),

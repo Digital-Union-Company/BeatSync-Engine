@@ -20,6 +20,83 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-11-19 (UX-BROWSE-LAYOUT R1: folder pickers belong to their own fields)
+
+**Two surfaces, one cause, and only one of them was cosmetic.** Owner-approved roadmap item
+**UX-BROWSE-LAYOUT** (draft PR #107): a Browse button that does not read as belonging to any
+particular field.
+
+**Media Library → Video Review was the real defect, and it was a correctness one.** It still had
+the shape R8 Final Polish had already removed from Settings — a row of fields, then a row of
+buttons underneath. Both buttons in that lower row carry `scale=0`, so they bunched at its left
+while the two fields they filled spanned the row above: **the picker for Discarded sat directly
+under the Media Library field**, and the clips-folder picker sat under a row whose other half was
+the subfolders checkbox. Every picker pointed at the wrong thing — which is the one sense in which
+a layout can be *incorrect* rather than merely ugly, because the operator cannot tell what a
+control does.
+
+Fixed **structurally**, so it does not depend on the stylesheet landing: one field per row with its
+own picker immediately after it, which is the pattern Settings and the Audio Cutter already use. A
+button in the same row as exactly one field, directly after it, belongs to that field however the
+row is painted. The subfolders switch moved to its own row — it is a scan option, not that field's
+picker.
+
+**Settings was already one field per row** (R8), so what remained there was vertical, and the cause
+was read off the pinned build rather than guessed: `gr.Row` defaults to `equal_height=False`, which
+renders the class `unequal-height`, whose only rule in gradio 6.19.0 is `align-items: flex-start`.
+A labelled field's block is [label][input][info], so top-aligning the row puts the button level
+with the **label** — floating above the input it fills, with the input's own height of empty space
+beneath it. That is the detached button in the screenshots.
+
+`BROWSE_ROW_CSS` is that half, and it is deliberately the four weakest rules that do the job:
+`align-items: flex-end` so the button moves from the top of the field's block to the bottom, level
+with the input instead of the label above it; `flex: 0 0 auto` so it does not grow into the field's
+space;
+`min-width: 0` so the **field** may shrink below its content width, which is what actually stops a
+long placeholder forcing the row wider than the viewport; and `flex-wrap: wrap` so a row that still
+cannot fit wraps instead of overflowing. A `max-width: 640px` query then makes that stacking
+deliberate rather than incidental — full-width field, full-width picker beneath it. That breakpoint
+is gradio 6.19.0's own most-used one (12 rules in the shipped stylesheet, more than any other), so
+this reflows on the same scale as the surrounding app instead of introducing a competing one.
+
+Scoped to one class (`bs-browse-row`) carried by exactly **twelve** rows — nine in Settings, three
+on the review tab — and used by nothing else, so it can reach no other control. No absolute
+positioning, no negative margins, no pinned heights and no colour: the same reasoning the build-id
+rules already record, namely that layout arithmetic tuned against one Gradio version is what
+silently overlaps something in the next one. Every property degrades to ordinary flex behaviour if
+the surrounding markup changes.
+
+**Nothing about behaviour moved with the markup.** Same widgets, same `elem_id`s, same labels, same
+`info=` helper text on the fields themselves, same saved-preference reads through `_pref`, and the
+pickers are still wired by the **one** existing loop over `(button, field)` pairs with a **single**
+`.click(fn=_browse_folder, inputs=[_target], outputs=[_target])` registration — so there is still
+exactly one copy of the browse behaviour, and each button still sends and receives only its own
+field. Video Review's decisions, confirmation gate, single-flight transfer, scanning and path
+validation are untouched; loading Settings still reads no directory.
+
+**Verification.** `tests/test_browse_layout.py` — 26 tests, split to match the fix: the structural
+half (every repositioned control keeps its `elem_id`; the three review pickers and the six named
+Settings pickers are still paired with *their own* field in the shared wiring table — a pair table
+being exactly where a re-layout can mis-pair a button while the markup still looks right) and the
+stylesheet half, asserted as *what the page declares* (every selector scoped to the one class, the
+class used by nothing else, the overflow and stacking rules present, and bans on positioning,
+margin arithmetic and colour). `tests/test_gui_tabs.py` gains the Settings pairing rule **extended
+to Video Review**, which never had it, plus a per-row assertion that no row holds two pickers —
+the pair-by-pair rule cannot see that failure on its own, and it is the one that caused the
+mispairing. Whole suite: see the task report for the figure.
+
+**The `flex-end` fix is partial, and stated as such.** It puts the button level with the input only
+for a field with no `info=` helper text — eight of the nine Settings fields. Where `info` is present
+(the three review fields, and the render destination) the field's block extends below the input, so
+the button lands level with that helper line instead. No cross-axis rule can do better: the
+overshoot is text *inside* the field's own block, and the alternatives are height arithmetic or
+dropping helper text the roadmap requires be kept with its field. Bottom-adjacent beats
+floating-above-the-input either way, and the structural pairing carries the association regardless.
+
+**The stylesheet half is NOT visually accepted.** These tests prove the rules are declared, scoped
+and registered; they do not prove the rendered result, and the roadmap requires real Gradio 6.19.0
+at desktop and narrow widths for that. No GUI smoke was run — see the task report.
+
 ### Fixed — 2026-11-13 (R15-C / F-5: a stale page turn republished the folder the operator left)
 
 **The F-3 fence below was threaded into the page turn as well, and there it could never work.** The

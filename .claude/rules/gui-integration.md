@@ -586,6 +586,48 @@ automatically.
     names only `_CLIPS_SCANS.is_current`.
 
   Full contract: `.claude/rules/video-review-transfer.md`.
+- **A folder field and its Browse button live in ONE row, and that is structural
+  (UX-BROWSE-LAYOUT).** Both failures the owner reported had one cause — a picker that does not read
+  as belonging to a particular field — but only one was cosmetic.
+
+  Video Review kept the shape R8 removed from Settings: a row of fields, then a row of buttons
+  underneath. Both buttons carry `scale=0`, so they bunched at the lower row's left while the fields
+  spanned the row above — **the Discarded picker sat under the Media Library field**. That is a
+  correctness problem, not a styling one: the operator cannot tell what the control does.
+
+  The Settings half was vertical, and the cause is measured: `gr.Row` defaults to
+  `equal_height=False` → class `unequal-height` → `align-items: flex-start` in gradio 6.19.0. A
+  field's block is [label][input][info], so the button lands level with the **label**, floating
+  above the input it fills. Do not restate this as the button being stretched.
+
+  ```
+  with gr.Row(elem_classes='bs-browse-row'):
+      <field> = gr.Textbox(..., info=<its own helper text>)
+      <field>_browse = gr.Button(LABEL_BROWSE_FOLDER, scale=0)
+  ```
+
+  * **One field per row, its picker immediately after it, and never two pickers in one row.** Pinned
+    for Settings *and* Video Review in `tests/test_gui_tabs.py`, pair by pair **and** per row — the
+    pair-by-pair rule alone cannot see two buttons sharing a row, which is the failure that caused
+    the mispairing.
+  * **`BROWSE_ROW_CSS` only tidies what the structure already fixed**: `align-items: flex-end` so
+    the button moves to the bottom of the field's block rather than the top — level with the input
+    for a field with **no** `info=`, and level with the helper line where `info` is present, which
+    is a partial fix no cross-axis rule can improve on (the overshoot is text inside the field's own
+    block); `flex: 0 0 auto`, `min-width: 0` so
+    the *field* may shrink (this is what prevents horizontal overflow, not the button), and
+    `flex-wrap: wrap`, plus a `max-width: 640px` stacked layout. Scoped to one class on exactly
+    **twelve** rows and used by nothing else. **No absolute positioning, negative margins, pinned
+    heights or colour** — same reasoning `BUILD_ID_CSS` records.
+  * **Browse behaviour has exactly one copy and must keep it.** Every folder picker in the app is
+    wired by one loop over `(button, field)` pairs with a single
+    `.click(fn=_browse_folder, inputs=[_target], outputs=[_target])`, so a picker starts where its
+    field already points, writes back to that same field, and can reach nothing else; a cancelled
+    dialog returns `gr.update()` and changes nothing. Do not give a repositioned button its own
+    registration — and when editing that table, check each button is paired with **its own** field,
+    because a mis-paired row still looks correct in the markup.
+  * Browsing **reads no directory**: it fills a box. Loading Settings still scans and creates
+    nothing; the field values arrive through `_pref`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
