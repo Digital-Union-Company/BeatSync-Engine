@@ -601,6 +601,73 @@ _SETTINGS_BROWSE_PAIRS = (
 )
 
 
+#: [FORK] UX-BROWSE-LAYOUT: the same contract for Media Library -> Video Review, which never had
+#: it. Settings was re-laid-out under R8 Final Polish and pinned below; the review tab kept the
+#: shape R8 removed from Settings -- a row of fields, then a row of buttons underneath -- and the
+#: owner's screenshots are of that. With two `scale=0` buttons bunched at the left of the lower
+#: row, the picker for DISCARDED sat under the MEDIA LIBRARY field, so both pointed at the wrong
+#: field. These three pairs are the fix, asserted by the same structural rule.
+_REVIEW_BROWSE_PAIRS = (
+    ("clips_input", "clips_input_browse"),
+    ("clips_library", "clips_library_browse"),
+    ("clips_rejected", "clips_rejected_browse"),
+)
+
+
+@pytest.mark.parametrize("field,browse", _REVIEW_BROWSE_PAIRS)
+def test_each_review_browse_button_sits_in_its_own_fields_row(source: str, field: str,
+                                                              browse: str):
+    """[FORK] UX-BROWSE-LAYOUT. One field per row, its own picker immediately after it.
+
+    Structural rather than cosmetic on purpose: a button in the same row as exactly one field,
+    directly after it, belongs to that field however the row is painted -- so this holds whether or
+    not the stylesheet loads. Between the field and its button there must be no second `gr.Textbox`
+    (another field has come between them) and no `with gr.Row(` (the button is in a different row
+    altogether, which is exactly the shape being removed).
+    """
+    start, end = _section_span(source, "LABEL_SECTION_VIDEO_REVIEW")
+    opening = f"{field} = gr.Textbox("
+    field_at = source.index(opening, start, end)
+    browse_at = source.index(f"{browse} = gr.Button(", start, end)
+    assert field_at < browse_at, f"{browse} comes before the field it fills"
+    between = source[field_at + len(opening):browse_at]
+    assert "gr.Textbox(" not in between, f"another field sits between {field} and {browse}"
+    assert "with gr.Row(" not in between, f"{browse} is in a different Row from {field}"
+
+
+def test_no_review_browse_button_shares_a_row_with_another_browse_button(source: str):
+    """The measured defect, pinned from the other side.
+
+    Two pickers in one row is what made them point at the wrong fields: `scale=0` keeps each at its
+    natural width, so both sat at the left of the row while the two fields they filled spanned the
+    row above. A pair-by-pair test cannot see this on its own -- each pair could satisfy the rule
+    above and still share a row -- so the count is asserted per row.
+    """
+    start, end = _section_span(source, "LABEL_SECTION_VIDEO_REVIEW")
+    section = source[start:end]
+    for row in section.split("with gr.Row(")[1:]:
+        body = row.split("with gr.Row(")[0]
+        assert body.count("LABEL_BROWSE_FOLDER") <= 1, (
+            "two folder pickers in one row cannot both be beside the field they fill:\n"
+            + body[:400])
+
+
+def test_every_review_and_settings_browse_row_carries_the_shared_layout_class(source: str):
+    """The alignment and the narrow-screen stacking come from one class, so a row that forgets it
+    gets the default cross-axis stretch -- the tall-slab look this item exists to remove."""
+    for label, pairs in (("LABEL_SECTION_VIDEO_REVIEW", _REVIEW_BROWSE_PAIRS),
+                         ("LABEL_TAB_SETTINGS", _SETTINGS_BROWSE_PAIRS)):
+        span = (_section_span(source, label) if label.startswith("LABEL_SECTION")
+                else _tab_span(source, label))
+        start, end = span
+        for field, _browse in pairs:
+            field_at = source.index(f"{field} = gr.Textbox(", start, end)
+            row_at = source.rindex("with gr.Row(", start, field_at)
+            opening = source[row_at:source.index(":", row_at)]
+            assert "bs-browse-row" in opening, (
+                f"{field}'s row does not carry the shared layout class: {opening!r}")
+
+
 @pytest.mark.parametrize("field,browse", _SETTINGS_BROWSE_PAIRS)
 def test_each_browse_button_sits_in_its_own_fields_row(source: str, field: str, browse: str):
     """Measured on the shipped page: Browse buttons were collected into a Row of their own BELOW
