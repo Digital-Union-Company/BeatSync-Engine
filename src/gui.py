@@ -4781,11 +4781,23 @@ def _mark_verification(active: bool) -> None:
 # and it is deliberately the same shape as `_lock_holder` above: one module-level string, one small
 # lock, published by the worker and copied by the reader.
 #
-# **A single global slot is sound here for exactly the reason the R5 revision pin is sound.**
-# `_RENDER_LOCK` admits at most ONE of render / verify / sample at a time, so at most one phase is
-# ever load-bearing -- the same invariant `source-verification.md` leans on when it says "at most
-# one revision is load-bearing at any instant". Two concurrent operations cannot both be reporting,
-# because two concurrent operations cannot exist.
+# **A single global slot is sound here for exactly the reason the R5 revision pin is sound --
+# but that soundness belongs to the MUTEX HOLDERS, and so the slot is scoped to them.**
+# `_RENDER_LOCK` admits at most ONE of render / verify / sample at a time, so among the operations
+# that take it at most one phase is ever load-bearing -- the same invariant `source-verification.md`
+# leans on when it says "at most one revision is load-bearing at any instant".
+#
+# **Scan and Analyze are NOT among them, and that is why they must not read this slot.** They run
+# on their own unlimited Gradio lanes through `prep_scan_btn.click` / `prep_analyze_btn.click` and
+# take no lock, so they genuinely can overlap a Verify or a Sample -- across sessions or across
+# events. UX-PREP-ACTIVITY R2 (accepted source review of PR #109) measured the consequence on the
+# shipped seam: with a Verify in `PHASE_MEDIA_HEADERS`, a silent Scan tick rendered
+# `Scan Library - Reading media headers`, attributing one operation's phase to another. So the
+# WRITERS of this slot are exactly the lock-holding Verify/Sample impls, and its READERS are
+# exactly the lock-holding `_activity_frames` stream. `_run_prep_in_worker` -- the one activity
+# path that does not hold the mutex -- names its own generic `PHASE_WORKING` unconditionally and
+# never consults this slot. The scoping is the fix; a second slot or a coordinator is not needed,
+# because the two families never have to describe each other.
 #
 # It is DIAGNOSTIC ONLY, and nothing branches on it. A stale, missing or late phase can only word a
 # line of text: it can never admit a worker, release a mutex, publish a report, change a verdict or
@@ -4793,7 +4805,8 @@ def _mark_verification(active: bool) -> None:
 # `PHASE_STARTING` rather than guessing at one.
 # --------------------------------------------------------------------------------------------
 
-#: The phase label the running operation last published, or `''` for none.
+#: The phase label the running MUTEX-HOLDING operation (Verify / Sample) last published, or `''`
+#: for none. Scan and Analyze neither write nor read it -- see the paragraph above.
 _prep_phase: str = ''
 
 
@@ -5897,10 +5910,19 @@ def _run_prep_in_worker(work, state, *,
     pulse = 0
 
     def notice() -> str:
-        """The activity line: operation, pulse, and a measured elapsed reading. Never an estimate."""
+        """The activity line: operation, pulse, and a measured elapsed reading. Never an estimate.
+
+        **The phase is this operation's own generic `PHASE_WORKING`, and `_prep_phase` is
+        deliberately not consulted.** That slot is published only by the mutex-holding Verify and
+        Sample impls; Scan and Analyze hold no lock, so reading it attributed another operation's
+        phase to this one -- measured as `Scan Library - Reading media headers` while a Verify was
+        in its header sweep (UX-PREP-ACTIVITY R2). Scan and Analyze lose nothing by it: their real,
+        detailed phases are already in the report box through `ProgressView`, and this line's job
+        is only to prove the operation is alive during a stretch that emits no event.
+        """
         return fork_prep_activity.activity_line(fork_prep_activity.ActivityState(
             operation=operation,
-            phase=_prep_phase_now() or fork_prep_activity.PHASE_WORKING,
+            phase=fork_prep_activity.PHASE_WORKING,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
             pulse=pulse))
 

@@ -20,6 +20,58 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-19 (UX-PREP-ACTIVITY R2: an activity notice may only describe its own operation)
+
+**Accepted source-review finding on PR #109.** R1's Scan/Analyze activity notice was built with
+`phase=_prep_phase_now() or fork_prep_activity.PHASE_WORKING`, so it read the one global
+`_prep_phase` diagnostic slot. **That slot is written only by the mutex-holding Verify and Sample
+impls.** Scan and Analyze take no lock — they run on their own unlimited Gradio lanes through
+`prep_scan_btn.click` / `prep_analyze_btn.click` — so they genuinely overlap a Verify or a Sample,
+across events or across sessions, and a silent Scan tick rendered:
+
+```
+Scan Library — Reading media headers..   (00:01 elapsed)
+```
+
+One operation's phase under another operation's name, which is precisely the truthful-phase
+requirement the item exists to satisfy. Reproduced deterministically on the shipped seam before the
+correction (`_run_prep_in_worker` AST-extracted, a Verify phase published into the shared slot, one
+forced poll tick), and confirmed gone after it.
+
+**The correction is scoping, and it is one line of behaviour.** `_run_prep_in_worker`'s notice now
+names `fork_prep_activity.PHASE_WORKING` unconditionally. Scan and Analyze lose nothing: their real,
+detailed phases are already in the report box through `ProgressView`, and this line's job was only
+ever to prove the operation is alive through a stretch that emits no `ProgressEvent`.
+
+**R1's single-global argument was not wrong, it was over-claimed.** `_RENDER_LOCK` admits one
+operation at a time, so at most one phase is load-bearing *among the operations that take the lock*.
+The participant that broke it was a **reader** outside the lock. The slot is now scoped to the
+mutex-holding path on both sides:
+
+```
+WRITERS  _verify_sources_impl, _sample_decode_impl,
+         _verify_sources_frames, _sample_decode_frames     -- all hold _RENDER_LOCK
+READERS  _activity_frames                                  -- runs only inside those two generators
+```
+
+`test_every_writer_and_reader_of_the_phase_slot_holds_the_mutex` pins both as **exact sets** rather
+than banning a name, so a future read from an unlocked path fails in the suite rather than in front
+of an operator.
+
+**What this did NOT add:** no new coordinator, mutex, slot, phase vocabulary, progress protocol,
+GUI component or output. `ProgressView`, worker lifetime, the join-before-release ordering, the
+revision pin, the staleness rule, the four terminal states and both events' lanes are untouched;
+`beatsync_fork/prep_activity.py` is unchanged.
+
+**Verification.** Six new tests in `tests/test_prep_activity.py` (section 5b), driving the shipped
+Scan/Analyze path over the **same namespace** as the verification seam — deliberately one shared
+`_prep_phase`, because a second namespace would give each family its own slot and the test would
+pass vacuously. Covered: the forward leak for Scan *and* Analyze; the reverse direction with a real
+Verify stream and a real Scan stream alive simultaneously, each keeping its own phase and operation
+name; no phase outliving a terminated operation into a later Scan tick; and the two structural
+pins. Five of the six fail against the pre-fix line; the sixth confirms the already-correct
+post-termination behaviour the review also asked to check.
+
 ### Added — 2026-11-19 (UX-PREP-ACTIVITY R1: Prepare & Verify shows trustworthy in-flight state)
 
 **Two of the four Prepare & Verify operations had no in-flight state at all.** Scan Library and

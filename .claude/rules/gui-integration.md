@@ -615,6 +615,14 @@ automatically.
   * **`_prep_phase` is one lock-guarded global**, sound because `_RENDER_LOCK` admits one operation
     at a time — the same invariant the R5 revision pin rests on. Diagnostic only; nothing branches
     on it.
+  * **…and that soundness belongs to the mutex holders, so the slot is scoped to them (R2).** Scan
+    and Analyze take **no** lock, so they really can overlap a Verify or a Sample. While
+    `_run_prep_in_worker`'s notice read the slot, a silent Scan tick rendered `Scan Library —
+    Reading media headers` during a Verify's header sweep. It now names
+    `fork_prep_activity.PHASE_WORKING` unconditionally — **do not restore the
+    `_prep_phase_now() or …` fallback.** The writer set is exactly the four lock-holding
+    Verify/Sample functions and the reader set exactly `_activity_frames`, pinned as exact sets by
+    `tests/test_prep_activity.py`. No second slot, coordinator, mutex or output was added.
 
   Full contract: `.claude/rules/prep-activity.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not

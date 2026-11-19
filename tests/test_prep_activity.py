@@ -28,13 +28,19 @@ can leak into a later one.
 from __future__ import annotations
 
 import ast
+import contextlib
+import queue
 import re
+import sys
 import threading
 import time
+import types
 
 import pytest
 
 from beatsync_fork import prep_activity as pa
+from beatsync_fork.progress import ProgressEvent
+from beatsync_fork.progress_view import ProgressView
 from test_media_verify import _FakeRequest, _func, _load_concurrency_seam, _tree
 
 _GUI = "src/gui.py"
@@ -499,6 +505,243 @@ def test_an_interrupt_propagates_and_is_never_reported_as_a_file_problem():
     assert not namespace["_RENDER_LOCK"].locked(), "the mutex must still be released"
     assert namespace["_lock_holder_now"]() == ""
     assert namespace["_prep_phase_now"]() == ""
+
+
+# =============================================================================================
+# 5b - CROSS-OPERATION: Scan/Analyze and Verify/Sample never describe each other
+#
+# [FORK] Digital-Union (UX-PREP-ACTIVITY R2, accepted source review of PR #109).
+#
+# Section 5 above covers leakage BETWEEN SUCCESSIVE operations of the mutex-holding family, where
+# the single global slot is sound because `_RENDER_LOCK` admits one of them at a time. This section
+# covers the case that argument does not reach: **Scan and Analyze take no lock at all.** They run
+# on their own unlimited Gradio lanes through `prep_scan_btn.click` / `prep_analyze_btn.click`, so
+# they genuinely overlap a Verify or a Sample -- across events or across sessions.
+#
+# `_run_prep_in_worker.notice()` used to read the shared slot, so a silent Scan tick rendered
+# `Scan Library - Reading media headers` while a Verify was in its header sweep: one operation's
+# phase under another operation's name. Reproduced on this seam before the fix.
+#
+# The correction is scoping, not machinery: Scan/Analyze name their own generic `PHASE_WORKING`
+# unconditionally. No new coordinator, mutex, slot or GUI output is introduced.
+# =============================================================================================
+
+
+def _load_prep_worker_seam():
+    """Extend the verification seam with the SHIPPED Scan/Analyze activity path.
+
+    Deliberately built on `_load_concurrency_seam`'s namespace rather than a fresh one, because the
+    whole point is that the two families share ONE `_prep_phase` slot. A separate namespace would
+    give each family its own slot and the cross-operation test would pass vacuously -- it would be
+    asserting about a global that production does not have.
+
+    So: the real Verify stream and the real Scan/Analyze stream, over one real slot, one real lock
+    and one real renderer. Only the disk/pipeline work is stubbed.
+    """
+    namespace, state = _load_concurrency_seam()
+    tree = _tree(_GUI)
+
+    class _Console:
+        """`StageConsoleLogger` with its three call sites and no console."""
+
+        def line(self, *a, **k):
+            pass
+
+        def finish(self, *a, **k):
+            pass
+
+        def apply_event(self, *a, **k):
+            pass
+
+    class _Quiet:
+        def write(self, *a, **k):
+            pass
+
+        def flush(self, *a, **k):
+            pass
+
+    namespace.update({
+        "sys": sys,
+        "contextlib": contextlib,
+        "queue": queue,
+        "ProgressEvent": ProgressEvent,
+        "ProgressView": ProgressView,
+        "StageConsoleLogger": lambda *a, **k: _Console(),
+        "QuietConsole": _Quiet,
+        # Only the failure recorder is reachable from this seam.
+        "fork_prep": types.SimpleNamespace(
+            record_failure=lambda prep_state, text: ("FAILED", text)),
+        # `_prep_busy_updates` is the real body, so the seam needs a `gr.update`. `Request` is
+        # preserved because the verification handlers already exec'd above resolve `gr` by name.
+        "gr": types.SimpleNamespace(
+            Request=_FakeRequest, update=lambda **kw: ("gr.update", kw)),
+    })
+    nodes = [_func(tree, name) for name in
+             ("_prep_ui_updates", "_prep_busy_updates", "_run_prep_in_worker")]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), _GUI, "exec"), namespace)
+    return namespace, state
+
+
+def _first_silent_tick(namespace, operation: str) -> str:
+    """The notice from one bounded-poll tick of a Scan/Analyze that emitted NO `ProgressEvent`.
+
+    That silence is the whole case the bounded poll was added for -- a cold library's identity pass,
+    a Qwen worker loading its model -- and it is deterministic here: the work blocks on an Event
+    this function owns and the queue therefore stays empty past the timeout.
+
+    The worker is awaited before returning. `_run_prep_in_worker`'s worker holds
+    `contextlib.redirect_stdout`, which rebinds `sys.stdout` PROCESS-wide rather than per-thread, so
+    a worker still running when the test returns would leave pytest's own stdout redirected.
+    """
+    release = threading.Event()
+    finished = threading.Event()
+
+    def silent_work(event_callback, console_logger):
+        try:
+            release.wait(timeout=30)
+            return "PREP-STATE"
+        finally:
+            finished.set()
+
+    stream = namespace["_run_prep_in_worker"](silent_work, "PREP-STATE", operation=operation)
+    try:
+        next(stream)                        # the immediate frame
+        tick = next(stream)                 # the first poll tick: nothing arrived in the interval
+    finally:
+        release.set()
+        stream.close()
+    assert finished.wait(timeout=10), "the stubbed work must finish, restoring sys.stdout"
+    # `_prep_busy_updates` -> (rendered, notice, gr.update, state)
+    return tick[1]
+
+
+@pytest.mark.parametrize("operation", [pa.OPERATION_SCAN, pa.OPERATION_ANALYZE])
+def test_a_silent_scan_tick_never_renders_a_phase_a_verify_published(operation):
+    """The accepted review finding, as a regression.
+
+    A Verify is mid-sweep and has published `PHASE_MEDIA_HEADERS` into the one diagnostic slot.
+    Scan holds no mutex, so it is genuinely running at the same time. Its activity line must
+    describe ITSELF.
+    """
+    namespace, _ = _load_prep_worker_seam()
+
+    namespace["_mark_prep_phase"](pa.PHASE_MEDIA_HEADERS)
+    assert namespace["_prep_phase_now"]() == pa.PHASE_MEDIA_HEADERS, "precondition"
+
+    notice = _first_silent_tick(namespace, operation)
+
+    assert operation in notice, f"the notice must name its own operation: {notice!r}"
+    assert pa.PHASE_MEDIA_HEADERS not in notice, (
+        f"another operation's phase was attributed to {operation}: {notice!r}")
+    assert pa.PHASE_WORKING in notice, (
+        f"{operation} must name its own generic phase: {notice!r}")
+    # And it did not disturb the slot the running Verify owns.
+    assert namespace["_prep_phase_now"]() == pa.PHASE_MEDIA_HEADERS, \
+        "Scan/Analyze must neither read nor WRITE the mutex-holders' slot"
+
+
+def test_the_reverse_direction_a_verify_frame_keeps_its_own_phase_while_a_scan_ticks():
+    """The other direction, with both streams genuinely alive at once.
+
+    A real Verify stream and a real Scan stream overlap, which is exactly what the absent mutex on
+    the Scan side permits. Each must describe its own work: the Verify frames carry the phase its
+    own impl published, and the Scan notice carries `Working`.
+    """
+    namespace, state = _load_prep_worker_seam()
+    tick = namespace["_ACTIVITY_TICK_SECONDS"]
+    verify_release = threading.Event()
+
+    def verify_impl(folder, recursive):
+        namespace["_mark_prep_phase"](pa.PHASE_MEDIA_HEADERS)
+        verify_release.wait(timeout=30)
+        return "REPORT"
+
+    state["impl"] = verify_impl
+    verify_stream = namespace["_verify_sources_frames"]("J:/lib", True, _FakeRequest("S"))
+    try:
+        next(verify_stream)                              # the immediate Verify frame
+        verify_frame = next(verify_stream)               # a Verify tick, phase published by now
+        assert namespace["_RENDER_LOCK"].locked(), "the Verify owns the mutex for its whole stream"
+
+        # ...and while it does, a Scan runs on its own lane and takes a tick of its own.
+        scan_notice = _first_silent_tick(namespace, pa.OPERATION_SCAN)
+    finally:
+        verify_release.set()
+        verify_stream.close()
+
+    assert pa.OPERATION_VERIFY in verify_frame and pa.PHASE_MEDIA_HEADERS in verify_frame, (
+        f"the mutex holder must still see its own phase: {verify_frame!r}")
+    assert pa.OPERATION_SCAN in scan_notice and pa.PHASE_WORKING in scan_notice, scan_notice
+    assert pa.PHASE_MEDIA_HEADERS not in scan_notice, scan_notice
+    assert pa.OPERATION_VERIFY not in scan_notice, scan_notice
+    assert pa.OPERATION_SCAN not in verify_frame, verify_frame
+
+
+def test_no_phase_outlives_a_terminated_operation_into_a_later_scan_tick():
+    """The straggler rule across the two families.
+
+    A Verify runs to completion, publishing a phase and clearing it in its `finally`. A Scan tick
+    afterwards must show `Working` -- not the finished operation's last phase, and not `Starting`
+    inherited from an empty slot it has no business reading.
+    """
+    namespace, state = _load_prep_worker_seam()
+    state["impl"] = lambda f, r: (namespace["_mark_prep_phase"](pa.PHASE_MEDIA_HEADERS),
+                                  "REPORT")[1]
+    assert namespace["_on_verify_sources_click"]("J:/lib", True, _FakeRequest("S")) == "REPORT"
+    assert namespace["_prep_phase_now"]() == "", "the slot is cleared when an operation ends"
+    assert not namespace["_RENDER_LOCK"].locked()
+
+    notice = _first_silent_tick(namespace, pa.OPERATION_SCAN)
+    assert pa.PHASE_WORKING in notice, notice
+    assert pa.PHASE_MEDIA_HEADERS not in notice, notice
+    assert pa.PHASE_STARTING not in notice, (
+        "Scan names its own phase; it must not render the empty slot's `Starting` either")
+
+
+def test_every_writer_and_reader_of_the_phase_slot_holds_the_mutex():
+    """The invariant the single global slot actually rests on, pinned as a positive SET.
+
+    The slot's soundness argument is `_RENDER_LOCK` admitting one operation at a time. That argument
+    covers a participant only if the participant is on the lock-holding path -- which is precisely
+    what the pre-R2 reader was not. Pinning the exact writer and reader sets is what makes a future
+    read from an unlocked path fail here rather than in front of an operator.
+    """
+    tree = _tree(_GUI)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def enclosing(node):
+        """The OUTERMOST named function containing `node` -- nested helpers belong to their owner."""
+        name, cursor = None, parents.get(node)
+        while cursor is not None:
+            if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = cursor.name
+            cursor = parents.get(cursor)
+        return name
+
+    writers, readers = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "_mark_prep_phase":
+                writers.add(enclosing(node))
+            elif node.func.id == "_prep_phase_now":
+                readers.add(enclosing(node))
+
+    assert writers == {"_verify_sources_impl", "_sample_decode_impl",
+                       "_verify_sources_frames", "_sample_decode_frames"}, writers
+    assert readers == {"_activity_frames"}, readers
+    # ...and `_activity_frames` is reached only from the two mutex-holding generators.
+    for name in ("_verify_sources_frames", "_sample_decode_frames"):
+        assert "yield from _activity_frames(" in ast.unparse(_func(tree, name)), name
+    assert "_activity_frames" not in _code_only(_func(tree, "_run_prep_in_worker"))
+
+
+def test_the_scan_and_analyze_notice_names_its_own_phase_and_consults_no_slot():
+    """Structural companion to the behavioural tests above, so the fix cannot be half-reverted."""
+    body = _code_only(_func(_tree(_GUI), "_run_prep_in_worker"))
+    assert "fork_prep_activity.PHASE_WORKING" in body, body
+    for forbidden in ("_prep_phase_now", "_mark_prep_phase", "_prep_phase"):
+        assert forbidden not in body, (
+            f"`_run_prep_in_worker` holds no mutex and must not touch {forbidden}")
 
 
 # =============================================================================================

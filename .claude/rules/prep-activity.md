@@ -135,6 +135,35 @@ sound**: `_RENDER_LOCK` admits at most one of render / verify / sample / cutter 
 most one phase is ever load-bearing. Two concurrent operations cannot both be reporting, because
 two concurrent operations cannot exist.
 
+**That argument covers the MUTEX HOLDERS only, and the slot is scoped to them (R2).** Scan and
+Analyze take no lock — they run on their own unlimited lanes through `prep_scan_btn.click` /
+`prep_analyze_btn.click` — so "two concurrent operations cannot exist" is simply false for them,
+and a reader outside the lock inherits none of the soundness. The first implementation had
+`_run_prep_in_worker`'s notice read the slot, and the accepted source review of PR #109 found the
+consequence: with a Verify in `PHASE_MEDIA_HEADERS`, a silent Scan tick rendered
+
+```
+Scan Library — Reading media headers..   (00:01 elapsed)
+```
+
+— one operation's phase under another operation's name, which is exactly the truthful-phase
+requirement this item exists to satisfy. Reproduced deterministically on the shipped seam before
+the fix, and the correction is **scoping, not machinery**:
+
+```
+WRITERS  _verify_sources_impl, _sample_decode_impl,
+         _verify_sources_frames, _sample_decode_frames     -- all hold _RENDER_LOCK
+READERS  _activity_frames                                  -- runs only inside those two generators
+         _run_prep_in_worker  -> names fork_prep_activity.PHASE_WORKING unconditionally
+```
+
+`test_every_writer_and_reader_of_the_phase_slot_holds_the_mutex` pins those as **exact sets**
+rather than banning a name, so a future read from an unlocked path fails in the suite instead of
+in front of an operator. Scan and Analyze lose nothing: their real, detailed phases are already in
+the report box through `ProgressView`, and the notice's job was never to restate them. **No second
+slot, no coordinator, no new mutex and no new GUI output was added** — the two families simply
+never have to describe each other.
+
 * **It is diagnostic only and nothing branches on it.** A stale, missing or late phase can word a
   line of text and nothing else: it can never admit a worker, release a mutex, publish a report,
   change a verdict or move a revision.
@@ -165,6 +194,12 @@ report box shows `ProgressView`'s real ones when they exist), it fabricates no p
 estimate, and it does not restate the phase `ProgressView` is already rendering — the notice says
 `Working` and the box says which stage. **A timeout is not a sleep**: an event arriving
 mid-interval is applied immediately, so the cadence never delays anything.
+
+**`Working` here is a literal, not a fallback (R2).** The notice is built with
+`phase=fork_prep_activity.PHASE_WORKING` and never consults `_prep_phase` — see the phase-slot
+section above for the cross-operation attribution defect that `_prep_phase_now() or PHASE_WORKING`
+caused. Do not reintroduce the `or`: it reads as a harmless default and is not one, because the
+slot belongs to operations this one does not exclude.
 
 The notice goes in `prep_status`, which is already one of the four `prep_outputs`, so **the
 preparation event wiring is byte-identical** — same inputs, same outputs, same four-tuple arity.
