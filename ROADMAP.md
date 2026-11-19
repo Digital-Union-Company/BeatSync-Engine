@@ -1983,7 +1983,7 @@ A seventh commit, from the owner's own hands-on session rather than from a revie
 Encoding and the output profiles were not touched; 1080p · 25 fps still renders
 `1920×1080 @ 25/1`.
 
-### UX follow-ups — owner playtest, 2026-11-18 · **TWO SOURCE-IMPLEMENTED, ONE PLANNED**
+### UX follow-ups — owner playtest, 2026-11-18 · **ALL THREE SOURCE-IMPLEMENTED — NO MERGE OR INSTALLATION**
 
 Three separate improvements observed by the owner on the installed GUI, with screenshots
 of Settings → Default folders and Media Library → Video Review. These are specific
@@ -2021,9 +2021,11 @@ remaining items for retry. **Discard is a move to quarantine, never a deletion.*
 Focused tests cover zero-Keep/one-Discard, zero decisions/bulk action, stale
 page/snapshot, mixed Keep/Discard, failed moves, double-clicks and subsequent pages.
 
-#### UX-BROWSE-LAYOUT — Folder pickers visually belong to their inputs
+#### UX-BROWSE-LAYOUT — Folder pickers visually belong to their inputs · **SOURCE IMPLEMENTED, NOT MERGED OR INSTALLED**
 
-**Problem.** The previous UX Refresh documented a Browse button beside each
+**Implementation status (2026-11-19).** Source implementation is committed and pushed in **draft PR #110** (`feat/ux-browse-layout-r1` at `dda8bd4342f89ebcb5b57e0c8098dfee87c6663d`). The implementer reports **10,996 passed / 25 skipped** and 32 added focused assertions. Video Review's Browse buttons are now structurally paired with the correct folder input in the same Gradio row. Settings retains its field/button pairing and uses scoped responsive flex CSS. **Visual acceptance remains pending**: the CSS aligns controls at the field block's bottom, which for an `info=` textbox is below the input and may leave the picker aligned to the helper line. No isolated real-Gradio GUI smoke, merge, installation or owner acceptance is claimed. PRs #108, #109 and #110 all change `src/gui.py`; a combined-source regression and a safe isolated GUI smoke are required before claiming integrated or visually accepted behaviour.
+
+**Problem (deployed baseline).** The previous UX Refresh documented a Browse button beside each
 Settings folder input, but the latest owner screenshots show awkwardly detached
 right-edge buttons in Settings and a separate button row far below the corresponding
 Media Library → Video Review folder fields.
@@ -2064,7 +2066,7 @@ A status must not be claimed terminal while its worker still runs. Check real
 Gradio UI activity during a deliberately slow synthetic operation, plus focused
 stale-input, duplicate-click, no-event interval and exception regressions.
 
-**Status:** **UX-ZERO-KEEP = SOURCE IMPLEMENTED / DRAFT PR #108**; **UX-PREP-ACTIVITY = SOURCE IMPLEMENTED / DRAFT PR #109**. Both remain **NOT MERGED / NOT INSTALLED / GUI SMOKE PENDING / OWNER ACCEPTANCE PENDING**. **UX-BROWSE-LAYOUT = ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**. All are independent bounded tasks; this roadmap-only update does not authorise a merge, deployment or production-media changes.
+**Status:** **UX-ZERO-KEEP = SOURCE IMPLEMENTED / DRAFT PR #108**; **UX-PREP-ACTIVITY = SOURCE IMPLEMENTED / DRAFT PR #109**; **UX-BROWSE-LAYOUT = SOURCE IMPLEMENTED / DRAFT PR #110**. All three remain **NOT MERGED / NOT INSTALLED / GUI SMOKE PENDING / OWNER ACCEPTANCE PENDING**. They are independent bounded tasks, and combined-source integration has not been verified. This roadmap-only update does not authorise a merge, deployment or production-media changes.
 
 ---
 
@@ -2100,7 +2102,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R16** — Music Playlist Mode for Video Render | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner ideas 2026-11-03, scope accepted 2026-11-12). Ordered multiple songs with Move Up/Down, Shuffle and Sort by Name; one continuous soundtrack for beat/shot planning and rendering; visible order is frozen, no silent reshuffle. Existing single-track and R10 Repeat Music remain unchanged by default; playlist-repeat interaction is a future explicit decision |
 | **R17** — Chrome / Windows notifications on long-job completion | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner idea 2026-11-04, scope accepted 2026-11-12). Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional R17-B research (service worker / Push), NOT promised for V1 — **no service worker, Push server, daemon, background poller or extension is authorised**. Accepting the scope authorises no source work and no deploy |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
-| **UX follow-ups** — zero-Keep all-Discard, Browse alignment, Prepare & Verify activity | **UX-ZERO-KEEP SOURCE IMPLEMENTED** in draft PR #108 (`3de9ea7d`); **UX-PREP-ACTIVITY SOURCE IMPLEMENTED** in draft PR #109 (`d26529ba`), tests reported green; both **NOT MERGED / INSTALLED / GUI-ACCEPTED**. **UX-BROWSE-LAYOUT ACCEPTED · NOT IMPLEMENTED**. No change to product priority order |
+| **UX follow-ups** — zero-Keep all-Discard, Browse alignment, Prepare & Verify activity | **ALL THREE SOURCE IMPLEMENTED** in separate draft PRs: **#108** (`3de9ea7d`), **#109** (`d26529ba`), **#110** (`dda8bd43`). Tests reported green on each branch independently; **NOT COMBINED-TESTED / NOT MERGED / INSTALLED / GUI-ACCEPTED**. Browse CSS alignment beside fields with helper text remains visually unverified. No change to product priority order |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
