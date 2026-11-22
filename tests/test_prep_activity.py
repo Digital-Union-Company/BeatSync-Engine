@@ -38,6 +38,7 @@ import types
 
 import pytest
 
+from beatsync_fork import library_prep as fork_library_prep
 from beatsync_fork import prep_activity as pa
 from beatsync_fork.progress import ProgressEvent
 from beatsync_fork.progress_view import ProgressView
@@ -568,9 +569,15 @@ def _load_prep_worker_seam():
         "ProgressView": ProgressView,
         "StageConsoleLogger": lambda *a, **k: _Console(),
         "QuietConsole": _Quiet,
-        # Only the failure recorder is reachable from this seam.
+        # Only the failure recorder is reachable from this seam -- plus, since
+        # UX-PREP-VISUAL-PROGRESS R1, the two REAL structural facts `_run_prep_in_worker`'s
+        # terminal frame classifies on. They are the genuine module objects rather than stubs,
+        # because the whole point of that classification is that it reads `library_prep`'s own
+        # marker and its own notice constant instead of recognising a sentence.
         "fork_prep": types.SimpleNamespace(
-            record_failure=lambda prep_state, text: ("FAILED", text)),
+            record_failure=lambda prep_state, text: ("FAILED", text),
+            is_failure_report=fork_library_prep.is_failure_report,
+            REFUSAL_NOTICE=fork_library_prep.REFUSAL_NOTICE),
         # `_prep_busy_updates` is the real body, so the seam needs a `gr.update`. `Request` is
         # preserved because the verification handlers already exec'd above resolve `gr` by name.
         "gr": types.SimpleNamespace(

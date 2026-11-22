@@ -256,6 +256,37 @@ class ProgressView:
         view = self._stages.get(stage)
         return None if view is None else view.active_phase
 
+    def active_measurement(self) -> "ActiveMeasurement | None":
+        """What the active phase of the active stage has actually measured, or ``None``.
+
+        [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1). A read-only projection of state this
+        view has **already** folded, added so a caller that needs the numbers can have them
+        without either of the two wrong alternatives: reaching into ``_stages``, or parsing them
+        back out of :meth:`render`'s text, which is the prose parsing Phase 2A deleted.
+
+        It folds nothing, mutates nothing, emits no event, defines no phase and carries nothing
+        across a phase boundary -- ``current``/``total`` come from one ``_PhaseView``, so the
+        per-``(stage, phase)`` monotonicity rule above applies to them unchanged. An uncounted
+        active phase reports ``current``/``total`` as ``None``, never as zero: ``counted`` is the
+        only thing that may turn into a determinate figure on screen, and a zero denominator
+        inherited from somewhere else is exactly what that rule exists to prevent.
+        """
+        stage_number = self.active_stage()
+        if stage_number is None:
+            return None
+        stage = self._stages[stage_number]
+        phase = stage.active()
+        return ActiveMeasurement(
+            stage=stage.stage,
+            stage_title=stage.title,
+            phase=phase.key,
+            message=phase.last_message,
+            unit=phase.unit,
+            current=phase.current,
+            total=phase.total,
+            finished=stage.finished,
+        )
+
     def stage_line(self, stage: int) -> str:
         """Detail line for a stage's **active phase**, or ``""`` if the stage is unknown."""
         view = self._stages.get(stage)
@@ -317,4 +348,31 @@ class ProgressView:
         return "\n".join(lines)
 
 
-__all__ = ["MAIN_PHASE", "MAX_NOTICES", "ProgressView"]
+@dataclass(frozen=True)
+class ActiveMeasurement:
+    """One read-only reading of the active ``(stage, phase)``. Every field was measured.
+
+    [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1). Returned by
+    :meth:`ProgressView.active_measurement`. Frozen because a consumer holding it must not be able
+    to edit the view's state through it, and because a reading is a fact about a moment rather than
+    a mutable handle.
+
+    ``current``/``total`` are ``None`` for an uncounted phase -- which is **not** zero. Only
+    :attr:`counted` may license a determinate figure on screen.
+    """
+
+    stage: int
+    stage_title: str
+    phase: str | None
+    message: str
+    unit: str
+    current: int | None
+    total: int | None
+    finished: bool
+
+    @property
+    def counted(self) -> bool:
+        return self.current is not None and self.total is not None
+
+
+__all__ = ["MAIN_PHASE", "MAX_NOTICES", "ActiveMeasurement", "ProgressView"]

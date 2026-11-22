@@ -2,6 +2,7 @@
 paths:
   - "src/beatsync_fork/prep_activity.py"
   - "tests/test_prep_activity.py"
+  - "tests/test_prep_visual_progress.py"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
 > `.claude/rules/operating-policies.md`. The two operations this serves are
@@ -239,3 +240,164 @@ preparation event wiring is byte-identical** — same inputs, same outputs, same
 * **GUI runtime acceptance is not claimed.** No Gradio was started and no FFmpeg executed by this
   work. Actual click behaviour, the frame cadence as rendered by `gradio==6.19.0`, and how a
   `gr.Textbox` repaints a streamed value remain a separately authorized milestone.
+
+  (**Superseded for Scan and Analyze only, by UX-PREP-VISUAL-PROGRESS R1 below**, which ran a
+  served smoke against the real `gradio==6.19.0`. Verify and Sample still carry this disposition:
+  their report boxes were not exercised in a browser by either item.)
+
+---
+
+# UX-PREP-VISUAL-PROGRESS R1 — the same observations, as a visible panel
+
+UX-PREP-ACTIVITY made Scan and Analyze **speak** through a silent phase. They still were not
+**visible**, and the owner reported the consequence from the installed GUI on 2026-11-22:
+
+> a Scan of 6,363 sources shows `0 / 6363 (0.0%)` for several minutes, and the only sign of life is
+> a small `Working… (03:27 elapsed)` line below the report.
+
+## Two halves, two causes — and only one of them is a defect
+
+* **The count is TRUE, and this is the part that is easy to get wrong.**
+  `classify_library_sources` emits `start(current=0, total=len(sources))` and *then* runs
+  `_compute_cache_paths_parallel` over the whole library, which emits **nothing** until the
+  per-source verdict loop begins. So `0 / 6363` is a real measurement of a real counter that has
+  genuinely not advanced. **Do not "fix" it by suppressing the count, smoothing it, or starting it
+  somewhere other than zero.**
+* **The silence is the defect.** A determinate bar parked at 0.0% is indistinguishable from a dead
+  button, and the placement made it worse: `prep_status` sat *below* a ten-line report box and the
+  Analyze button, so nothing within sight of the pressed control changed.
+
+The answer separates two questions the old line conflated:
+
+```
+"is this running?"     -> a state chip + a CSS animation. True for as long as the worker is alive,
+                          and they cost no measurement at all.
+"how far has it got?"  -> ONLY measured counts. Absent when nothing measured one.
+```
+
+**They are not alternatives.** A 0%-filled bar still carries the sweep, because the count being
+zero is not evidence that nothing is happening.
+
+## Where the motion lives, and why it is not a timer
+
+In `PREP_ACTIVITY_CSS`, as one `@keyframes` declared once on the Blocks. The server emits one frame
+a second, so an animation driven by the frames would step once a second and read as a stutter; a
+browser-side timer would mean a fourth authorised JS installer plus per-element state a Gradio
+re-render destroys. **Measured in the served app:** while a single server frame — the `0 / 8000`
+one — was on screen for 680 ms, the sweep's computed `background-position-x` took **17 distinct
+values** from `-40%` to `42.3%`, with no network traffic and no script.
+
+**The sweep is a SIBLING of the fill, spanning the whole track.** First attempt put it *on* the
+fill; a determinate `0 / N` then renders a zero-width element and the animation had nowhere to
+travel — dead at exactly the count the owner reported. The element carrying the motion must never
+be the one whose width is a measurement.
+
+## What the panel may say
+
+* **`activity_panel_html`** renders the RUNNING panel from the same `ActivityState` the one-line
+  form renders, so it can say nothing `activity_line` could not. The one-line form is passed **in**
+  as `summary`, which makes the call site the proof that there is one renderer rather than two.
+* **`status_panel_html`** renders terminal and idle. **No track at all** — a full bar on completion
+  would be a measurement nobody took, and a bar on a failure would claim the work got somewhere.
+* **`measured_percent` is the only route to a percentage**, used by both forms. A test pins that
+  `* 100.0` appears exactly once in the module.
+* `STATUS_IDLE` + an empty notice renders **`""`**, not an empty card. That is the blank-space half
+  of the complaint, fixed at the source.
+* **Unknown status fails closed to idle**, never to running (an animation over a dead worker) and
+  never to completed (the one answer a caller must not receive by accident).
+* **Whitespace in every interpolated string is collapsed to one space.** Escaping alone is not
+  enough: `html.escape` leaves a newline alone, this lands in a **Markdown** component, and a blank
+  line inside a raw HTML block is how a Markdown renderer decides the block ended. That is layout,
+  not rewording — the notice slot is a one-line status by its own contract.
+
+## The terminal state is classified from STRUCTURE, never from prose
+
+```
+failed   library_prep.is_failure_report(report_text)   -- tests only FAILURE_PREFIX, one definition
+refused  notice == library_prep.REFUSAL_NOTICE         -- one constant, two gui.py call sites
+         refusal WINS: a declined run never started, so it cannot have failed
+```
+
+`FAILURE_PREFIX` and `REFUSAL_NOTICE` exist so the reader and the writer cannot drift apart; a test
+asserts the literal appears once in `library_prep.py` and nowhere in `gui.py`. Nothing branches on
+either — they can word a panel and nothing else.
+
+**`_prep_ui_updates` gained three keyword-only arguments, and exactly one caller passes them**: the
+terminal frame, which is the only code that observed an operation finish. Every widget `change`
+handler gets the neutral idle panel, so an invalidation can never leave a green `Completed` chip
+standing over the scan it just invalidated. They default to plain `''`/`None` because this function
+is AST-executed against synthesised namespaces by two suites — a default that *evaluated* a module
+attribute would fail at definition time in a namespace that does not carry it.
+
+**An abandoned stream claims nothing.** Nothing is yielded from a `finally`, so a closed generator
+emits no terminal frame and the last thing on screen stays the honest RUNNING panel.
+
+## The phase and the counts come from THIS operation's own events
+
+`ProgressView.active_measurement()` is a new read-only projection of state the view has already
+folded — added so the counts can be had without either wrong alternative: reaching into `_stages`,
+or parsing them back out of `render()`, which is the prose parsing Phase 2A deleted. It reports one
+`_PhaseView`, so the per-`(stage, phase)` monotonicity rule applies unchanged and an uncounted
+phase reports `None`, never zero.
+
+**This does NOT reintroduce the R2 cross-operation defect.** `_prep_phase` is still never read by
+`_run_prep_in_worker`: that slot belongs to the mutex-holding Verify and Sample. `view` holds only
+the events this operation emitted, so it can describe no other. `PHASE_WORKING` remains the label
+before the first event arrives, and a test drives a real Verify holding `PHASE_MEDIA_HEADERS` while
+a Scan ticks, asserting the Scan panel never shows it.
+
+## The layout move, and the one window it is safe in
+
+`prep_status` moved from below the Analyze button to directly beneath `prep_scan_btn`, above the
+report box. It is a **layout move only** — same widget, same name, same type, same `elem_id`, same
+position in `prep_outputs`, same four-tuple arity; Gradio matches `outputs` by position in the
+list, not on screen.
+
+**It may not move further.** Four other suites slice `gui.py` raw with
+`source.index("LABEL_PREP_SECTION") : source.index("prep_status = gr.Markdown")`, and one of them
+requires `prep_batch_size = gr.Number(` to be *inside* that span. Above the scan control the span
+loses it. A test in `tests/test_prep_visual_progress.py` pins the window.
+
+**And `gr.HTML` was the obvious change and the wrong one**, for the same reason: those four slices
+key on the literal `prep_status = gr.Markdown`.
+
+## Measured in the served app (gradio 6.19.0, port 7881, synthetic library, Qwen disabled)
+
+```
+t=   91 ms  running    Running  00:00  "Working"                                 fill 100%  sweep+pulse
+t=  521 ms  running    Running  00:00  "Classifying 8000 ... · 0 / 8000 (0.0%)"  fill   0%  sweep+pulse
+t= 1448 ms  running    Running  00:01  "classified · 1 / 8000 (0.0%)"            fill   0%  sweep+pulse
+t= 1496 ms  running    Running  00:01  "classified · 8000 / 8000 (100.0%)"       fill 100%  sweep+pulse
+t= 1509 ms  completed  Completed 00:01 "8000 video(s) need analysis."            no track, no animation
+```
+
+Component count **516 = 516** against a base worktree built by the identical script; no `elem_id`
+added or removed; CSS +2,772 bytes. A deliberately absent folder produced the **Failed** panel with
+Analyze disabled and the full error in the report box.
+
+## Open, and recorded rather than claimed closed
+
+* **`gr.Markdown`'s sanitizer strips every `data-*`, `role` and `aria-*` attribute — MEASURED.**
+  `class` and `style` survive, so the animation, the tones, the determinate fill width and the
+  state class all work, and the state and the measurement are readable as **text** (the chip and
+  the detail line). But the `role="progressbar"` / `aria-valuenow` semantics and the `aria-label`
+  **do not reach the browser**. They are still emitted — they are correct, cost nothing, and would
+  become live if this ever moved to `gr.HTML` — and `tests/test_prep_visual_progress.py` asserts
+  them on the **server-side markup only**. Do not cite those tests as evidence of browser
+  behaviour. `sanitize_html=False` would make them live and is deliberately **not** taken: it
+  removes a defence-in-depth layer from a component fed operator-controlled strings (folder paths,
+  FFmpeg errors), for an a11y gain the text already mostly provides.
+* **A sustained minutes-long silent phase was not reproduced in the browser.** The synthetic
+  library's 1 KB files make the identity pass instant, and the HOT reserve was reached, so it was
+  not grown. The sustained case is asserted server-side instead (several poll ticks, monotonic
+  measured clock, every frame distinct); the browser evidence covers the determinate-zero frame,
+  which is the one the owner reported.
+* **Reduced motion was verified by CSSOM rule inspection, not by emulation.** The
+  `prefers-reduced-motion` block is present in the served stylesheet; the extension cannot set the
+  preference, so the reduced-motion *appearance* has not been seen.
+* **Analyze's panel was verified server-side only** (both operations are parametrised in the
+  suite). Running a real Analyze needs the Qwen backend, which the sandbox deliberately disables.
+* **Responsiveness was verified by narrowing the panel's CONTAINER**, down to 240 px with no
+  horizontal overflow at any width. `resize_window` cannot move this extension's rendered viewport,
+  so a `max-width` media query was not exercised — and the panel has none: it reflows by
+  `flex-wrap`.

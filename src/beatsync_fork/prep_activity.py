@@ -48,6 +48,7 @@ The honesty rules, which are the whole point
 
 from __future__ import annotations
 
+import html as _html
 from dataclasses import dataclass
 from typing import Optional
 
@@ -61,6 +62,10 @@ __all__ = [
     "PHASE_CACHE_RECORDS", "PHASE_MEDIA_HEADERS", "PHASE_STREAM_METADATA",
     "PHASE_SAMPLE_DECODE", "PHASE_REPORT",
     "PULSE_FRAMES", "ActivityState", "activity_line", "working_text", "pulse_marker",
+    # UX-PREP-VISUAL-PROGRESS R1 -- the visual panel for the same observations.
+    "STATUS_IDLE", "STATUS_RUNNING", "PANEL_STATUSES", "STATUS_LABELS",
+    "PANEL_READONLY_FOOTER", "measured_percent", "terminal_status",
+    "activity_panel_html", "status_panel_html",
 ]
 
 # --------------------------------------------------------------------------------------------
@@ -158,6 +163,20 @@ class ActivityState:
         return _measured_counts(self.done, self.total)
 
 
+def measured_percent(state: ActivityState) -> Optional[float]:
+    """Completion percentage derived from the two measured integers, or ``None``.
+
+    [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1): extracted so the one-line form and the
+    visual panel cannot drift into two different arithmetics for the same pair of integers. There
+    is deliberately no other way to obtain a percentage from this module.
+    """
+    counts = state.measured
+    if counts is None:
+        return None
+    done, total = counts
+    return (done * 100.0) / total
+
+
 def activity_line(state: ActivityState) -> str:
     """The one-line summary: operation, phase, measured counts if any, measured elapsed.
 
@@ -172,7 +191,7 @@ def activity_line(state: ActivityState) -> str:
     if counts is None:
         return f"{state.operation} — {phase}{pulse_marker(state.pulse)}  ({elapsed} elapsed)"
     done, total = counts
-    percent = (done * 100.0) / total
+    percent = measured_percent(state)
     return (f"{state.operation} — {phase}  {done} / {total} ({percent:.1f}%)"
             f"  ({elapsed} elapsed)")
 
@@ -201,3 +220,300 @@ def working_text(state: ActivityState, *, footer: bool = True, hint: bool = True
     if hint:
         parts.append(WORKING_HINT)
     return "\n".join(parts)
+
+
+# =============================================================================================
+# UX-PREP-VISUAL-PROGRESS R1 -- the same observations, as a visible panel
+#
+# [FORK] Digital-Union. The honesty rules above were already right; what was wrong was that the
+# only visible evidence of a running Scan was a small text line BELOW a ten-line report box, and
+# the first thing that line's report box said about a 6,363-source library was
+#
+#     Stage 0 - Input  (running)
+#       0 / 6363 (0.0%)
+#
+# -- which is a true reading, taken from a real `ProgressEvent`, and which then stayed exactly
+# that for several minutes. The measured cause is `classify_library_sources`: it emits its
+# `start` event with `current=0, total=len(sources)` and then runs `_compute_cache_paths_parallel`
+# over the whole library, which emits NOTHING until the per-source verdict loop begins. So a
+# determinate bar sitting at 0.0% is simultaneously honest about the count and silent about the
+# work, and an operator reads the pair as a dead button.
+#
+# The answer is therefore NOT to invent a number for that stretch. It is to separate two
+# questions the old line conflated:
+#
+#     "is this running?"      -> answered by a state chip and a CSS animation, which are true for
+#                                as long as the worker is alive and cost no measurement at all
+#     "how far has it got?"   -> answered ONLY from measured counts, and left ABSENT otherwise
+#
+# A determinate fill and the running animation are not alternatives here: a 0%-filled bar still
+# carries the sweep, because the count being zero is not evidence that nothing is happening.
+#
+# What this section is deliberately NOT
+# -------------------------------------
+# * **Not a second progress protocol.** It emits no `ProgressEvent`, defines no stage and no
+#   phase key, and parses nothing out of rendered text. Every value it prints was handed to it.
+# * **Not a clock.** Like the rest of this module it reads no time source; `elapsed_ms` is the
+#   caller's `time.perf_counter()` reading or it is absent.
+# * **Not a browser-side timer.** There is no script here and none is implied. The animation is a
+#   CSS keyframe declared once in the application stylesheet, which is why it keeps moving
+#   between two server frames without anything polling anything.
+# =============================================================================================
+
+#: No operation has run yet, or an input change invalidated the last one. Neutral: an idle panel
+#: must not read as a success and must not read as a fault.
+STATUS_IDLE = "idle"
+#: A worker is alive right now. The ONE status that animates.
+STATUS_RUNNING = "running"
+
+#: Every status the panel can render. The four terminal ones are `OUTCOMES` -- reused rather than
+#: redefined, because a second four-label vocabulary for the same four answers is exactly the
+#: duplication this module's docstring forbids. Here they are machine-readable state (a `data-`
+#: attribute and a class suffix); the words an operator reads come from `STATUS_LABELS`.
+PANEL_STATUSES = (STATUS_IDLE, STATUS_RUNNING) + OUTCOMES
+
+#: The chip text. Past tense for every terminal state and present participle for the running one,
+#: so the chip alone distinguishes "it is happening" from "it happened".
+STATUS_LABELS = {
+    STATUS_IDLE: "Idle",
+    STATUS_RUNNING: "Running",
+    OUTCOME_COMPLETED: "Completed",
+    OUTCOME_FAILED: "Failed",
+    OUTCOME_REFUSED: "Declined",
+    OUTCOME_SUPERSEDED: "Superseded",
+}
+
+#: The same four tones the Raw Cutter panel already uses, so the two activity surfaces in this
+#: application do not teach an operator two different colour languages. Colour is never the only
+#: signal: the chip text, the `data-bs-prep-status` attribute and the panel's own `aria-label` all
+#: name the state in words.
+_STATUS_TONES = {
+    STATUS_IDLE: "#8b949e",             # grey  -- nothing to report, which is not a fault
+    STATUS_RUNNING: "#2f81f7",          # blue  -- work is genuinely running
+    OUTCOME_COMPLETED: "#2ea043",       # green -- a terminal success
+    OUTCOME_FAILED: "#f85149",          # red   -- a terminal failure
+    OUTCOME_REFUSED: "#d29922",         # amber -- declined; nothing ran, which is not a failure
+    OUTCOME_SUPERSEDED: "#d29922",      # amber -- an answer withheld, for the same reason
+}
+
+#: The panel's own reassurance line. Shorter than :data:`WORKING_FOOTER` on purpose and not a
+#: second claim: the chip beside it already says `Running`, so repeating the word inside the panel
+#: would be the duplicated status information this surface is meant to remove. The *statement* is
+#: the same one, and it is true of all four operations -- Verify and Sample write nothing at all,
+#: Scan creates the cache directory and no record, and Analyze's writes stay on the existing
+#: checkpoint path.
+PANEL_READONLY_FOOTER = "Nothing has been changed on disk yet."
+
+
+def terminal_status(*, failed: bool = False, refused: bool = False) -> str:
+    """Map two observed facts onto one terminal status. Refusal wins, then failure.
+
+    Deliberately takes booleans the caller measured rather than a report string to classify: a
+    renderer that decided "did this fail" by looking for words in prose would be the prose-parsing
+    `progress-events.md` deleted, moved to the last step of the pipeline instead of the first.
+
+    Refusal is checked first because a declined operation **did not run**, so it cannot have
+    failed; reporting it as a failure would send an operator looking for a fault in their library.
+    """
+    if refused:
+        return OUTCOME_REFUSED
+    if failed:
+        return OUTCOME_FAILED
+    return OUTCOME_COMPLETED
+
+
+def _tone(status: str) -> str:
+    return _STATUS_TONES.get(status, _STATUS_TONES[STATUS_IDLE])
+
+
+def _one_line(text) -> str:
+    """Collapse every run of whitespace to one space, so an interpolated string is one line.
+
+    Escaping is not sufficient on its own here, and that is a measured point rather than a
+    precaution: `html.escape` leaves a newline alone, this fragment lands in a **Markdown**
+    component, and a blank line inside a raw HTML block is exactly how a Markdown renderer decides
+    the block ended -- so one multi-line string would split the panel in half and show the rest as
+    visible angle brackets. Every value reaching this markup can contain one: an FFmpeg error, a
+    Windows path, an operator-typed folder.
+
+    This is layout, not rewording. No word, number, order or character other than whitespace
+    changes, and the notice slot it serves is a *one-line* status by its own contract
+    (:attr:`library_prep.PrepSessionState.notice`); the full multi-line report has its own box.
+    """
+    return " ".join(str(text or "").split())
+
+
+def _safe_status(status) -> str:
+    """A status this module will render, failing closed to :data:`STATUS_IDLE`.
+
+    Unknown input becomes *idle*, never running and never completed. Both of those would be a
+    claim: "still working" keeps an animation alive over a dead worker, and "completed" is the one
+    answer a caller must never receive by accident.
+    """
+    text = str(status or "")
+    return text if text in PANEL_STATUSES else STATUS_IDLE
+
+
+def _chip(status: str) -> str:
+    """The state chip: a tone-coloured dot, then the state in words."""
+    return (f'<span class="bs-prep-chip" style="color:{_tone(status)};">'
+            f'<span class="bs-prep-dot" style="background:{_tone(status)};"></span>'
+            f'{_html.escape(STATUS_LABELS.get(status, status.title()))}</span>')
+
+
+def _track(state: ActivityState) -> str:
+    """The bar, rendered ONLY while something is running.
+
+    Determinate when -- and only when -- `state.measured` accepted two real integers; the fill is
+    then exactly that fraction and `aria-valuenow` carries it. Otherwise the fill spans the track
+    and carries no value at all: ARIA's own rule for an indeterminate progressbar is to OMIT
+    `aria-valuenow`, which is a far better answer than a zero, because a screen reader announces a
+    zero as a measurement.
+
+    **The sweep is a sibling of the fill and spans the whole track, not the filled part.** That is
+    requirement 4 as code, and it is the second attempt: with the sweep ON the fill, a determinate
+    `0 / 6363` renders a zero-width element, so the animation that is supposed to say "alive" had
+    nowhere to travel and the panel looked as dead as the line it replaced -- at exactly the count
+    the owner reported. A measured zero is a true count and not evidence of idleness, so the
+    motion is attached to the thing whose width is not a measurement.
+    """
+    percent = measured_percent(state)
+    sweep = '<div class="bs-prep-sweep"></div>'
+    if percent is None:
+        return ('<div class="bs-prep-track" role="progressbar" aria-valuemin="0" '
+                'aria-valuemax="100">'
+                f'<div class="bs-prep-fill" style="width:100%;"></div>{sweep}</div>')
+    bounded = max(0.0, min(100.0, percent))
+    return ('<div class="bs-prep-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" '
+            f'aria-valuenow="{bounded:.1f}">'
+            f'<div class="bs-prep-fill" style="width:{bounded:.1f}%;"></div>{sweep}</div>')
+
+
+def _panel(*, status: str, operation: str, elapsed_ms: Optional[float], detail: str,
+           footer: str, summary: str, track: str, pulse: int,
+           done: Optional[int], total: Optional[int], percent: Optional[float]) -> str:
+    """The shared markup. One line of HTML, every interpolated value escaped.
+
+    One line because this lands in a Markdown component: a blank line inside a raw HTML block is
+    how a Markdown renderer decides the block ended, and a fragment split in half there renders as
+    visible angle brackets.
+
+    `data-bs-prep-*` is the stable contract the tests and the browser read, so no assertion has to
+    parse presentation. `data-bs-prep-pulse` is also mechanical rather than decorative: a Gradio
+    update whose value is byte-identical to the previous one is **not delivered** (the hazard the
+    R5 grid nonce exists for), so without a guaranteed per-frame difference the panel would freeze
+    while work continued -- and an HTML panel cannot carry the text pulse the one-line form uses.
+    """
+    tone = _tone(status)
+    operation = _one_line(operation)
+    detail = _one_line(detail)
+    footer = _one_line(footer)
+    # The summary is the caller's own one-line form of the same observation, emitted as the
+    # panel's `aria-label`. Absent when the caller has no one-line form -- an empty `aria-label`
+    # is worse than none at all.
+    #
+    # MEASURED CAVEAT, so nobody reads this as a live accessibility feature: the consumer renders
+    # through a `gr.Markdown`, and gradio 6.19.0's sanitizer strips every `aria-*`, `role` and
+    # `data-*` attribute before the browser sees it. `class` and `style` survive and nothing else
+    # does. These attributes are still emitted because they are correct, cost nothing, and become
+    # live the moment a consumer renders this through `gr.HTML` -- but what a screen reader
+    # ACTUALLY gets today is the chip text and the detail line, which is why the state is always
+    # written in words and the measurement is always written as text.
+    summary = _one_line(summary)
+    label = (f'aria-label="{_html.escape(summary, quote=True)}" ' if summary else '')
+    rows = [
+        f'<div {label}class="bs-prep-panel bs-prep-{_html.escape(status, quote=True)}" '
+        f'data-bs-prep-status="{_html.escape(status, quote=True)}" '
+        f'data-bs-prep-running="{"1" if status == STATUS_RUNNING else "0"}" '
+        f'data-bs-prep-operation="{_html.escape(operation, quote=True)}" '
+        f'data-bs-prep-elapsed-ms="{"" if elapsed_ms is None else int(max(0.0, elapsed_ms))}" '
+        f'data-bs-prep-determinate="{"1" if percent is not None else "0"}" '
+        f'data-bs-prep-done="{"" if done is None else int(done)}" '
+        f'data-bs-prep-total="{"" if total is None else int(total)}" '
+        f'data-bs-prep-percent="{"" if percent is None else format(percent, ".1f")}" '
+        f'data-bs-prep-pulse="{int(pulse)}" '
+        f'style="border-left:3px solid {tone};">',
+        '<div class="bs-prep-head">',
+        _chip(status),
+    ]
+    if operation:
+        rows.append(f'<span class="bs-prep-operation">{_html.escape(operation)}</span>')
+    if elapsed_ms is not None:
+        rows.append('<span class="bs-prep-clock">'
+                    f'{_html.escape(format_elapsed(max(0.0, float(elapsed_ms))))}</span>')
+    rows.append('</div>')
+    rows.append(track)
+    if detail:
+        rows.append(f'<div class="bs-prep-detail">{_html.escape(detail)}</div>')
+    if footer:
+        rows.append(f'<div class="bs-prep-foot">{_html.escape(footer)}</div>')
+    rows.append('</div>')
+    return "".join(rows)
+
+
+def activity_panel_html(state: ActivityState, *, summary: str = "",
+                        footer: str = PANEL_READONLY_FOOTER) -> str:
+    """The RUNNING panel for one in-flight observation.
+
+    `state` is the same record `activity_line` renders, so the panel can say nothing the one-line
+    form could not. `summary` is that one-line form, passed in rather than recomputed here: it
+    becomes the panel's `aria-label` and the call site then visibly shows that there is exactly one
+    renderer for "what is this operation doing right now". See `_panel` for the measured caveat
+    about which attributes survive the consumer's Markdown sanitizer.
+
+    The detail line is the phase the operation itself published plus the counts something measured,
+    and nothing else -- no estimate, no rate, no throughput and no remaining time, for any of which
+    the data does not exist.
+    """
+    counts = state.measured
+    percent = measured_percent(state)
+    detail = str(state.phase or PHASE_STARTING)
+    if counts is not None:
+        done, total = counts
+        detail = f"{detail} · {done} / {total} ({percent:.1f}%)"
+    return _panel(
+        status=STATUS_RUNNING,
+        operation=str(state.operation or ""),
+        elapsed_ms=float(state.elapsed_ms or 0.0),
+        detail=detail,
+        footer=footer,
+        summary=summary,
+        track=_track(state),
+        pulse=int(state.pulse or 0),
+        done=None if counts is None else counts[0],
+        total=None if counts is None else counts[1],
+        percent=percent,
+    )
+
+
+def status_panel_html(*, status: str, operation: str = "", message: str = "",
+                      elapsed_ms: Optional[float] = None) -> str:
+    """The terminal or idle panel. No bar, no animation, and no fabricated completion.
+
+    `message` is the operation's own notice, rendered **verbatim** (escaped, never reworded): the
+    four terminal strings are compared by equality in accepted suites and "declined, nothing ran"
+    leads an operator somewhere different from "ran and broke", so this decorates none of them.
+
+    **No track is rendered here at all.** Painting a full bar on completion would be inventing a
+    measurement -- a finished Scan knows how many sources it classified, not that some progress
+    figure reached 100 -- and painting one on a failure would claim the work got somewhere.
+
+    An idle panel with nothing to say renders as the empty string rather than as an empty card,
+    which is what keeps the preparation section from carrying a permanent blank box.
+    """
+    resolved = _safe_status(status)
+    if resolved == STATUS_IDLE and not str(message or "").strip():
+        return ""
+    return _panel(
+        status=resolved,
+        operation=str(operation or ""),
+        elapsed_ms=None if elapsed_ms is None else float(elapsed_ms),
+        detail=str(message or ""),
+        footer="",
+        summary="",
+        track="",
+        pulse=0,
+        done=None,
+        total=None,
+        percent=None,
+    )

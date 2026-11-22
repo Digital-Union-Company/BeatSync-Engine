@@ -632,6 +632,38 @@ def record_scan(state: PrepSessionState, scan: PrepScanResult) -> PrepSessionSta
                    report_text=scan.render_text(batch_size=state.batch_size), notice=notice)
 
 
+#: The marker :func:`record_failure` writes at the front of its report, named once so the
+#: recogniser below and the writer above cannot drift apart.
+#:
+#: [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1).
+FAILURE_PREFIX = "❌ "
+
+#: The notice every *refusal* carries, as opposed to a fault. Promoted from three repeated string
+#: literals in `gui.py` so that "was this declined or did it break?" is answered by comparing
+#: against one definition rather than by recognising a sentence.
+#:
+#: A refusal is not a failure and must not be shown as one: the operation never ran, nothing was
+#: touched, and the fix is a different action by the operator.
+#:
+#: [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1).
+REFUSAL_NOTICE = "Preparation run refused."
+
+
+def is_failure_report(report_text: str) -> bool:
+    """True when ``report_text`` was produced by :func:`record_failure`.
+
+    [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1). Deliberately a test for the **structural
+    marker this module itself writes**, not a reading of the message: it looks only at
+    :data:`FAILURE_PREFIX`, never at any word a failure happens to contain. That distinction is
+    the whole difference between a state machine reporting its own shape and the prose parsing
+    `progress-events.md` removed from `gui.py`.
+
+    It is diagnostic only. Nothing in this module branches on it, and it can word a panel and
+    nothing else: it cannot admit a run, enable Analyze, change a count or move a state.
+    """
+    return str(report_text or "").startswith(FAILURE_PREFIX)
+
+
 def record_failure(state: PrepSessionState, message: str,
                    notice: str = "Scan failed.") -> PrepSessionState:
     """A scan or a run that could not proceed: no result is recorded, so Analyze stays disabled.
@@ -640,7 +672,7 @@ def record_failure(state: PrepSessionState, message: str,
     :func:`analyze_refusal` can produce means the recorded classification no longer describes
     reality, so leaving it in place would only let the user click into the same refusal again.
     """
-    return replace(state, scan=None, report_text=f"❌ {message}", notice=notice)
+    return replace(state, scan=None, report_text=f"{FAILURE_PREFIX}{message}", notice=notice)
 
 
 def record_analysis_complete(state: PrepSessionState, summary: str) -> PrepSessionState:
@@ -817,6 +849,7 @@ __all__ = [
     "BATCH_FINISHED_TEXT",
     "DEFAULT_ANALYZE_BATCH_SIZE",
     "DEFAULT_RECURSIVE",
+    "FAILURE_PREFIX",
     "INTRO_TEXT",
     "MEDIA_SUMMARY_FIELDS",
     "LivePrepDeclaration",
@@ -825,6 +858,7 @@ __all__ = [
     "PreparedMediaSummary",
     "PrepSessionState",
     "PrepStatus",
+    "REFUSAL_NOTICE",
     "RESCAN_HINT",
     "RuntimeIdentity",
     "SEMANTIC_MODE_TEXT",
@@ -834,6 +868,7 @@ __all__ = [
     "build_scan_result",
     "declaration_refusal",
     "initial_state",
+    "is_failure_report",
     "media_summary_from_source_counts",
     "normalize_batch_size",
     "record_analysis_complete",
