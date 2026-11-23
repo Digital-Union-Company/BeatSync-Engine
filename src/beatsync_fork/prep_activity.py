@@ -196,10 +196,26 @@ def activity_line(state: ActivityState) -> str:
             f"  ({elapsed} elapsed)")
 
 
-#: The reassurance line. It states what is true of every operation this module serves: all four are
-#: read-only with respect to records and media, so an operator watching a long phase knows that
-#: abandoning it costs them nothing. Verify and Sample write nothing at all; Scan creates the cache
-#: directory and no record, and Analyze's writes go through the existing checkpoint path.
+#: The reassurance line for **Verify Sources and Sample Decode, and for no other operation**.
+#:
+#: Those two are the only consumers, and that is structural rather than a convention:
+#: :func:`working_text` is reached from exactly one place in `gui.py`, `_activity_frames`, which
+#: in turn is reached only from `_verify_sources_frames` and `_sample_decode_frames` -- both
+#: pinned as exact sets by `tests/test_prep_activity.py`, which also pins that
+#: `_run_prep_in_worker` (Scan and Analyze) never names `_activity_frames` at all. The
+#: Scan/Analyze panel supplies no footer of its own either.
+#:
+#: That scoping is load-bearing, because the claim is only true of those two: they write nothing
+#: whatsoever, so an operator watching a long Verify or Sample knows that abandoning it costs them
+#: nothing.
+#:
+#: **It does NOT hold for Analyze, and must never be shown there.** `analyze_video_sources`
+#: checkpoints each source's cache record the moment that source finishes, so records are landing
+#: on disk while the operation is still running. (An earlier version of this comment claimed "all
+#: four are read-only with respect to records and media" and said Analyze's writes merely "go
+#: through the existing checkpoint path" -- that describes *where* they go, not *whether* they
+#: happen, and PR #111 finding F1 was the panel acting on it.) Scan is read-only apart from
+#: creating the cache directory, but it is not a consumer of this string either.
 WORKING_FOOTER = "Working — nothing has been changed on disk yet."
 
 #: Scan and Analyze stream real `ProgressEvent`s, so their notice carries the activity line only;
@@ -284,9 +300,14 @@ STATUS_LABELS = {
 }
 
 #: The same four tones the Raw Cutter panel already uses, so the two activity surfaces in this
-#: application do not teach an operator two different colour languages. Colour is never the only
-#: signal: the chip text, the `data-bs-prep-status` attribute and the panel's own `aria-label` all
-#: name the state in words.
+#: application do not teach an operator two different colour languages.
+#:
+#: **Colour is never the only signal, and the non-colour signals that actually reach a browser are
+#: the chip TEXT and the `bs-prep-<status>` CLASS.** Both are rendered by :func:`_chip` and
+#: :func:`_panel` and both survive the consumer's sanitizer. The `data-bs-prep-status` attribute
+#: and the panel's `aria-label` are *emitted* and are correct, but they are stripped before the
+#: DOM sees them (see :func:`_panel`), so they are a server-side contract and must not be counted
+#: as browser-side redundancy for colour.
 _STATUS_TONES = {
     STATUS_IDLE: "#8b949e",             # grey  -- nothing to report, which is not a fault
     STATUS_RUNNING: "#2f81f7",          # blue  -- work is genuinely running
@@ -382,26 +403,32 @@ def _chip(status: str) -> str:
 def _track(state: ActivityState) -> str:
     """The bar, rendered ONLY while something is running.
 
+    The two branches differ in **which elements exist**, not merely in a width:
+
+    ```
+    measured      <div class="bs-prep-track" aria-valuenow="NN.N">  + bs-prep-fill  + bs-prep-sweep
+    not measured  <div class="bs-prep-track bs-prep-indeterminate">                 + bs-prep-sweep
+    ```
+
     Determinate when -- and only when -- `state.measured` accepted two real integers; the fill is
-    then exactly that fraction and `aria-valuenow` carries it. Otherwise the fill spans the track
-    and carries no value at all: ARIA's own rule for an indeterminate progressbar is to OMIT
-    `aria-valuenow`, which is a far better answer than a zero, because a screen reader announces a
-    zero as a measurement.
+    then exactly that fraction and `aria-valuenow` carries it. **Otherwise there is no fill element
+    at all** (PR #111 finding F2), and no `aria-valuenow`: ARIA's own rule for an indeterminate
+    progressbar is to OMIT it, which is a far better answer than a zero, because a screen reader
+    announces a zero as a measurement.
 
-    **The sweep is a sibling of the fill and spans the whole track, not the filled part.** That is
-    requirement 4 as code, and it is the second attempt: with the sweep ON the fill, a determinate
-    `0 / 6363` renders a zero-width element, so the animation that is supposed to say "alive" had
-    nowhere to travel and the panel looked as dead as the line it replaced -- at exactly the count
-    the owner reported. A measured zero is a true count and not evidence of idleness, so the
-    motion is attached to the thing whose width is not a measurement.
+    R1 rendered the unmeasured branch as a fill at `width:100%`, which paints the identical solid
+    bar a genuinely complete `N / N` paints -- so a phase nobody had counted looked *finished*,
+    the inverse of the defect this whole item exists to remove. Emitting no fill is strictly
+    better than dimming one: there is then no element whose width could be read as a quantity at
+    all, and the sweep moving across an empty track is unambiguous. The track, the sweep and the
+    running chip are unchanged, so the state is still obvious.
 
-    **An indeterminate track carries NO fill element at all** (PR #111 finding F2). R1 rendered
-    `width:100%` there, which paints the same solid bar a genuinely complete `N / N` paints -- so
-    a phase nobody had counted looked finished, which is the determinate-looking-indeterminate
-    inverse of the defect this whole item exists to remove. Emitting no fill is strictly better
-    than dimming one: there is then no element whose width could be read as a quantity, and the
-    sweep moving across an empty track is unambiguous. The track, the sweep and the running chip
-    are untouched, so the state is still obvious.
+    **The sweep spans the whole track in both branches, and is never nested inside the fill.**
+    That is requirement 4 as code, and it is the second attempt: with the sweep ON the fill, a
+    determinate `0 / 6363` renders a zero-width element, so the animation that is supposed to say
+    "alive" had nowhere to travel and the panel looked as dead as the line it replaced -- at
+    exactly the count the owner reported. A measured zero is a true count and not evidence of
+    idleness, so the motion is attached to the one element whose width is never a measurement.
     """
     percent = measured_percent(state)
     sweep = '<div class="bs-prep-sweep"></div>'
@@ -424,11 +451,27 @@ def _panel(*, status: str, operation: str, elapsed_ms: Optional[float], detail: 
     how a Markdown renderer decides the block ended, and a fragment split in half there renders as
     visible angle brackets.
 
-    `data-bs-prep-*` is the stable contract the tests and the browser read, so no assertion has to
-    parse presentation. `data-bs-prep-pulse` is also mechanical rather than decorative: a Gradio
-    update whose value is byte-identical to the previous one is **not delivered** (the hazard the
-    R5 grid nonce exists for), so without a guaranteed per-frame difference the panel would freeze
-    while work continued -- and an HTML panel cannot carry the text pulse the one-line form uses.
+    `data-bs-prep-*` is the stable contract **of the emitted source**, which is what the tests
+    read, so no assertion has to parse presentation. It is explicitly **not** a live DOM contract:
+    measured against the served `gradio==6.19.0`, the consumer's `gr.Markdown` sanitizer strips
+    every `data-*`, `role` and `aria-*` attribute, leaving only `class` and `style`. So:
+
+    ```
+    emitted here, asserted by tests   class  style  data-bs-prep-*  role  aria-*
+    present in the live DOM           class  style
+    ```
+
+    A browser-side check must therefore key on the `bs-prep-<status>` class and the rendered text,
+    never on these attributes, and a passing server-markup test is not evidence about the DOM. The
+    attributes are still emitted because they are correct, cost nothing, and become live the
+    moment a consumer renders this through `gr.HTML`.
+
+    `data-bs-prep-pulse` is mechanical rather than decorative, and it keeps working despite the
+    stripping **because the mechanism is server-side**: a Gradio update whose value is
+    byte-identical to the previous one is **not delivered** (the hazard the R5 grid nonce exists
+    for), and that comparison is made on the emitted string, not on the DOM. Without a guaranteed
+    per-frame difference the panel would freeze while work continued -- and an HTML panel cannot
+    carry the text pulse the one-line form uses.
     """
     tone = _tone(status)
     operation = _one_line(operation)
