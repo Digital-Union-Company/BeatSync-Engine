@@ -706,6 +706,184 @@ BROWSE_ROW_CSS = """
 }
 """
 
+# [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1): the Prepare & Verify activity panel.
+#
+# The owner's report: a Scan of 6,363 sources showed `0 / 6363 (0.0%)` for several minutes with
+# nothing but a small line of text below the report box to say anything was happening. Both halves
+# of that are real and they have different causes.
+#
+#   * The count is TRUE. `classify_library_sources` emits its start event with
+#     `current=0, total=len(sources)` and then runs the parallel identity pass, which emits
+#     nothing until the per-source verdict loop begins. So the figure is a measurement, and it
+#     genuinely is zero for as long as that pass takes.
+#   * The *silence* is the defect. A determinate bar parked at 0.0% looks exactly like a dead
+#     button, and the honest fix is not to invent a number for the gap -- it is to answer "is this
+#     alive?" separately from "how far has it got?".
+#
+# This stylesheet is the first answer. It is deliberately where the MOTION lives, and that is a
+# measured design choice rather than a preference: the server emits one frame a second, so any
+# animation driven by the frames themselves would step once a second and read as a stutter, and a
+# browser-side timer would mean a FOURTH authorised JS installer on the Blocks, plus per-element
+# state that a Gradio re-render destroys. A CSS keyframe declared once in the application
+# stylesheet keeps moving smoothly BETWEEN two server frames with nothing polling anything and no
+# script of any kind.
+#
+# (Deliberately NOT spelling the installer's call expression here: the authorised installer count
+# is pinned by a raw substring count over this file, so naming it in a comment makes the count
+# wrong -- measured, as a failing test, while writing this.)
+#
+# Five things about it that are load-bearing:
+#
+#   * **Scoped to `.bs-prep-panel` and `#prep-status`**, which nothing else in the app uses, so it
+#     can reach no other control. No `!important` except where it has to beat Gradio's own
+#     paragraph margins, and no colour is a `.stop`-style class selector that could leak.
+#   * **`prefers-reduced-motion: reduce` is honoured, and the running state survives it.** The
+#     sweep and the pulsing dot stop; the fill is replaced by a *static* diagonal stripe, so the
+#     RUNNING state is still visually distinct from a terminal one. Switching the animation off
+#     and leaving a flat bar would make reduced-motion users see exactly the ambiguous panel this
+#     item exists to remove.
+#   * **Colour is never the only signal.** Every state also carries its chip TEXT ("Running",
+#     "Completed", "Failed", "Declined") and its own `bs-prep-<status>` class. Deliberately not
+#     "and its `data-` attribute": measured against the served gradio 6.19.0, this renders through
+#     a Markdown component whose sanitizer strips every `data-*`, `role` and `aria-*` attribute --
+#     `class` and `style` survive and nothing else does. The panel still emits them (they are
+#     correct, cost nothing, and would be live under `gr.HTML`), but nothing visible may depend on
+#     them, and the ARIA progressbar semantics do NOT reach the browser. See
+#     `.claude/rules/prep-activity.md` for why `sanitize_html=False` was not taken.
+#   * **The blank-space fix is the `#prep-status p` rule**, not a height. The notice renders
+#     through a Markdown component, whose default paragraph margins were most of the empty band
+#     under the report box; collapsing them is why no pinned height or negative margin appears
+#     here -- the same reasoning `BUILD_ID_CSS` records.
+#   * **Responsive by wrapping, not by breakpoint arithmetic.** The header row is a `flex-wrap`
+#     with the clock pushed right by `margin-left:auto`, so it reflows rather than overflowing.
+#     Measured by narrowing the panel's own container to 1100 / 600 / 360 / 240 px: no horizontal
+#     overflow of the panel and none of the document at any of them. The one media query is the
+#     reduced-motion one; there is no `max-width` breakpoint to exercise.
+PREP_ACTIVITY_CSS = """
+#prep-status p {
+    margin: 0 !important;
+}
+
+#prep-status {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+.bs-prep-panel {
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    display: grid;
+    gap: 6px;
+    font-size: 0.92em;
+}
+
+.bs-prep-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+}
+
+.bs-prep-chip {
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    white-space: nowrap;
+}
+
+.bs-prep-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+.bs-prep-running .bs-prep-dot {
+    animation: bs-prep-pulse 1.3s ease-in-out infinite;
+}
+
+.bs-prep-operation {
+    font-weight: 600;
+}
+
+.bs-prep-clock {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.8;
+    white-space: nowrap;
+}
+
+.bs-prep-track {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.10);
+    overflow: hidden;
+}
+
+.bs-prep-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: #2f81f7;
+}
+
+/* Spans the whole track, never the filled part: a determinate 0 / 6363 has a zero-width fill, and
+   an animation on that has nowhere to travel -- which is precisely the count the operator
+   reported seeing for minutes. */
+.bs-prep-sweep {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%,
+        rgba(255, 255, 255, 0.55) 50%, rgba(255, 255, 255, 0) 100%);
+    background-size: 40% 100%;
+    background-repeat: no-repeat;
+    animation: bs-prep-sweep 1.4s linear infinite;
+}
+
+.bs-prep-detail {
+    opacity: 0.9;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+}
+
+.bs-prep-foot {
+    opacity: 0.55;
+    font-size: 0.88em;
+}
+
+@keyframes bs-prep-sweep {
+    0%   { background-position: -40% 0; }
+    100% { background-position: 140% 0; }
+}
+
+@keyframes bs-prep-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.35; transform: scale(0.72); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .bs-prep-running .bs-prep-dot,
+    .bs-prep-sweep {
+        animation: none !important;
+    }
+
+    /* The motion stops; the RUNNING state does not become ambiguous. A static diagonal stripe
+       across the whole track still distinguishes a running panel from a terminal one, which has
+       no track at all. */
+    .bs-prep-sweep {
+        background-image: repeating-linear-gradient(135deg,
+            rgba(255, 255, 255, 0.30) 0 7px, rgba(255, 255, 255, 0) 7px 14px);
+        background-size: auto;
+        background-repeat: repeat;
+    }
+}
+"""
+
 # [FORK] Digital-Union (R5 Clips Preview Selector, P1): gallery interaction.
 #
 # Decisions POST to `/r5decide`, the server's own authorized endpoint, and NOT through a Gradio
@@ -5745,18 +5923,45 @@ def render_selected_variants_guarded(
 # pass and no edit style anywhere in here, because none of that reaches Stage-5 cache identity.
 
 
-def _prep_ui_updates(state) -> Tuple:
-    """Project the preparation state onto its three widgets plus the state object."""
+def _prep_ui_updates(state, *, status: str = '', operation: str = '',
+                     elapsed_ms=None) -> Tuple:
+    """Project the preparation state onto its three widgets plus the state object.
+
+    [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1): the notice slot now carries the preparation
+    activity panel rather than a bare sentence, and `state.notice` is rendered inside it
+    **verbatim** -- escaped, never reworded, because the terminal strings are compared by equality
+    in accepted suites and because "declined, nothing ran" leads an operator somewhere different
+    from "ran and broke".
+
+    The three keyword arguments are what makes the terminal state *honest* rather than guessed.
+    They are supplied by exactly one caller -- `_run_prep_in_worker`'s final frame, which is the
+    only code that actually observed an operation finish. Every other caller is a widget `change`
+    handler, where there is no operation, no outcome and no clock, so the default is the neutral
+    idle panel: an input change must not leave a green `Completed` chip standing over a scan it
+    just invalidated, and must not look like a fault either.
+
+    Keyword-only and defaulted to plain `''`/`None` on purpose: this function is AST-extracted and
+    executed against synthesised namespaces by two suites, so a default that *evaluated* a module
+    attribute would fail at definition time in a namespace that does not carry it.
+    """
     return (
         state.report_text,
-        state.notice,
+        fork_prep_activity.status_panel_html(
+            status=status or fork_prep_activity.STATUS_IDLE,
+            operation=operation,
+            message=state.notice,
+            elapsed_ms=elapsed_ms),
         gr.update(value=state.analyze_button_label(), interactive=state.can_analyze()),
         state,
     )
 
 
 def _prep_busy_updates(state, rendered: str, notice: str) -> Tuple:
-    """An in-flight frame: live progress in the report box, Analyze held disabled."""
+    """An in-flight frame: live progress in the report box, Analyze held disabled.
+
+    Signature, arity and element order are deliberately unchanged -- `notice` is simply the
+    rendered activity panel now instead of one line of text, and it still goes to the same widget.
+    """
     return (rendered, notice, gr.update(interactive=False), state)
 
 
@@ -5898,7 +6103,7 @@ def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
     if refusal is None:
         refusal = fork_prep.analyze_refusal(state, None)
     if refusal is not None:
-        return fork_prep.record_failure(state, refusal, notice="Preparation run refused.")
+        return fork_prep.record_failure(state, refusal, notice=fork_prep.REFUSAL_NOTICE)
 
     # Recompute the invocation-scoped identity once and compare it with the scan's. Passing an empty
     # source list reuses the one classifier seam to do exactly that work - backend availability,
@@ -5910,7 +6115,7 @@ def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
     runtime = fork_prep.runtime_identity_from_classification(probe, qwen_enabled=qwen_enabled)
     refusal = fork_prep.analyze_refusal(state, runtime)
     if refusal is not None:
-        return fork_prep.record_failure(state, refusal, notice="Preparation run refused.")
+        return fork_prep.record_failure(state, refusal, notice=fork_prep.REFUSAL_NOTICE)
 
     # The P.1 rule: only the classified subset, and only one bounded batch of it. For the measured
     # 902-source library the subset is 4 paths, not 902; for a cold 1107-source library it is 1107,
@@ -5954,10 +6159,28 @@ def _run_prep_in_worker(work, state, *,
 
     The wait is now a one-second poll, and a tick with no event emits an activity notice carrying
     the pulse and a MEASURED elapsed reading. Three things it deliberately does not do: it invents
-    no count (the report box shows `ProgressView`'s real ones when they exist), it fabricates no
-    percentage or ETA, and it does not restate the phase `ProgressView` is already rendering -- the
-    notice says `Working` and the box says which stage. A timeout is not a sleep: an event arriving
-    mid-interval is applied immediately, so the cadence never delays anything.
+    no count, it fabricates no percentage or ETA, and it does not restate everything
+    `ProgressView` is rendering -- the box still carries the full multi-stage view.
+    A timeout is not a sleep: an event arriving mid-interval is applied immediately, so the cadence
+    never delays anything.
+
+    [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1): the notice is now a VISIBLE PANEL, and it
+    carries the active phase's own measured counts when the event stream has supplied them.
+
+    Two separate changes, and conflating them is how the old line went wrong. The panel answers
+    "is this running?" with a state chip and a CSS animation -- true facts that cost no
+    measurement and stay true through a stretch that emits nothing. It answers "how far has it
+    got?" **only** from `view.active_measurement()`, which reports what this operation's own
+    events measured, and leaves the figure absent otherwise. That is why a scan whose first event
+    honestly says `0 / 6363` no longer reads as a dead button: the count is rendered as the count
+    it is, and the animation does not stop because the count happens to be zero.
+
+    The phase shown is the active phase's **own last message** -- published by this operation's
+    event stream and by nothing else -- falling back to `fork_prep_activity.PHASE_WORKING` before
+    the first event arrives. `_prep_phase` is still never consulted: that slot belongs to the
+    mutex-holding Verify and Sample, Scan and Analyze hold no lock, and reading it attributed one
+    operation's phase to another (UX-PREP-ACTIVITY R2). Reading this operation's own events is a
+    different thing entirely, and it is the only honest source for requirement 2.
     """
     status_queue: queue.Queue[object | None] = queue.Queue()
     result_queue: queue.Queue[object] = queue.Queue(maxsize=1)
@@ -5989,21 +6212,39 @@ def _run_prep_in_worker(work, state, *,
     pulse = 0
 
     def notice() -> str:
-        """The activity line: operation, pulse, and a measured elapsed reading. Never an estimate.
+        """The running activity panel: operation, phase, measured counts, measured elapsed.
 
-        **The phase is this operation's own generic `PHASE_WORKING`, and `_prep_phase` is
-        deliberately not consulted.** That slot is published only by the mutex-holding Verify and
-        Sample impls; Scan and Analyze hold no lock, so reading it attributed another operation's
-        phase to this one -- measured as `Scan Library - Reading media headers` while a Verify was
-        in its header sweep (UX-PREP-ACTIVITY R2). Scan and Analyze lose nothing by it: their real,
-        detailed phases are already in the report box through `ProgressView`, and this line's job
-        is only to prove the operation is alive during a stretch that emits no event.
+        **`_prep_phase` is deliberately not consulted.** That slot is published only by the
+        mutex-holding Verify and Sample impls; Scan and Analyze hold no lock, so reading it
+        attributed another operation's phase to this one -- measured as `Scan Library - Reading
+        media headers` while a Verify was in its header sweep (UX-PREP-ACTIVITY R2). What IS
+        consulted is `view`, which holds only the events **this** operation emitted, so the phase
+        and the counts below describe this operation and can describe no other.
+
+        Nothing here is derived, smoothed, extrapolated or defaulted to a number. `done`/`total`
+        are handed over exactly as the active phase measured them, and `prep_activity` rejects
+        anything that is not two real integers -- so an uncounted phase renders no figure at all
+        rather than a plausible one.
         """
-        return fork_prep_activity.activity_line(fork_prep_activity.ActivityState(
+        measurement = view.active_measurement()
+        counted = measurement is not None and measurement.counted
+        observed = fork_prep_activity.ActivityState(
             operation=operation,
-            phase=fork_prep_activity.PHASE_WORKING,
+            phase=((measurement.message if measurement is not None and measurement.message
+                    else fork_prep_activity.PHASE_WORKING)),
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
-            pulse=pulse))
+            done=measurement.current if counted else None,
+            total=measurement.total if counted else None,
+            pulse=pulse)
+        # The one-line form becomes the panel's `aria-label`, and passing it from here rather than
+        # recomputing it inside the renderer is what makes this call site the proof that there is
+        # exactly ONE renderer for "what is this operation is doing right now" -- not a second
+        # arithmetic hidden inside the markup. (Measured caveat: the Markdown sanitizer strips
+        # that attribute before it reaches the browser, so it is correctness kept for a future
+        # `gr.HTML`, not a live accessibility feature. The chip and detail text are what a screen
+        # reader actually gets. See `.claude/rules/prep-activity.md`.)
+        return fork_prep_activity.activity_panel_html(
+            observed, summary=fork_prep_activity.activity_line(observed))
 
     last_rendered = "Starting…"
     yield _prep_busy_updates(state, last_rendered, notice())
@@ -6031,7 +6272,27 @@ def _run_prep_in_worker(work, state, *,
             yield _prep_busy_updates(state, rendered, notice())
 
     thread.join()
-    yield _prep_ui_updates(result_queue.get())
+    # [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1): the terminal frame names which of the
+    # three terminal states actually happened, from two facts this state object records about
+    # itself -- the failure marker `record_failure` writes, and the one refusal notice constant.
+    # Neither is a reading of prose: `is_failure_report` tests only `FAILURE_PREFIX`, and the
+    # refusal is compared against `REFUSAL_NOTICE` rather than recognised as a sentence.
+    #
+    # A refusal is checked first inside `terminal_status` because a declined run never started, so
+    # it cannot have failed, and reporting it as a failure would send an operator looking for a
+    # fault in their library.
+    #
+    # This is reached only when the stream ran to completion. Nothing is yielded from a `finally`
+    # anywhere in this generator, so an ABANDONED event -- a closed generator, a dropped Gradio
+    # request -- emits no terminal frame at all and therefore cannot be mistaken for a success.
+    final_state = result_queue.get()
+    yield _prep_ui_updates(
+        final_state,
+        status=fork_prep_activity.terminal_status(
+            failed=fork_prep.is_failure_report(final_state.report_text),
+            refused=final_state.notice == fork_prep.REFUSAL_NOTICE),
+        operation=operation,
+        elapsed_ms=(time.perf_counter() - started) * 1000.0)
 
 
 def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tuple]:
@@ -12795,7 +13056,7 @@ def create_ui() -> gr.Blocks:
     app = gr.Blocks(title=UI_BROWSER_TITLE.format(version=FORK_VERSION, build=build_label),
                     theme='ocean',
                     css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS + BUILD_ID_CSS
-                        + BROWSE_ROW_CSS)
+                        + BROWSE_ROW_CSS + PREP_ACTIVITY_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -14695,6 +14956,31 @@ def create_ui() -> gr.Blocks:
                                 elem_id='prep-batch-size',
                             )
                             prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
+                            # [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1): MOVED UP, from
+                            # below the Analyze button to directly beneath the button that starts
+                            # the long operation.
+                            #
+                            # This is the owner's actual complaint and it is a placement problem
+                            # as much as a rendering one. A Scan of 6,363 sources takes minutes,
+                            # and the only visible evidence it had started sat *below* a ten-line
+                            # report box and a second button -- so the operator pressed a control
+                            # and nothing within sight of it changed. The panel now appears where
+                            # the press happened, and the detailed multi-stage view stays
+                            # immediately under it, which is a summary-then-detail hierarchy
+                            # rather than the other way round.
+                            #
+                            # It is a layout move only. The event wiring, the widget order inside
+                            # the handler's output tuple, the four-tuple arity and this widget's
+                            # name, type and element id are all unchanged -- Gradio matches an
+                            # `outputs` list by position in that list, not by position on screen.
+                            # It stays ABOVE the report box and below the scan control, which is
+                            # the one window that keeps every pinned source span intact.
+                            prep_status = gr.Markdown(
+                                fork_prep_activity.status_panel_html(
+                                    status=fork_prep_activity.STATUS_IDLE,
+                                    message=initial_prep_state().notice),
+                                elem_id='prep-status'
+                            )
                             prep_report = gr.Textbox(
                                 label=LABEL_PREP_REPORT,
                                 value=initial_prep_state().report_text,
@@ -14705,9 +14991,6 @@ def create_ui() -> gr.Blocks:
                             )
                             prep_analyze_btn = gr.Button(
                                 LABEL_PREP_ANALYZE, interactive=False, elem_id='prep-analyze-button'
-                            )
-                            prep_status = gr.Markdown(
-                                initial_prep_state().notice, elem_id='prep-status'
                             )
 
                             # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.

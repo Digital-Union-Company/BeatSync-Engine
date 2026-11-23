@@ -655,6 +655,46 @@ automatically.
     `tests/test_prep_activity.py`. No second slot, coordinator, mutex or output was added.
 
   Full contract: `.claude/rules/prep-activity.md`.
+- **…and Scan/Analyze's notice is a VISIBLE PANEL now, moved to where the press happens
+  (UX-PREP-VISUAL-PROGRESS R1).** The owner's complaint was that a 6,363-source Scan shows
+  `0 / 6363 (0.0%)` for minutes with only a small line below the report box to say anything is
+  happening. The count is **true** — `classify_library_sources` emits `start(current=0, total=N)`
+  and then runs its parallel identity pass, which emits nothing — so the fix is not to suppress or
+  smooth it, but to answer "is this running?" (a state chip and a CSS animation, costing no
+  measurement) separately from "how far has it got?" (measured counts, absent otherwise).
+
+  ```
+  prep_status     gr.Markdown, MOVED from below prep_analyze_btn to directly under prep_scan_btn
+  PREP_ACTIVITY_CSS   appended to the Blocks css -- where the MOTION lives, one @keyframes
+  prep_activity.activity_panel_html / status_panel_html   the running and the terminal panels
+  ProgressView.active_measurement()   the read-only source of the phase and the counts
+  ```
+
+  * **No component was added and none was removed.** `prep_outputs` is byte-identical, the
+    four-tuple arity is unchanged, and a base-vs-candidate build measured **516 = 516** components
+    with no `elem_id` added or removed. Gradio matches `outputs` by position in the list, not on
+    screen, which is what makes the move a layout change and nothing else.
+  * **It may not move further, and it may not become `gr.HTML`.** Four other suites slice `gui.py`
+    raw between `LABEL_PREP_SECTION` and the literal `prep_status = gr.Markdown`, and one requires
+    `prep_batch_size = gr.Number(` to stay inside that span.
+  * **The motion is CSS, not a timer.** No `setInterval`, no fourth JS installer, no second
+    coordinator. Measured in the served app: one server frame on screen for 680 ms carried **17
+    distinct** computed sweep positions. The sweep is a **sibling** of the fill spanning the whole
+    track — on the fill, a determinate `0 / N` has zero width and the animation dies at exactly the
+    count being complained about.
+  * **The terminal state is classified from structure**: `library_prep.is_failure_report` (tests
+    only `FAILURE_PREFIX`) and `library_prep.REFUSAL_NOTICE`, each with one definition. Refusal
+    wins over failure. `_prep_ui_updates` gained three keyword-only arguments that **exactly one**
+    caller passes — the terminal frame — so a `change` handler always renders the neutral idle
+    panel and cannot leave a stale `Completed` chip over an invalidated scan.
+  * **Measured limitation:** `gr.Markdown`'s sanitizer strips every `data-*`, `role` and `aria-*`
+    attribute. `class` and `style` survive, so everything visual works and the state is readable as
+    text — but the ARIA progressbar semantics do not reach the browser. The tests assert them on
+    the server-side markup only; do not cite them as browser evidence.
+
+  Full contract: `.claude/rules/prep-activity.md` (UX-PREP-VISUAL-PROGRESS R1 section) **+**
+  `.claude/rules/progress-events.md` (`active_measurement`) **+**
+  `.claude/rules/library-preparation.md` (the state machine it reads and does not move).
 - **A folder field and its Browse button live in ONE row, and that is structural
   (UX-BROWSE-LAYOUT).** Both failures the owner reported had one cause — a picker that does not read
   as belonging to a particular field — but only one was cosmetic.

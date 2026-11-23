@@ -63,6 +63,17 @@ Rules that are load-bearing:
 - **A stale straggler is ignored for everything, not just the count.** `ProgressView` drops
   out-of-order events for `rate`, `elapsed` and `message` as well, and never overwrites a known
   measurement with `None` — otherwise one late Stage 6 event erased `4.8 clips/s`.
+- **`ProgressView.active_measurement()` is the read-only way to get the numbers back out
+  (UX-PREP-VISUAL-PROGRESS R1).** It returns a frozen `ActiveMeasurement` for the active
+  `(stage, phase)` — stage, title, phase key, last message, unit, `current`, `total`, `finished` —
+  or `None` before any event. It exists so a caller that needs the figures has neither of the two
+  wrong options: reaching into `_stages`, or recovering them from `render()`'s text, which would
+  reintroduce at the far end of the pipe exactly the prose parsing Phase 2A deleted at the near
+  end. It folds nothing, mutates nothing, emits no event and defines no phase, and because it
+  reports **one** `_PhaseView` the per-`(stage, phase)` rule above applies to it unchanged.
+  **An uncounted active phase reports `current`/`total` as `None`, never zero** — only `counted`
+  may license a determinate figure on screen, and an inherited zero denominator is what that rule
+  exists to prevent.
 - **Never touch a Gradio component from a worker thread.** `event_callback` only calls `queue.put`;
   the generator does all widget updates. A test asserts the callback's only method call is `put`.
 - **Stage 5 seeds the counter with cache hits**, so a fully cached run shows completion instead of

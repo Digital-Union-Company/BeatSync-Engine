@@ -20,6 +20,179 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-23 (UX-PREP-VISUAL-PROGRESS R1 remediation: two source-review findings on PR #111)
+
+Both findings are defects in the entry below, found by source review before the change reached the
+installed app. Neither touches the progress architecture: no event, stage, phase, counter, cache
+write, checkpoint, classification or Analyze behaviour changed, and the component inventory is
+still **516**.
+
+**F1 — the panel claimed nothing had been written, and that was false for Analyze.** R1 shipped
+`PANEL_READONLY_FOOTER = "Nothing has been changed on disk yet."` as the default footer of the
+Scan/Analyze running panel, on the stated belief that it held "for all four operations". It does
+not: `video_analysis.analyze_video_sources` calls `_checkpoint_cache` → `_save_cache` →
+`json.dump` **inside its `as_completed` loop**, so each source's record lands on disk the moment
+that source finishes. From the first completed source onward the panel was telling the operator
+the opposite of what the backend was doing — and the cancellation contract already said so in as
+many words: *"Records checkpointed before the Stop stay on disk."*
+
+The constant is **deleted** and `footer` now defaults to empty. Removal rather than rewording,
+because a footer whose truth depends on which operation is running is a conditional claim the next
+operation to gain a write path silently falsifies, and `activity_panel_html` cannot see which
+backend it is describing. A caller that wants a reassurance must supply it and owns its truth;
+Scan and Analyze supply none. `WORKING_FOOTER` is untouched and remains correct — its only
+consumers are Verify and Sample, which genuinely write nothing at all.
+
+The root inaccuracy was in the prose too, and is corrected: `prep-activity.md` framed "no cache
+write" as a property of all four operations, when it is a property of *the activity stream*.
+"Analyze's writes stay on the existing checkpoint path" describes where they go, not whether they
+happen.
+
+**F2 — the unmeasured state painted a completed-looking bar.** The indeterminate track rendered
+its fill at `width:100%` in solid `#2f81f7` — the identical bar a genuinely complete `N / N`
+paints — so a phase nobody had counted looked *finished*. That is this item's own defect inverted:
+R1 set out to stop a determinate zero reading as idle and shipped an indeterminate state reading
+as done.
+
+```
+nothing measured  ->  <div class="bs-prep-track bs-prep-indeterminate">  + sweep, NO fill element
+measured          ->  <div class="bs-prep-track" aria-valuenow="...">    + fill at the exact %
+```
+
+Emitting no fill beats dimming one: there is then no element whose width could be read as a
+quantity at all. The determinate case is untouched at both ends — a measured `0.0%` stays empty
+and a measured `100.0%` stays full, because both are things something counted. The animated
+full-track sweep, the running chip and the pulsing dot are all preserved, and the stylesheet
+needed no change.
+
+**Verified.** The focused suite grew from 65 to **78 tests**, all passing, including an in-flight
+**Analyze** regression driven through the shipped `_run_prep_in_worker` with real `ProgressEvent`s
+(the defect was a *default*, so the renderer looked fine in isolation and the call site is what
+picked the claim up), a parametrised determinate-fill test at 0 / 2.5 / 23.6 / 50 / 100 %, and a
+structural test that the deleted constant cannot return. 1,784 passed / 4 skipped across the
+visual-progress, prep-activity, library-preparation, media-verify, media-sample, GUI-seam,
+progress-core/phases/sequence/truth, cache-panel, inventory-panel, tabs, build-identity,
+instruction-map, runtime-dependency and fork-identity suites. Component inventory re-checked at
+**516 = 516** with no `elem_id` added or removed and byte-identical CSS.
+
+Re-measured in the served sandbox (`gradio==6.19.0`, port 7881, 40-file synthetic library, Qwen
+disabled): the indeterminate frame now renders **no fill**, its track still measures `8 × 1803 px`
+with its only child removed, the sweep still animates and its computed `background-position-x`
+still advances; `0 / 40` keeps a 0 px fill while animating; `40 / 40` keeps a full 1803 px fill;
+the terminal **Completed** and **Failed** panels stop both animations; and **no frame of any
+operation renders a footer**. HTML escaping, Markdown sanitization and the reduced-motion block are
+all unchanged.
+
+**Not re-measured:** the previously recorded intermittent failure in
+`test_library_missing_sample.py` was checked only far enough to rule out a relevant regression —
+that suite contains zero references to `prep_activity`, is ordered before the visual-progress
+suite, and passes. Its cause remains unknown and is not claimed otherwise.
+
+### Changed — 2026-11-22 (UX-PREP-VISUAL-PROGRESS R1: Prepare & Verify looks alive without lying about progress)
+
+**UX-PREP-ACTIVITY made Scan and Analyze speak through a silent phase; they still were not
+visible.** The owner reported the consequence from the installed GUI on 2026-11-22: a Scan of 6,363
+sources shows `0 / 6363 (0.0%)` for several minutes, and the only sign of life is a small
+`Working… (03:27 elapsed)` line *below* a ten-line report box and the Analyze button.
+
+**Both halves of that are real, and only one of them is a defect.** The count is **true**:
+`classify_library_sources` emits its start event with `current=0, total=len(sources)` and then runs
+`_compute_cache_paths_parallel` over the whole library, which emits nothing until the per-source
+verdict loop begins. So the figure is a measurement of a counter that genuinely has not advanced,
+and suppressing it, smoothing it or starting it somewhere other than zero would replace an honest
+reading with a comfortable one. The **silence** is the defect — a determinate bar parked at 0.0% is
+indistinguishable from a dead button.
+
+The fix separates two questions the old line conflated:
+
+```
+"is this running?"     ->  a state chip + a CSS animation -- true for as long as the worker is
+                           alive, and costing no measurement at all
+"how far has it got?"  ->  ONLY measured counts, and absent when nothing measured one
+```
+
+They are not alternatives. **A 0%-filled bar still carries the sweep**, because the count being zero
+is not evidence that nothing is happening.
+
+**The motion lives in CSS, declared once.** `PREP_ACTIVITY_CSS` carries one `@keyframes`; the server
+emits one frame a second, so an animation driven by the frames would step once a second and read as
+a stutter, and a browser-side timer would mean another JS installer plus per-element state a Gradio
+re-render destroys. Measured in a served sandbox: while a **single** server frame — the `0 / 8000`
+one — was on screen for 680 ms, the sweep's computed `background-position-x` took **17 distinct
+values**, with no network traffic and no script. The sweep is a **sibling** of the fill spanning the
+whole track; the first attempt put it *on* the fill, where a determinate `0 / N` renders a
+zero-width element and the animation dies at exactly the count being complained about.
+
+**The notice moved to where the press happens** — from below the Analyze button to directly beneath
+Scan Library, above the report box, which keeps the detailed `ProgressView` view one line further
+down as detail under a summary. It is a layout move and nothing else: same widget, same name, same
+type, same `elem_id`, same position in `prep_outputs`, same four-tuple arity, no component added or
+removed (a base-vs-candidate build measured **516 = 516** with no `elem_id` changed). It may not
+move further and may not become `gr.HTML`: four other suites slice `gui.py` raw between
+`LABEL_PREP_SECTION` and the literal `prep_status = gr.Markdown`, and one requires the batch-size
+widget to stay inside that span.
+
+**The terminal state is classified from structure, never from prose.** `library_prep` gained
+`FAILURE_PREFIX`, `is_failure_report()` and `REFUSAL_NOTICE` — one definition each, so the reader
+and the writer cannot drift — and refusal wins over failure, because a declined run never started
+and so cannot have failed. `_prep_ui_updates` gained three keyword-only arguments that **exactly
+one** caller passes: the terminal frame, the only code that observed an operation finish. Every
+widget `change` handler therefore renders the neutral idle panel, so an invalidation can never leave
+a green `Completed` chip over the scan it just invalidated. **An abandoned stream claims nothing** —
+nothing is yielded from a `finally`, so a closed generator emits no terminal frame at all.
+
+**The phase and the counts come from this operation's own events.**
+`ProgressView.active_measurement()` is a new read-only projection of already-folded state, added so
+the figures can be had without either wrong alternative: reaching into `_stages`, or parsing them
+back out of `render()`'s text. It reports one `_PhaseView`, so nothing carries across a phase
+boundary and an uncounted phase reports `None` rather than zero. This does **not** reintroduce the
+UX-PREP-ACTIVITY R2 cross-operation defect: `_prep_phase` is still never read here — that slot
+belongs to the mutex-holding Verify and Sample — and a test drives a real Verify publishing
+`PHASE_MEDIA_HEADERS` while a Scan ticks, asserting the Scan panel never shows it.
+
+Nothing was invented: no ETA, no rate, no throughput, no completed-file count and no percentage that
+is not computed from two measured integers by the single `measured_percent` arithmetic. Unknown
+status fails closed to *idle* — never to running, which would animate over a dead worker, and never
+to completed, which is the one answer a caller must not get by accident. An idle panel with nothing
+to say renders as the empty string rather than an empty card, which is the blank-space half of the
+complaint.
+
+```
+beatsync_fork/prep_activity.py    +  STATUS_IDLE/RUNNING, PANEL_STATUSES, STATUS_LABELS,
+                                     measured_percent, terminal_status,
+                                     activity_panel_html, status_panel_html
+beatsync_fork/progress_view.py    +  ActiveMeasurement, ProgressView.active_measurement()
+beatsync_fork/library_prep.py     +  FAILURE_PREFIX, REFUSAL_NOTICE, is_failure_report()
+gui.py  PREP_ACTIVITY_CSS         NEW scoped stylesheet, appended to the Blocks css
+gui.py  _prep_ui_updates          ->  three keyword-only arguments; renders the panel
+gui.py  _run_prep_in_worker       ->  the notice is the panel; the terminal frame is classified
+gui.py  prep_status               ->  MOVED above the report box (layout only)
+tests/test_prep_visual_progress.py  NEW  65 tests
+```
+
+**Verified.** Whole suite green — **11,131 passed, 28 skipped**, run in two halves because the full
+127-file suite exceeds a 10-minute command ceiling. One **intermittent, unexplained** failure was
+seen once during the work, in `test_library_missing_sample.py::test_t16_a5s_report_block_is_byte_
+identical_with_and_without_the_sample`; it did not reproduce in two later runs of the identical file
+list, passes in isolation and beside its neighbours, did not appear in a base-worktree control run of
+the same list, and is ordered **before** the new suite so it cannot be caused by it. Recorded rather
+than explained. Served smoke on the real `gradio==6.19.0` against a
+synthetic 8,000-file library with Qwen disabled, in an isolated clone — never the owner's media
+library and never the shared analysis cache — producing RUNNING at 91 ms, the determinate `0 / 8000`
+frame with the animation still advancing, the climbing counts, the terminal **Completed** panel with
+the animation stopped, and the **Failed** panel for an absent folder with Analyze left disabled. The
+production checkout was byte-identical before and after across `input/`, `output/` and `state/`.
+
+**Recorded rather than claimed closed.** `gr.Markdown`'s sanitizer **strips every `data-*`, `role`
+and `aria-*` attribute** — measured. `class` and `style` survive, so the animation, the tones, the
+determinate fill width and the state class all work, and the state and the measurement are readable
+as text; but the ARIA progressbar semantics do not reach the browser. They are still emitted, and the
+tests assert them on the server-side markup **only**. `sanitize_html=False` would make them live and
+is deliberately not taken. A sustained minutes-long silent phase was not reproduced in a browser (the
+synthetic files are 1 KB, so the identity pass is instant, and the HOT storage reserve was reached so
+the library was not grown) — that case is asserted server-side instead. Reduced motion was verified
+by CSSOM rule inspection, not by emulation. Analyze's panel was verified server-side only.
+
 ### Added — 2026-11-18 (UX-ZERO-KEEP: Video Review can file a page with nothing worth keeping)
 
 **The deployed keep-only workflow had no answer for a bad shoot.** Marking the good clips and
