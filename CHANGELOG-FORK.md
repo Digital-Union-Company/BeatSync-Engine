@@ -20,6 +20,74 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-23 (UX-PREP-VISUAL-PROGRESS R1 remediation: two source-review findings on PR #111)
+
+Both findings are defects in the entry below, found by source review before the change reached the
+installed app. Neither touches the progress architecture: no event, stage, phase, counter, cache
+write, checkpoint, classification or Analyze behaviour changed, and the component inventory is
+still **516**.
+
+**F1 — the panel claimed nothing had been written, and that was false for Analyze.** R1 shipped
+`PANEL_READONLY_FOOTER = "Nothing has been changed on disk yet."` as the default footer of the
+Scan/Analyze running panel, on the stated belief that it held "for all four operations". It does
+not: `video_analysis.analyze_video_sources` calls `_checkpoint_cache` → `_save_cache` →
+`json.dump` **inside its `as_completed` loop**, so each source's record lands on disk the moment
+that source finishes. From the first completed source onward the panel was telling the operator
+the opposite of what the backend was doing — and the cancellation contract already said so in as
+many words: *"Records checkpointed before the Stop stay on disk."*
+
+The constant is **deleted** and `footer` now defaults to empty. Removal rather than rewording,
+because a footer whose truth depends on which operation is running is a conditional claim the next
+operation to gain a write path silently falsifies, and `activity_panel_html` cannot see which
+backend it is describing. A caller that wants a reassurance must supply it and owns its truth;
+Scan and Analyze supply none. `WORKING_FOOTER` is untouched and remains correct — its only
+consumers are Verify and Sample, which genuinely write nothing at all.
+
+The root inaccuracy was in the prose too, and is corrected: `prep-activity.md` framed "no cache
+write" as a property of all four operations, when it is a property of *the activity stream*.
+"Analyze's writes stay on the existing checkpoint path" describes where they go, not whether they
+happen.
+
+**F2 — the unmeasured state painted a completed-looking bar.** The indeterminate track rendered
+its fill at `width:100%` in solid `#2f81f7` — the identical bar a genuinely complete `N / N`
+paints — so a phase nobody had counted looked *finished*. That is this item's own defect inverted:
+R1 set out to stop a determinate zero reading as idle and shipped an indeterminate state reading
+as done.
+
+```
+nothing measured  ->  <div class="bs-prep-track bs-prep-indeterminate">  + sweep, NO fill element
+measured          ->  <div class="bs-prep-track" aria-valuenow="...">    + fill at the exact %
+```
+
+Emitting no fill beats dimming one: there is then no element whose width could be read as a
+quantity at all. The determinate case is untouched at both ends — a measured `0.0%` stays empty
+and a measured `100.0%` stays full, because both are things something counted. The animated
+full-track sweep, the running chip and the pulsing dot are all preserved, and the stylesheet
+needed no change.
+
+**Verified.** The focused suite grew from 65 to **78 tests**, all passing, including an in-flight
+**Analyze** regression driven through the shipped `_run_prep_in_worker` with real `ProgressEvent`s
+(the defect was a *default*, so the renderer looked fine in isolation and the call site is what
+picked the claim up), a parametrised determinate-fill test at 0 / 2.5 / 23.6 / 50 / 100 %, and a
+structural test that the deleted constant cannot return. 1,784 passed / 4 skipped across the
+visual-progress, prep-activity, library-preparation, media-verify, media-sample, GUI-seam,
+progress-core/phases/sequence/truth, cache-panel, inventory-panel, tabs, build-identity,
+instruction-map, runtime-dependency and fork-identity suites. Component inventory re-checked at
+**516 = 516** with no `elem_id` added or removed and byte-identical CSS.
+
+Re-measured in the served sandbox (`gradio==6.19.0`, port 7881, 40-file synthetic library, Qwen
+disabled): the indeterminate frame now renders **no fill**, its track still measures `8 × 1803 px`
+with its only child removed, the sweep still animates and its computed `background-position-x`
+still advances; `0 / 40` keeps a 0 px fill while animating; `40 / 40` keeps a full 1803 px fill;
+the terminal **Completed** and **Failed** panels stop both animations; and **no frame of any
+operation renders a footer**. HTML escaping, Markdown sanitization and the reduced-motion block are
+all unchanged.
+
+**Not re-measured:** the previously recorded intermittent failure in
+`test_library_missing_sample.py` was checked only far enough to rule out a relevant regression —
+that suite contains zero references to `prep_activity`, is ordered before the visual-progress
+suite, and passes. Its cause remains unknown and is not claimed otherwise.
+
 ### Changed — 2026-11-22 (UX-PREP-VISUAL-PROGRESS R1: Prepare & Verify looks alive without lying about progress)
 
 **UX-PREP-ACTIVITY made Scan and Analyze speak through a silent phase; they still were not

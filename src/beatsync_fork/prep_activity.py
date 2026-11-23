@@ -64,7 +64,7 @@ __all__ = [
     "PULSE_FRAMES", "ActivityState", "activity_line", "working_text", "pulse_marker",
     # UX-PREP-VISUAL-PROGRESS R1 -- the visual panel for the same observations.
     "STATUS_IDLE", "STATUS_RUNNING", "PANEL_STATUSES", "STATUS_LABELS",
-    "PANEL_READONLY_FOOTER", "measured_percent", "terminal_status",
+    "measured_percent", "terminal_status",
     "activity_panel_html", "status_panel_html",
 ]
 
@@ -296,13 +296,31 @@ _STATUS_TONES = {
     OUTCOME_SUPERSEDED: "#d29922",      # amber -- an answer withheld, for the same reason
 }
 
-#: The panel's own reassurance line. Shorter than :data:`WORKING_FOOTER` on purpose and not a
-#: second claim: the chip beside it already says `Running`, so repeating the word inside the panel
-#: would be the duplicated status information this surface is meant to remove. The *statement* is
-#: the same one, and it is true of all four operations -- Verify and Sample write nothing at all,
-#: Scan creates the cache directory and no record, and Analyze's writes stay on the existing
-#: checkpoint path.
-PANEL_READONLY_FOOTER = "Nothing has been changed on disk yet."
+# There is deliberately NO default reassurance footer for this panel, and the absence is the
+# point rather than an omission.
+#
+# [FORK] Digital-Union (UX-PREP-VISUAL-PROGRESS R1 remediation, PR #111 finding F1). R1 shipped
+# `PANEL_READONLY_FOOTER = "Nothing has been changed on disk yet."` as the default, on the stated
+# belief that it was "true of all four operations". **It is false for Analyze**, and provably so:
+# `video_analysis.analyze_video_sources` calls `_checkpoint_cache` -> `_save_cache` -> `json.dump`
+# inside its `as_completed` loop, checkpointing each source's record the moment that source
+# completes. So from the first finished source onward, the running Analyze panel was telling the
+# operator that nothing had been written while records were landing on disk behind it. The
+# cancellation contract says so in as many words: *"Records checkpointed before the Stop stay on
+# disk."*
+#
+# That is the worst class of defect this module exists to prevent -- a confident claim the backend
+# contradicts -- and it is exactly the mistake the honesty rules above forbid about *numbers*,
+# made about a sentence instead.
+#
+# The fix is removal, not rewording per operation. A footer whose truth depends on which operation
+# is running is a conditional claim that the next operation to gain a write path silently
+# falsifies, and `activity_panel_html` cannot see which backend it is describing. `footer` is now
+# an explicit, defaulted-empty argument: a caller that wants a reassurance must supply it and owns
+# its truth. Scan and Analyze supply none.
+#
+# `WORKING_FOOTER` above is untouched and stays correct, because its only consumers are Verify and
+# Sample, which genuinely write nothing at all.
 
 
 def terminal_status(*, failed: bool = False, refused: bool = False) -> str:
@@ -376,13 +394,21 @@ def _track(state: ActivityState) -> str:
     nowhere to travel and the panel looked as dead as the line it replaced -- at exactly the count
     the owner reported. A measured zero is a true count and not evidence of idleness, so the
     motion is attached to the thing whose width is not a measurement.
+
+    **An indeterminate track carries NO fill element at all** (PR #111 finding F2). R1 rendered
+    `width:100%` there, which paints the same solid bar a genuinely complete `N / N` paints -- so
+    a phase nobody had counted looked finished, which is the determinate-looking-indeterminate
+    inverse of the defect this whole item exists to remove. Emitting no fill is strictly better
+    than dimming one: there is then no element whose width could be read as a quantity, and the
+    sweep moving across an empty track is unambiguous. The track, the sweep and the running chip
+    are untouched, so the state is still obvious.
     """
     percent = measured_percent(state)
     sweep = '<div class="bs-prep-sweep"></div>'
     if percent is None:
-        return ('<div class="bs-prep-track" role="progressbar" aria-valuemin="0" '
-                'aria-valuemax="100">'
-                f'<div class="bs-prep-fill" style="width:100%;"></div>{sweep}</div>')
+        return ('<div class="bs-prep-track bs-prep-indeterminate" role="progressbar" '
+                'aria-valuemin="0" aria-valuemax="100">'
+                f'{sweep}</div>')
     bounded = max(0.0, min(100.0, percent))
     return ('<div class="bs-prep-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" '
             f'aria-valuenow="{bounded:.1f}">'
@@ -452,7 +478,7 @@ def _panel(*, status: str, operation: str, elapsed_ms: Optional[float], detail: 
 
 
 def activity_panel_html(state: ActivityState, *, summary: str = "",
-                        footer: str = PANEL_READONLY_FOOTER) -> str:
+                        footer: str = "") -> str:
     """The RUNNING panel for one in-flight observation.
 
     `state` is the same record `activity_line` renders, so the panel can say nothing the one-line
@@ -464,6 +490,11 @@ def activity_panel_html(state: ActivityState, *, summary: str = "",
     The detail line is the phase the operation itself published plus the counts something measured,
     and nothing else -- no estimate, no rate, no throughput and no remaining time, for any of which
     the data does not exist.
+
+    **`footer` defaults to empty and this renderer never supplies one.** It cannot see which
+    backend it is describing, so it cannot know whether a reassurance about disk writes is true;
+    a caller that wants one must supply it and owns its truth. See the note above
+    :func:`terminal_status` for the Analyze checkpoint that made the previous default false.
     """
     counts = state.measured
     percent = measured_percent(state)

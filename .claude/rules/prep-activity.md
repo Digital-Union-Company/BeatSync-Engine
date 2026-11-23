@@ -220,9 +220,22 @@ preparation event wiring is byte-identical** — same inputs, same outputs, same
   for the measured S2-A R3 reason: a shared lane leaves the event queued and then runs it against
   click-time values, and a lane of 1 re-creates that one step in.
 * **Nothing enters `gr.State`** — no lock, thread, handle, lifecycle or phase.
-* **No cache write, no media change, no analysis.** `WORKING_FOOTER` says so to the operator, and
-  it is true of all four operations: Verify and Sample write nothing at all, Scan creates the cache
-  directory and no record, and Analyze's writes stay on the existing checkpoint path.
+* **This item adds no cache write, no media change and no analysis**, for any of the four
+  operations. That is a statement about what *the activity stream* does, and it is true.
+
+  **It is NOT a statement that the operations themselves write nothing, and this bullet used to
+  read as if it were** — "`WORKING_FOOTER` says so to the operator, and it is true of all four
+  operations … Analyze's writes stay on the existing checkpoint path". The first half of that is
+  fine (`WORKING_FOOTER` is only ever rendered for **Verify** and **Sample**, which genuinely
+  write nothing), but the framing invited exactly the error PR #111 finding F1 caught:
+  **Analyze writes to disk while it is running.** `analyze_video_sources` calls
+  `_checkpoint_cache` → `_save_cache` → `json.dump` inside its `as_completed` loop, so each
+  source's record lands the moment that source finishes. "Writes stay on the existing checkpoint
+  path" describes *where* they go, not *whether* they happen.
+
+  So: **never render a blanket "nothing has been changed" reassurance on a surface that serves
+  Analyze.** See the UX-PREP-VISUAL-PROGRESS R1 section's F1 remediation below, where
+  `activity_panel_html` lost its defaulted footer for precisely this reason.
 
 ## Open and recorded rather than claimed closed
 
@@ -292,6 +305,23 @@ fill; a determinate `0 / N` then renders a zero-width element and the animation 
 travel — dead at exactly the count the owner reported. The element carrying the motion must never
 be the one whose width is a measurement.
 
+**And an indeterminate track carries NO fill element at all (PR #111 finding F2).** R1 rendered
+`width:100%` there, which paints the identical solid bar a genuinely complete `N / N` paints — so
+a phase nobody had counted looked *finished*. That is this item's own defect inverted: R1 set out
+to stop a determinate zero reading as idle, and shipped an indeterminate state reading as done.
+
+```
+nothing measured   ->  <div class="bs-prep-track bs-prep-indeterminate">  + sweep, NO fill
+measured           ->  <div class="bs-prep-track" aria-valuenow="...">    + fill at the exact %
+```
+
+Emitting no fill is strictly better than dimming one: there is then **no element whose width could
+be read as a quantity**. The determinate case is untouched at both ends — a measured `0.0%` stays
+empty and a measured `100.0%` stays full, because both are things something counted. The two look
+similar on screen by design, and the *detail line* is what separates them (`Working` versus
+`Classifying 6363 library source(s) · 0 / 6363 (0.0%)`): a bar may not show a quantity that does
+not exist, so the count lives in the text.
+
 ## What the panel may say
 
 * **`activity_panel_html`** renders the RUNNING panel from the same `ActivityState` the one-line
@@ -305,6 +335,15 @@ be the one whose width is a measurement.
   of the complaint, fixed at the source.
 * **Unknown status fails closed to idle**, never to running (an animation over a dead worker) and
   never to completed (the one answer a caller must not receive by accident).
+* **It makes no claim about what has been written to disk, and `footer` defaults to empty**
+  (PR #111 finding F1). R1 defaulted it to `PANEL_READONLY_FOOTER = "Nothing has been changed on
+  disk yet."`, which is **false for Analyze** — see the corrected UX-PREP-ACTIVITY bullet above.
+  The constant is **deleted**, not merely unused: a defaulted reassurance is a claim that the next
+  operation to gain a write path silently falsifies, and this renderer cannot see which backend it
+  is describing. A caller that wants a footer must supply it and owns its truth; Scan and Analyze
+  supply none. `WORKING_FOOTER` is untouched and stays correct, because only Verify and Sample
+  render it. **Do not reintroduce a default here**, and do not "fix" it with per-operation wording
+  — the renderer has no way to verify the claim it would be making.
 * **Whitespace in every interpolated string is collapsed to one space.** Escaping alone is not
   enough: `html.escape` leaves a newline alone, this lands in a **Markdown** component, and a blank
   line inside a raw HTML block is how a Markdown renderer decides the block ended. That is layout,
@@ -374,6 +413,23 @@ t= 1509 ms  completed  Completed 00:01 "8000 video(s) need analysis."           
 Component count **516 = 516** against a base worktree built by the identical script; no `elem_id`
 added or removed; CSS +2,772 bytes. A deliberately absent folder produced the **Failed** panel with
 Analyze disabled and the full error in the report box.
+
+**Re-measured after the F1/F2 remediation** (same harness, 40-file synthetic library). The
+`fill 100%` on the first row is exactly what F2 removed, so that row now reports **no fill at
+all**, and no row carries a footer:
+
+```
+t=  94 ms  running    Running  00:00  "Working"                     NO fill   track 8x1803 px  sweep+pulse
+t= 102 ms  running    Running  00:00  "... · 0 / 40 (0.0%)"         fill    0 px               sweep+pulse
+t= 108 ms  running    Running  00:00  "classified · 1 / 40 (2.5%)"  fill   45 px               sweep+pulse
+t= 114 ms  running    Running  00:00  "classified · 40 / 40 (100%)" fill 1803 px               sweep+pulse
+t= 124 ms  completed  Completed 00:00 "40 video(s) need analysis."  no track, no animation
+```
+
+The indeterminate track still renders at its full `8 × 1803 px` with its only child removed
+(height is on the track, and the sweep is `position:absolute; inset:0`), and its computed
+`background-position-x` still advances. Component count re-checked: **516**, CSS byte-identical —
+the remediation needed no stylesheet change.
 
 ## Open, and recorded rather than claimed closed
 

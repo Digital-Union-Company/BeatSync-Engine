@@ -144,6 +144,145 @@ def test_an_indeterminate_panel_shows_no_figure_and_omits_aria_valuenow():
     assert '<div class="bs-prep-sweep"></div>' in markup, "still visibly alive"
 
 
+# ---------------------------------------------------------------------------------------------
+# PR #111 finding F2 -- an unmeasured phase must not paint a completed-looking bar
+# ---------------------------------------------------------------------------------------------
+
+def test_an_indeterminate_track_carries_no_fill_element_at_all():
+    """R1 rendered the indeterminate fill at `width:100%`, which paints the same solid bar a
+    genuinely complete `N / N` paints -- so a phase nobody counted looked finished.
+
+    No fill element is strictly better than a dimmed one: there is then no element whose width
+    could be read as a quantity at all.
+    """
+    markup = pa.activity_panel_html(pa.ActivityState(
+        operation=pa.OPERATION_ANALYZE, phase=pa.PHASE_WORKING, elapsed_ms=4_000))
+
+    assert "bs-prep-fill" not in markup, markup
+    assert "width:100%" not in markup, markup
+    assert "width:" not in markup, "no width may be asserted for something nobody measured"
+    # ...and the track, the sweep and the running state all survive, so it still reads as alive.
+    assert "bs-prep-track" in markup and "bs-prep-indeterminate" in markup, markup
+    assert '<div class="bs-prep-sweep"></div>' in markup, markup
+    assert _attr(markup, "status") == pa.STATUS_RUNNING
+    assert pa.STATUS_LABELS[pa.STATUS_RUNNING] in markup
+
+
+@pytest.mark.parametrize("done,total,width", [
+    (0, 6363, "0.0%"),          # the owner's frame -- still exactly zero, never nudged up
+    (1, 8000, "0.0%"),
+    (1500, 6363, "23.6%"),
+    (50, 100, "50.0%"),
+    (6363, 6363, "100.0%"),     # and a real 100% is still painted as 100%
+])
+def test_a_determinate_track_keeps_the_exact_measured_fill(done, total, width):
+    """F2 must not cost the determinate case anything. The fill is the measurement, including at
+    both ends: 0% stays empty and 100% stays full, because both are things something counted."""
+    markup = pa.activity_panel_html(pa.ActivityState(
+        operation=pa.OPERATION_SCAN, phase=pa.PHASE_WORKING, elapsed_ms=1_000,
+        done=done, total=total))
+
+    assert f'<div class="bs-prep-fill" style="width:{width};"></div>' in markup, markup
+    assert "bs-prep-indeterminate" not in markup, "this one IS a measurement"
+    assert _attr(markup, "percent") == width.rstrip("%")
+    assert f'aria-valuenow="{width.rstrip("%")}"' in markup
+    assert '<div class="bs-prep-sweep"></div>' in markup, "and it is still visibly alive"
+
+
+def test_only_a_determinate_track_can_ever_paint_a_full_bar():
+    """The two states must not be confusable in either direction: a measured `N / N` is the ONLY
+    thing that may look complete, and it is still not a terminal panel."""
+    full = pa.activity_panel_html(pa.ActivityState(
+        pa.OPERATION_SCAN, pa.PHASE_WORKING, 1_000, done=7, total=7))
+    unknown = pa.activity_panel_html(pa.ActivityState(
+        pa.OPERATION_SCAN, pa.PHASE_WORKING, 1_000))
+
+    assert 'style="width:100.0%;"' in full and _attr(full, "determinate") == "1"
+    assert "width:" not in unknown and _attr(unknown, "determinate") == "0"
+    # Neither is terminal: both still animate and both still say Running.
+    for markup in (full, unknown):
+        assert '<div class="bs-prep-sweep"></div>' in markup
+        assert _attr(markup, "running") == "1"
+
+
+# ---------------------------------------------------------------------------------------------
+# PR #111 finding F1 -- the panel may not claim nothing has been written
+# ---------------------------------------------------------------------------------------------
+
+#: Words that would amount to a claim about what this operation has or has not written. The ban is
+#: applied to the SPOKEN text, for the reason `_spoken_text` records.
+_DISK_CLAIM_WORDS = ("nothing has been changed", "nothing has been written", "on disk",
+                     "no changes", "unchanged on disk", "read-only", "read only",
+                     "nothing is written", "nothing was written")
+
+
+def test_the_running_panel_makes_no_claim_about_what_has_been_written():
+    """PR #111 finding F1, at the renderer.
+
+    R1 defaulted the footer to "Nothing has been changed on disk yet." on the stated belief that
+    it held for all four operations. It does **not** hold for Analyze:
+    `analyze_video_sources` calls `_checkpoint_cache` -> `_save_cache` -> `json.dump` inside its
+    `as_completed` loop, so each source's record lands on disk the moment that source finishes --
+    while this panel is on screen saying the opposite.
+    """
+    for operation in (pa.OPERATION_SCAN, pa.OPERATION_ANALYZE):
+        for state in (pa.ActivityState(operation, pa.PHASE_WORKING, 9_000),
+                      pa.ActivityState(operation, "analysed", 9_000, done=4, total=100)):
+            spoken = _spoken_text(pa.activity_panel_html(
+                state, summary=pa.activity_line(state))).lower()
+            for claim in _DISK_CLAIM_WORDS:
+                assert claim not in spoken, f"{operation}: {claim!r} in {spoken!r}"
+            assert "bs-prep-foot" not in pa.activity_panel_html(state), "no footer is rendered"
+
+
+def test_the_module_defines_no_blanket_readonly_footer_for_this_panel():
+    """The constant is gone, not merely unused: a defaulted reassurance is a claim that the next
+    operation to gain a write path silently falsifies, and this renderer cannot see which backend
+    it is describing."""
+    assert not hasattr(pa, "PANEL_READONLY_FOOTER")
+    assert "PANEL_READONLY_FOOTER" not in pa.__all__
+    source = open("src/beatsync_fork/prep_activity.py", encoding="utf-8").read()
+    tree = ast.parse(source)
+    panel = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "activity_panel_html")
+    footer_default = dict(zip(
+        [a.arg for a in panel.args.kwonlyargs],
+        [ast.literal_eval(d) if d is not None else None for d in panel.args.kw_defaults],
+    ))["footer"]
+    assert footer_default == "", f"activity_panel_html defaults footer to {footer_default!r}"
+
+
+def test_the_shipped_scan_and_analyze_call_site_supplies_no_footer():
+    """Structural companion, so the fix cannot be half-reverted by changing only the default."""
+    worker = _code_only(_func(_tree(_GUI), "_run_prep_in_worker"))
+    assert "activity_panel_html" in worker, worker
+    assert "footer" not in worker, "Scan/Analyze must not supply a reassurance footer"
+    assert "PANEL_READONLY_FOOTER" not in worker
+    gui_source = open(_GUI, encoding="utf-8").read()
+    assert "Nothing has been changed on disk yet." not in gui_source, gui_source[:0]
+
+
+def test_the_verify_and_sample_one_line_footer_is_untouched():
+    """`WORKING_FOOTER` stays, and stays correct: its only consumers are Verify and Sample, which
+    write nothing at all. F1 is about the panel's default, not about that text."""
+    assert pa.WORKING_FOOTER == "Working — nothing has been changed on disk yet."
+    assert pa.WORKING_FOOTER in pa.working_text(
+        pa.ActivityState(pa.OPERATION_VERIFY, pa.PHASE_MEDIA_HEADERS, 1_000))
+    assert pa.WORKING_FOOTER not in pa.working_text(
+        pa.ActivityState(pa.OPERATION_VERIFY, pa.PHASE_MEDIA_HEADERS, 1_000), footer=False)
+
+
+def test_a_caller_that_supplies_a_footer_still_gets_one_escaped_and_collapsed():
+    """Removing the default must not remove the capability -- a caller that can prove its own
+    claim may still make it, and it is escaped like everything else."""
+    markup = pa.activity_panel_html(
+        pa.ActivityState(pa.OPERATION_VERIFY, pa.PHASE_MEDIA_HEADERS, 1_000),
+        footer="This reads your files.\n<b>Nothing</b> is written.")
+    assert "bs-prep-foot" in markup
+    assert "<b>" not in markup and "\n" not in markup
+    assert "This reads your files. &lt;b&gt;Nothing&lt;/b&gt; is written." in markup
+
+
 @pytest.mark.parametrize("done,total", [
     (True, 5),            # bool subclasses int and must be rejected first
     (3, True),
@@ -544,6 +683,43 @@ def test_the_panel_turns_determinate_only_when_real_events_supply_the_counts():
     # Requirement 4 again, now with real counts in hand: the measured zero still animates.
     zeroes = [n for n in determinate if _attr(n, "done") == "0"]
     assert zeroes and all('<div class="bs-prep-sweep"></div>' in n for n in zeroes)
+
+
+def test_an_in_flight_analyze_panel_claims_nothing_about_what_it_has_written():
+    """PR #111 finding F1 against the SHIPPED stream, and Analyze specifically.
+
+    Analyze is the operation the removed footer was false for: `analyze_video_sources` checkpoints
+    each source's record the moment that source completes, so a record is on disk long before the
+    operation ends. Every frame it emits -- the immediate one, the silent ticks, and the ones
+    carrying real counts -- must therefore make no claim about disk at all.
+
+    Driven through the real `_run_prep_in_worker` with real `ProgressEvent`s rather than asserted
+    on the renderer alone, because the defect was a DEFAULT: the renderer looked fine in isolation
+    and the shipped call site is what picked the claim up.
+    """
+    namespace, _ = _load_prep_worker_seam()
+    tick = namespace["_ACTIVITY_TICK_SECONDS"]
+
+    def analyzing(event_callback, console_logger):
+        event_callback(fork_progress.start(
+            5, "Analysing 100 source(s)", current=0, total=100, unit="sources"))
+        time.sleep(tick * 1.3)
+        # ...and by here the real backend has already checkpointed finished records to disk.
+        event_callback(fork_progress.progress(5, 4, 100, "analysed", unit="sources"))
+        time.sleep(tick * 1.3)
+        return _PLAIN_FINAL
+
+    notices = _notices(_drive(namespace, analyzing, operation=pa.OPERATION_ANALYZE))
+    running = [n for n in notices if _attr(n, "status") == pa.STATUS_RUNNING]
+
+    assert len(running) >= 3, f"expected several in-flight frames, got {len(running)}"
+    assert any(_attr(n, "determinate") == "1" for n in running), \
+        "precondition: the measured frames this test is about must have been produced"
+    for notice in notices:
+        spoken = _spoken_text(notice).lower()
+        for claim in _DISK_CLAIM_WORDS:
+            assert claim not in spoken, f"{claim!r} in an Analyze frame: {spoken!r}"
+        assert "bs-prep-foot" not in notice, "no reassurance footer may be rendered"
 
 
 def test_the_phase_shown_is_this_operations_own_event_message():
