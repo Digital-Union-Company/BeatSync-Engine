@@ -29,6 +29,9 @@ import pytest
 
 from beatsync_fork import clips_review as fork_clips
 from beatsync_fork import cut_handoff as handoff
+# [FORK] R17-A: `_notify_cut` maps each terminal path's counts through this module's four outcome
+# tokens, so the AST-executed namespace needs it just as it needs the other fork aliases.
+from beatsync_fork import desktop_notify as notify
 from beatsync_fork import raw_cutter as cutter
 from beatsync_fork import raw_cutter_activity as activity
 from beatsync_fork import raw_cutter_batch as fork_batch
@@ -521,14 +524,23 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
     about the handoff is the shipped code's own behaviour on each terminal path.
     """
     gui = _tree(_GUI)
+    # [FORK] R17-A: `_notify_cut` joins the extraction list because `_on_cut_run` calls it on each
+    # of its three terminal paths -- the shipped function, not a stub, so these cases keep driving
+    # the real classification (a crash that left clips on disk is PARTIAL, agreeing with the
+    # handoff record). Its one side effect, `_notify_publish`, is the only thing replaced.
     wanted = ["_restore_plan", "_cut_progress_html", "_cut_activity", "_cut_activity_final",
-              "_cut_buttons", "_cut_handoff", "_on_cut_run"]
+              "_cut_buttons", "_cut_handoff", "_notify_cut", "_on_cut_run"]
     body = [node for node in gui.body
             if isinstance(node, ast.Assign)
             and getattr(node.targets[0], "id", "") == "_CUT_TONES"]
     body += [_strip_docstrings(_func(gui, name)) for name in wanted]
     namespace: dict = dict(fork_activity=activity, fork_handoff=handoff, fork_cutter=cutter,
-                           fork_profiles=profiles)
+                           fork_profiles=profiles, fork_notify=notify)
+    # A recorder rather than a no-op: the ledger is a process-global this harness must not write,
+    # but what each terminal path asked to announce is worth being able to read back.
+    namespace["_notify_publish"] = (
+        lambda request, job_kind, outcome, **counts:
+        namespace.setdefault("_published", []).append((job_kind, outcome, counts)))
     module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
     exec(compile(module, _GUI, "exec"), namespace)          # noqa: S102 - the body under test
 

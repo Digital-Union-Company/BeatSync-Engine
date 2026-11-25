@@ -38,6 +38,9 @@ import os
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import submitted_parameters
+
 from beatsync_fork import audio_mix as fork_audio_mix
 from beatsync_fork import music_repeat as M
 from beatsync_fork import smart_mix as fork_smart_mix
@@ -1138,12 +1141,19 @@ def test_the_extension_rebinds_both_the_cuts_and_the_bus():
 def test_both_render_events_pass_the_repeat_at_the_same_index_as_the_signature(button, handler):
     """Gradio matches positionally, so the click list and the signature are one contract."""
     inputs = _click_inputs(_GUI, button)
-    args = [arg.arg for arg in _func(_GUI, handler).args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. The notification layer appended a `gr.Request`
+    # parameter that Gradio INJECTS, so it is deliberately absent from `inputs`; comparing it
+    # against a widget would assert the opposite of this contract. See `tests/conftest.py`.
+    args = submitted_parameters(_func(_GUI, handler))
     assert "repeat_music" in inputs, button
     assert inputs.index("repeat_music") == args.index("repeat_music"), (button, handler)
     # appended LAST in both, so no pre-existing positional index moved
     assert inputs[-1] == "repeat_music"
     assert args[-1] == "repeat_music"
+    # ...and the injected parameter is genuinely the only thing after it, so the exclusion above
+    # cannot become a way to hide a widget argument this contract should have caught.
+    all_args = [arg.arg for arg in _func(_GUI, handler).args.args]
+    assert all_args == args + ["request"], (handler, all_args)
 
 
 def test_r7_3s_policy_did_not_move():

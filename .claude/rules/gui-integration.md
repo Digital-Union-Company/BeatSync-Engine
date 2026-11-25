@@ -737,6 +737,47 @@ automatically.
     because a mis-paired row still looks correct in the markup.
   * Browsing **reads no directory**: it fills a box. Loading Settings still scans and creates
     nothing; the field values arrive through `_pref`.
+- **A finished job's desktop notification is a CHAINED event and a per-session ledger, never a
+  wider `outputs` list (R17-A).** Seven handlers own a terminal outcome worth announcing, and every
+  one of them has a pinned `outputs` list, a pinned emitted arity, or a body three suites freeze.
+  So nothing was appended to any of them:
+
+  ```
+  <job>.click(… unchanged …).then(fn=_notify_drain, inputs=[], outputs=[notify_envelope])
+  _notify_publish(request, …)   the ONE ledger writer, the ONE place an identity is minted
+  _notify_drain(request)        POPS, applies the saved toggle, writes the one hidden envelope
+  notify_envelope.change(js=NOTIFY_DISPATCH_JS)    the ONE dispatch site
+  ```
+
+  * **`request: "gr.Request" = None` is injected, appended LAST, and absent from every `inputs`
+    list** — on `process_video_guarded`, `render_selected_variants_guarded`, `_on_cut_run`,
+    `_on_cut_batch_run_ui`, `_on_audio_cut`, `_on_prep_scan_click` and `_on_prep_analyze_click`.
+    The browser gains no new way to name a session, and no submitted argument's index moved. The
+    annotation is a **string** because every one of those bodies is executed against a synthesised
+    namespace in which `gr` does not exist — the same def-time trap `repeat_music`'s integer
+    literal records. `tests/conftest.py` carries the one shared `submitted_parameters` exclusion
+    that the eight positional `inputs`-to-signature contracts now apply.
+  * **Exactly six translators call the publisher**, and `_PRODUCER_CALLS` pins how many calls each
+    handler may make. Every outcome is **translated** from the subsystem's own typed
+    classification — `RENDER_OUTCOME_KEY`, `RenderBatchOutcome`, the cutter's `TERMINAL_*`
+    vocabulary, `summarise`, `is_failure_report` — and never derived from a status string.
+  * **Nothing is published from a `finally`.** Abandonment is not a terminal outcome, and `.then()`
+    does not run for an abandoned event either.
+  * **`_notify_publish` cannot raise into a job's terminal path.** A notification is a courtesy; a
+    job's result is not.
+  * **The panel's whole server-side writer set is `notify_app_state`.** `notify_status` — the live
+    browser-permission line — has **no** server writer, because only the page knows the answer, and
+    `notify_envelope` has exactly one, `_notify_drain`.
+  * **Four of the five scripts are one-line delegates and the installer holds every rule.** It is
+    the **fourth** authorised `app.load(js=…)` installer; `requestPermission()` has one
+    implementation, reachable only from one button. No script contains a network call, a service
+    worker, a Push API reference or a timer.
+  * **The two pre-existing option writers were corrected, and that was a real regression.**
+    `save_preferences` replaces the file and defaults any option key the caller omits, so once a
+    second option existed, picking a collision policy switched notifications back off. Both call
+    sites now pass the complete set.
+
+  Full contract: `.claude/rules/desktop-notifications.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -764,4 +805,5 @@ automatically.
 | the in-flight **activity** for Scan / Analyze / Verify / Sample, `_activity_frames`, `_verify_sources_frames`, `_sample_decode_frames`, `_prep_phase` or `prep_activity.py` (UX-PREP-ACTIVITY) | `.claude/rules/prep-activity.md` **+** `.claude/rules/source-verification.md` (the mutex, the pin and the staleness rule it must not disturb) **+** `.claude/rules/progress-events.md` (the generator-lifetime rule the join rests on, and the ETA ban it restates) |
 | Settings → **Video Analysis Cache**, the shared cache folder, the Import button, or Cache Management's analysis category | `.claude/rules/shared-analysis-cache.md` **+** `.claude/rules/stage5-cache-identity.md` (the directory is deliberately not part of identity) |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |
+| Settings → **Desktop notifications**, `notify_envelope`, `_notify_publish` / `_notify_drain`, any `_notify_*` translator, or any of the five `NOTIFY_*_JS` scripts (R17-A) | `.claude/rules/desktop-notifications.md` **+** the subsystem rule of whichever job you are touching the terminal point of — the outcome must stay a *translation* of that subsystem's own typed class, never a derivation from its status text |
 | render modes, encoder branches, frame lock | `.claude/rules/pipeline-core.md` |

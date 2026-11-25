@@ -596,7 +596,10 @@ def test_the_header_adds_no_event_registration(gui_source: str, gui_tree: ast.Mo
     """It is static text written once at build time. No `app.load`, no component identity, and
     nothing that could put it in an `inputs` or `outputs` list.
     """
-    assert gui_source.count("app.load(") == 3, "the authorised app.load installers are three"
+    # [FORK] R17-A: five since the desktop-notification feature was authorised -- four JavaScript
+    # installers plus ONE server-side load that re-reads the saved toggle for each browser
+    # session. The claim this test makes is unchanged: the build header adds none of them.
+    assert gui_source.count("app.load(") == 5, "the authorised app.load registrations are five"
     for call in ast.walk(gui_tree):
         if not isinstance(call, ast.Call):
             continue

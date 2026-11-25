@@ -27,6 +27,9 @@ from typing import Any
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import INJECTED_ANNOTATIONS, submitted_parameters
+
 from beatsync_fork import freestyle as fork_freestyle
 
 from beatsync_fork import creative as fork_creative
@@ -2812,8 +2815,15 @@ def test_both_render_wrappers_take_the_same_freestyle_widgets():
 #: [FUN R10] `repeat_music` joins them for the identical reason, and in BOTH handlers again: a
 #: repeat count is shared render intent, so the batch freezes one value for every candidate exactly
 #: as it freezes the audio file, the source set and the encoder.
+#: [FORK] R17-A: `request` joins them, and it is the one entry that is NOT a widget. It carries the
+#: owning browser session, which Gradio INJECTS at the annotated parameter's own index rather than
+#: taking from `inputs`, so it is deliberately absent from both registrations' input lists. It is
+#: listed here for the identical reason every other entry is: it was appended, never inserted, so no
+#: pre-existing positional index moved. `test_the_injected_session_is_appended_and_is_not_a_widget`
+#: below pins what distinguishes it, so this list cannot quietly admit a real widget argument that
+#: was never wired up.
 _APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return", "voice_overflow",
-                             "repeat_music")
+                             "repeat_music", "request")
 
 
 def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched():
@@ -2848,6 +2858,32 @@ def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched(
         defaulted = names[len(names) - len(node.args.defaults):] if node.args.defaults else []
         for name in trailing:
             assert name in defaulted, (handler, name, "appended without a default")
+
+
+def test_the_injected_session_is_appended_and_is_not_a_widget():
+    """[FORK] R17-A: the one entry in `_APPENDED_AFTER_FREESTYLE` that is not a widget.
+
+    `request` carries the owning browser session for the desktop-notification ledger. Gradio
+    **injects** it, at the annotated parameter's own index, so it must be absent from both
+    registrations' `inputs` — the browser gains no new way to name a session, and no submitted
+    argument's position moved. It is also the LAST parameter of both handlers, which is what makes
+    its presence in the appended list a statement about ordering rather than a hole in it.
+    """
+    tree = _tree(_GUI)
+    for button, handler in (("process_btn", "process_video_guarded"),
+                            ("render_selected_variants_btn", "render_selected_variants_guarded")):
+        names = [a.arg for a in _func(tree, handler).args.args]
+        assert names[-1] == "request", handler
+        assert names.count("request") == 1, handler
+        annotation = _func(tree, handler).args.args[-1].annotation
+        assert ast.unparse(annotation) in INJECTED_ANNOTATIONS, handler
+        click = next(node for node in ast.walk(tree)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and ast.unparse(node.func) == f"{button}.click")
+        inputs = {kw.arg: kw.value for kw in click.keywords}["inputs"]
+        assert "request" not in [ast.unparse(e) for e in inputs.elts], button
+        # Every OTHER appended name really is a submitted widget, so the list above stays honest.
+        assert submitted_parameters(_func(tree, handler)) == names[:-1], handler
 
 
 def test_generating_variants_still_writes_no_freestyle_widget():

@@ -24,6 +24,9 @@ from beatsync_fork import raw_cutter_batch as batch
 from beatsync_fork import raw_cutter_profiles as profiles
 # [FORK] R12: and `fork_activity` for the Activity & Performance read-out, for the same reason.
 from beatsync_fork import raw_cutter_activity as activity
+# [FORK] R17-A: and `fork_notify`, which the wrapper's terminal frame maps the batch's own
+# `TERMINAL_*` class through, for the same reason.
+from beatsync_fork import desktop_notify as notify
 # [FORK] R11: and `fork_handoff`, which the wrapper's terminal frame calls to build the "Review
 # these clips" record. The REAL module, so what these cases assert about the offer is the shipped
 # gate -- including its refusal to produce a record for a job that published no clips.
@@ -747,10 +750,29 @@ def test_start_batch_is_one_click_with_no_confirmation_step(gui_tree, gui_source
     assert ast.unparse(kwargs["fn"]) == "_on_cut_batch_run_ui"
     wrapper = _code_only(_func(gui_tree, "_on_cut_batch_run_ui"))
     assert wrapper.count("_on_cut_batch_run(") == 1, "the wrapper must run the batch exactly once"
-    # No `.then(...)` chain: one press does the whole folder.
+    # One press does the whole folder: no chained event may do batch WORK, and no chained event may
+    # write anything the batch itself writes.
+    #
+    # [FORK] R17-A: the ban is now structural rather than a bare `.then(` substring. There is
+    # exactly one chained event on this registration and it is the desktop-notification drain --
+    # `inputs=[]`, `outputs=[notify_envelope]`, so it reads nothing from the screen, writes no
+    # batch widget and performs no cutting. Keeping the substring form would have meant either
+    # failing a change that does not touch this guarantee, or weakening it to "no second click",
+    # which is not the thing worth protecting. What IS protected is pinned by exact value below.
     start = gui_source.index("cut_batch_start_btn.click(")
     end = gui_source.index("cut_batch_cancel_btn.click(")
-    assert ".then(" not in gui_source[start:end]
+    span = gui_source[start:end]
+    assert span.count(".then(") == 1, "only the notification drain may be chained to Start Batch"
+    # The `.then(...)` WRAPS the `.click(...)`, so it is the chain's outer call rather than a
+    # descendant of it -- found by its callee, which is this button's own click expression.
+    chained = [node for node in ast.walk(gui_tree)
+               if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "then"
+               and ast.unparse(node.func.value).startswith("cut_batch_start_btn.click(")]
+    assert len(chained) == 1
+    chained_kwargs = {kw.arg: ast.unparse(kw.value) for kw in chained[0].keywords}
+    assert chained_kwargs["fn"] == "_notify_drain"
+    assert chained_kwargs["inputs"] == "[]"
+    assert chained_kwargs["outputs"] == "[notify_envelope]"
 
 
 def test_the_batch_handler_requires_no_plan_state_and_no_staleness_gate(gui_tree):
@@ -1353,8 +1375,14 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         # button's availability come out of the shipped helper rather than a stand-in -- which is
         # what makes the "cleared while running, offered only when clips exist" cases below
         # assertions about the real seam.
+        # [FORK] R17-A: `_notify_cut_batch` and its `_CUT_BATCH_NOTIFY_OUTCOMES` table join it for
+        # the same reason -- the wrapper's terminal frame calls it, so the shipped function has to
+        # be resolvable or every `ui=True` case dies on a `NameError` inside the generator. The
+        # real one is exec'd rather than stubbed, so these cases keep driving the shipped mapping;
+        # only its one side effect, `_notify_publish`, is replaced below.
         wanted += ["_cut_progress_html", "_cut_activity", "_cut_activity_final",
-                   "_cut_batch_buttons", "_cut_handoff", "_on_cut_batch_run_ui"]
+                   "_cut_batch_buttons", "_cut_handoff", "_notify_cut_batch",
+                   "_on_cut_batch_run_ui"]
     body = [_strip_docstrings(_func(gui, name)) for name in wanted]
     namespace: dict = {}
     if ui:
@@ -1362,13 +1390,24 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
                 if isinstance(node, ast.Assign)
                 and getattr(node.targets[0], "id", "") in ("_CUT_TONES",
                                                            "_CUT_BATCH_ACTIVITY",
-                                                           "_CUT_BATCH_HANDOFF")] + body
+                                                           "_CUT_BATCH_HANDOFF",
+                                                           "_CUT_BATCH_NOTIFY_OUTCOMES")] + body
         # `_CUT_BATCH_ACTIVITY` is built at module scope from the two real fork vocabularies, so
         # they have to be resolvable BEFORE the body is executed rather than only afterwards.
         # [FORK] R11: `_CUT_BATCH_HANDOFF` is built the same way, from `fork_cutter_batch`'s
         # `TERMINAL_*` names and `fork_handoff`'s outcome names, so it needs the same treatment.
+        # [FORK] R17-A: `_CUT_BATCH_NOTIFY_OUTCOMES` is the third such table, built from the same
+        # `TERMINAL_*` names and `fork_notify`'s four outcome tokens.
+        #
+        # `_notify_publish` is the ONE stub here, and deliberately a recorder rather than a no-op:
+        # the desktop-notification ledger is a process-global that this harness has no business
+        # writing, but what the wrapper asked to announce is worth being able to read back. What a
+        # notification may SAY is `tests/test_desktop_notifications.py`'s subject, not this file's.
         namespace.update(fork_cutter_batch=batch, fork_activity=activity,
-                         fork_handoff=handoff)
+                         fork_handoff=handoff, fork_notify=notify)
+        namespace["_notify_publish"] = (
+            lambda request, job_kind, outcome, **counts:
+            namespace.setdefault("_published", []).append((job_kind, outcome, counts)))
     module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
     exec(compile(module, _GUI, "exec"), namespace)          # noqa: S102 - the body under test
 

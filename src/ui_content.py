@@ -1037,6 +1037,51 @@ STATUS_COLLISION_SAVED_SUFFIX = (
     "Nothing is ever overwritten."
 )
 
+# [FORK] Digital-Union (R17-A Desktop Notifications): Settings -> Notifications.
+#
+# Every sentence here is about what the feature CAN and CANNOT promise. A notification is the one
+# part of BeatSync that depends on three things it does not control -- the page staying open,
+# Chrome's per-origin permission, and Windows' own notification settings -- so the wording says so
+# instead of implying a guaranteed alert. The per-state explanations are NOT here: they live in
+# `beatsync_fork.desktop_notify.PERMISSION_SENTENCES`, so the panel and the policy cannot drift.
+LABEL_NOTIFY_SECTION = "🔔 Desktop notifications"
+INFO_NOTIFY_SECTION = (
+    "Optional. When a long job finishes, BeatSync can show one Windows desktop notification "
+    "through Chrome, so you can work in another window instead of watching this tab.\n\n"
+    "It covers the music video render, a Variant Lab batch, the Raw Cutter (single and folder "
+    "batch), the Audio Cutter, and Library scan and analysis — one notification per finished "
+    "job, saying whether it succeeded, partly succeeded, failed or was stopped.\n\n"
+    "**This page has to stay open.** A notification is sent by the open BeatSync tab, so nothing "
+    "arrives after you close the tab, close Chrome or the session disconnects. Windows Focus "
+    "Assist, Do Not Disturb and Chrome's own settings can also suppress one, so treat it as a "
+    "convenience and not as a guarantee — the full result is always in BeatSync itself."
+)
+LABEL_NOTIFY_ENABLED = "Enable desktop notifications"
+INFO_NOTIFY_ENABLED = (
+    "Off by default, and saved with your other settings. While this is off BeatSync sends "
+    "nothing, whatever Chrome allows. Notification text names the job and its outcome only — "
+    "never a folder, a filename or a log line."
+)
+LABEL_NOTIFY_PERMISSION_BTN = "Allow notifications in Chrome"
+LABEL_NOTIFY_TEST_BTN = "Send test notification"
+LABEL_NOTIFY_REFRESH_BTN = "Re-check browser status"
+LABEL_NOTIFY_STATUS = "Status"
+#: The server cannot know what the browser will answer, so the panel ships this and the page
+#: fills it in. Deliberately phrased as "checking", never as a state: a stale "granted" left on
+#: screen by a server-rendered default would be the one lie this panel must not tell.
+INFO_NOTIFY_STATUS_PENDING = (
+    "Checking this browser…  If this line does not change, this page could not run its "
+    "notification check and no desktop alert can be shown."
+)
+STATUS_NOTIFY_SAVED_ON = (
+    "Saved: desktop notifications are on. Chrome still has to allow them — see the status in "
+    "Settings → Desktop notifications."
+)
+STATUS_NOTIFY_SAVED_OFF = (
+    "Saved: desktop notifications are off. BeatSync will not send any, and nothing in Chrome was "
+    "changed."
+)
+
 LABEL_CACHE_SECTION = "🧹 Cache management"
 INFO_CACHE_SECTION = (
     "Disposable files BeatSync creates while it works. Press Inspect to see what is there, then "

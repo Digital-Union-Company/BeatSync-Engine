@@ -1050,6 +1050,11 @@ def _run_batch(kinds, durables, cancel_after=None):
         "_clear_active_render": lambda invocation_id: None,
         "_render_batch_request_tag": lambda: "T",
         "_process_video_guarded_unlocked": guarded_unlocked,
+        # [FORK] R17-A: the batch's one desktop-notification write, recorded rather than performed.
+        # The real helper is exercised by `tests/test_desktop_notifications.py`; here it is a stub
+        # so these cases neither touch the process-global ledger nor depend on what a notification
+        # says. It still has to EXIST, or the wrapper's terminal path dies on a `NameError`.
+        "_notify_render_batch": lambda request, outcome: _NOTIFIED.append(outcome),
         "Iterator": None, "Tuple": None, "VideoFilesInput": None,
     }
     exec(compile(ast.Module(body=[_gui_func("render_selected_variants_guarded")],
@@ -1670,6 +1675,12 @@ def test_shared_fatal_now_has_real_producers_in_the_module():
 # ===========================================================================
 # Helpers that read the real `gui.py` handlers
 # ===========================================================================
+
+
+#: [FORK] R17-A: what the batch wrapper asked to announce, in call order. A module-level list so
+#: the stub in the namespace above can be a one-line lambda; nothing here asserts on it, but a
+#: future case that wants to can read it.
+_NOTIFIED: list = []
 
 
 def _innermost_try_around(call_name):

@@ -268,6 +268,11 @@ from beatsync_fork import user_prefs as fork_prefs
 # site count stays at exactly the two that two suites pin.
 from beatsync_fork import collision as fork_collision
 from beatsync_fork import cache_admin as fork_cache
+# [FORK] Digital-Union (R17-A Desktop Notifications): the vocabulary, the wording and the content
+# safety rules for a finished-job desktop notification. Stdlib-only and side-effect-free -- it
+# mints no identity, keeps no ledger, reads no clock and touches no browser. This module owns the
+# per-session ledger and the one client-side dispatcher; that one owns what a notification may say.
+from beatsync_fork import desktop_notify as fork_notify
 # [FORK] Digital-Union (FUN Shared Analysis Cache): the per-user shared-cache configuration, the
 # per-invocation resolution, the record-filename shape, the folder measurement and the additive
 # import. Stdlib-only, so every branch is testable without a disk or a model. It owns no cache
@@ -393,6 +398,18 @@ LAST_OUTPUT_PATH_KEY = 'last_output_path'
 #: C3-R1B-b and are deliberately not implemented here. Pure diagnostics for the batch/UI layer --
 #: nothing inside the pipeline reads it back.
 RENDER_OUTCOME_KEY = 'render_outcome_kind'
+
+#: [FORK] Digital-Union (R17-A Desktop Notifications): did the render BODY run, or did the gate
+#: refuse? `RENDER_OUTCOME_KEY` cannot answer that -- a gate refusal and a real pipeline failure are
+#: both `SHARED_FATAL`, which is correct for batch continuation (every candidate would be refused
+#: identically) and wrong for a notification: a refused click performed no work, gave instant
+#: on-screen feedback, and must not raise a desktop toast.
+#:
+#: Written only by `_process_video_guarded_unlocked` -- `False` before the gate, `True` immediately
+#: before the render stream is constructed -- and read only by `process_video_guarded`'s terminal
+#: path. Nothing inside the pipeline reads it back, nothing branches on it, and it reaches no cache,
+#: identity, report or widget.
+RENDER_STARTED_KEY = 'render_body_entered'
 
 AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 
@@ -1718,6 +1735,197 @@ CLIPS_GALLERY_JS = r"""
 # `SyntaxError: Unexpected identifier 's'` out of Gradio's `new AsyncFunction`, which silently
 # costs every listener on the page. JSON encoding is the only safe way to move operator text into
 # a script; never interpolate it bare, and never assume a constant has no quote in it.
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R17-A Desktop Notifications): the client half of the feature.
+#
+# Five registrations carry JavaScript for this: one `app.load` installer and four one-line
+# delegating entry points. All five are on the allowlist in `tests/test_open_output_folder.py`,
+# by identity, and every one of them registers `fn=None` -- there is no new endpoint, no service
+# worker, no Push subscription, no background poller, no timer and no network call of any kind in
+# any of them. A notification is produced because a job REACHED A TERMINAL STATE on the server and
+# the server wrote one envelope into a hidden component; the browser never asks whether anything
+# finished.
+#
+# Why an installer at all, when the dispatcher could have been self-contained: the permission
+# read-out has to be truthful on arrival. Only the browser knows its own `Notification.permission`
+# and `isSecureContext`, so a server-rendered state would be a guess that goes stale the moment the
+# operator changes Chrome Site Settings. The installer therefore paints the panel from the live
+# browser answer, and repaints it after every action that could have changed it.
+#
+# What the installer deliberately does NOT do is ask for permission. `requestPermission()` is
+# reachable only from `NOTIFY_REQUEST_JS`, which is wired to one button, so a page load, a render
+# and a saved-toggle change can none of them produce a permission prompt.
+#
+# Every word of operator-facing text, and every state name, is substituted in from
+# `beatsync_fork.desktop_notify` through `json.dumps` -- the R5-P3 rule, and for the same measured
+# reason: these sentences contain apostrophes and curly quotes, and dropping them bare inside a JS
+# literal is how a whole script stops compiling. `json.dumps` also escapes non-ASCII, so the
+# em dashes and typographic quotes reach the browser as `\uXXXX` rather than as raw bytes.
+# =============================================================================================
+
+#: The element the installer paints the live permission state into. An id INSIDE the panel's own
+#: HTML rather than the component's `elem_id`, so the script addresses exactly the line it owns and
+#: cannot disturb anything Gradio wraps around it.
+NOTIFY_STATUS_ELEMENT_ID = 'bs-notify-permission'
+
+NOTIFY_JS = r"""
+() => {
+  if (window.__bsNotify) { return; }
+  const STATES = __BROWSER_STATES__;
+  const SENTENCES = __PERMISSION_SENTENCES__;
+  const GRANTED = __GRANTED__;
+  const UNSUPPORTED = __UNSUPPORTED__;
+  const SEEN_KEY = __SEEN_KEY__;
+  const SEEN_LIMIT = __SEEN_LIMIT__;
+  const ENVELOPE_VERSION = __ENVELOPE_VERSION__;
+  const TEST_TITLE = __TEST_TITLE__;
+  const TEST_BODY = __TEST_BODY__;
+  const TEST_TAG = __TEST_TAG__;
+  const STATUS_ID = __STATUS_ID__;
+  // Is the API usable AT ALL? Three separate questions, because each has a different answer the
+  // operator can act on, and a missing one must never be read as a denial: the constructor, the
+  // permission-request entry point, and a secure browsing context. `http://127.0.0.1` is a
+  // potentially trustworthy loopback origin so `isSecureContext` is normally true there -- but it
+  // is MEASURED rather than assumed, because an operator reaching the app by another address is
+  // exactly the case where a promise of alerts would be false.
+  const usable = () => (typeof window.Notification === "function"
+      && typeof window.Notification.requestPermission === "function"
+      && window.isSecureContext === true);
+  const state = () => {
+    if (!usable()) { return UNSUPPORTED; }
+    return STATES[String(window.Notification.permission || "")] || UNSUPPORTED;
+  };
+  const paint = () => {
+    const host = document.getElementById(STATUS_ID);
+    if (!host) { return; }
+    const now = state();
+    if (host.getAttribute("data-state") === now) { return; }
+    host.setAttribute("data-state", now);
+    host.textContent = "Chrome: " + now + " — " + (SENTENCES[now] || "");
+  };
+  // Gradio renders a tab's contents LAZILY, so on page load the Settings panel does not exist yet
+  // and the paint above finds nothing. Measured in the served app: a fresh page that opens
+  // Settings before running anything sat on "Checking this browser…" indefinitely -- the one
+  // sentence this panel ships precisely so that a page whose script never ran cannot be mistaken
+  // for a confident answer. It was telling the truth about itself and still showing the operator
+  // nothing.
+  //
+  // So the installer watches for the element arriving. A MutationObserver rather than a timer:
+  // it costs nothing while the DOM is still, there is no interval to leak, and this file's
+  // scripts are asserted to contain no `setInterval`/`setTimeout` at all. The callback is a
+  // `getElementById` plus one `getAttribute`, and `paint` returns immediately when the state has
+  // not changed -- so a render emitting a frame a second cannot make this expensive.
+  new MutationObserver(paint).observe(document.documentElement,
+                                      {childList: true, subtree: true});
+  // The duplicate ledger. `localStorage` rather than `sessionStorage` on purpose: it is shared by
+  // every tab of this origin, which is the whole point -- two BeatSync tabs that both somehow
+  // received one terminal event must still produce one notification. Bounded, and every access is
+  // guarded, because storage can be disabled or full and a notification must never be the thing
+  // that throws on the page.
+  const seen = () => {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(SEEN_KEY) || "[]");
+      return Array.isArray(stored) ? stored : [];
+    } catch (e) { return []; }
+  };
+  const remember = (id) => {
+    try {
+      const list = seen();
+      if (list.indexOf(id) === -1) { list.push(id); }
+      while (list.length > SEEN_LIMIT) { list.shift(); }
+      window.localStorage.setItem(SEEN_KEY, JSON.stringify(list));
+    } catch (e) { /* a full or disabled store costs the guard, never the page */ }
+  };
+  const fire = (title, body, tag) => {
+    if (state() !== GRANTED) { return false; }
+    try {
+      const note = new window.Notification(title, {body: body, tag: tag});
+      // Focus the page that produced it, and nothing else. No navigation, no tab switch, no
+      // render, no cleanup and no retry: clicking a notification must not change what BeatSync
+      // is showing or doing.
+      note.onclick = () => {
+        try { window.focus(); } catch (e) { /* a blocked focus is not an error */ }
+        try { note.close(); } catch (e) { /* nothing left to close */ }
+      };
+      return true;
+    } catch (e) { return false; }
+  };
+  window.__bsNotify = {
+    paint: paint,
+    state: state,
+    request: () => {
+      if (!usable()) { paint(); return; }
+      try {
+        const answer = window.Notification.requestPermission();
+        if (answer && typeof answer.then === "function") { answer.then(paint, paint); }
+        else { paint(); }
+      } catch (e) { paint(); }
+    },
+    test: () => { fire(TEST_TITLE, TEST_BODY, TEST_TAG); paint(); },
+    dispatch: (text) => {
+      // An empty value is the ordinary case and must do nothing: the component starts empty and
+      // the server writes an empty envelope whenever a click produced no terminal event, so "no
+      // notification on page load" and "no notification for a refused click" are both structural
+      // rather than checks that could be forgotten.
+      if (typeof text !== "string" || !text.trim()) { return; }
+      let payload = null;
+      try { payload = JSON.parse(text); } catch (e) { return; }
+      if (!payload || payload.v !== ENVELOPE_VERSION || !Array.isArray(payload.items)) { return; }
+      const delivered = seen();
+      payload.items.forEach((item) => {
+        if (!item || typeof item.id !== "string" || !item.id) { return; }
+        if (delivered.indexOf(item.id) !== -1) { return; }
+        // Recorded BEFORE it is sent, deliberately. Chrome, Windows or Focus Assist may refuse to
+        // display it, and there is no retry path -- so recording first makes a second delivery
+        // attempt for the same terminal event impossible, which is the invariant that matters.
+        remember(item.id);
+        fire(String(item.title || ""), String(item.body || ""), String(item.tag || item.id));
+      });
+      paint();
+    },
+  };
+  paint();
+}
+""".replace('__BROWSER_STATES__', json.dumps(fork_notify.BROWSER_PERMISSION_STATES)) \
+   .replace('__PERMISSION_SENTENCES__', json.dumps(fork_notify.PERMISSION_SENTENCES)) \
+   .replace('__GRANTED__', json.dumps(fork_notify.PERMISSION_GRANTED)) \
+   .replace('__UNSUPPORTED__', json.dumps(fork_notify.PERMISSION_UNSUPPORTED)) \
+   .replace('__SEEN_KEY__', json.dumps(fork_notify.SEEN_STORAGE_KEY)) \
+   .replace('__SEEN_LIMIT__', json.dumps(fork_notify.SEEN_LIMIT)) \
+   .replace('__ENVELOPE_VERSION__', json.dumps(fork_notify.ENVELOPE_VERSION)) \
+   .replace('__TEST_TITLE__', json.dumps(fork_notify.TEST_TITLE)) \
+   .replace('__TEST_BODY__', json.dumps(fork_notify.TEST_BODY)) \
+   .replace('__TEST_TAG__', json.dumps(fork_notify.TAG_PREFIX + 'test')) \
+   .replace('__STATUS_ID__', json.dumps(NOTIFY_STATUS_ELEMENT_ID))
+
+#: The hidden envelope component's `.change` handler. One line, delegating to the installer, so
+#: there is exactly one copy of the dispatch rules and this registration cannot grow a second
+#: interpretation of a payload. It is a no-op until the installer has run.
+NOTIFY_DISPATCH_JS = r"""
+(envelope) => { if (window.__bsNotify) { window.__bsNotify.dispatch(envelope); } }
+"""
+
+#: "Allow notifications in Chrome". The ONLY route to `Notification.requestPermission()` in the
+#: whole application, and it is reachable only from a button press -- never on page load, never
+#: during a render, and never because the saved toggle changed.
+NOTIFY_REQUEST_JS = r"""
+() => { if (window.__bsNotify) { window.__bsNotify.request(); } }
+"""
+
+#: "Send test notification". Sends one notification and nothing else: it starts no job, reads no
+#: folder and writes no setting.
+NOTIFY_TEST_JS = r"""
+() => { if (window.__bsNotify) { window.__bsNotify.test(); } }
+"""
+
+#: "Re-check browser status". Chrome's per-origin permission is changed in Chrome Site Settings,
+#: which BeatSync neither sees nor controls, so the operator needs a way to ask again without
+#: reloading the page.
+NOTIFY_REFRESH_JS = r"""
+() => { if (window.__bsNotify) { window.__bsNotify.paint(); } }
+"""
 
 
 def _stage_status(stage_number: int) -> str:
@@ -4661,6 +4869,12 @@ def _process_video_guarded_unlocked(audio_file: str,
     session_state[LAST_OUTPUT_PATH_KEY] = ''
     # [FORK] Digital-Union (C3-R1A): same lifecycle again -- cleared before the gate too.
     session_state[RENDER_OUTCOME_KEY] = None
+    # [FORK] Digital-Union (R17-A Desktop Notifications): same lifecycle a third time. It answers
+    # one question the typed outcome cannot: did the render BODY run at all, or did the gate refuse?
+    # Both produce `SHARED_FATAL`, and they are very different events -- a gate refusal is one click
+    # with instant on-screen feedback and no work done, which must not raise a desktop notification.
+    # It is bookkeeping and nothing branches on it inside this function; see `RENDER_STARTED_KEY`.
+    session_state[RENDER_STARTED_KEY] = False
 
     verification_started = time.perf_counter()
     decision = resolve_for_render(
@@ -4763,6 +4977,12 @@ def _process_video_guarded_unlocked(audio_file: str,
     # ordering explicit, synchronous and visible to a structural test. `process_video`'s own
     # finalizer then joins the worker, so by the time this `finally` returns the render has
     # actually stopped rather than merely been let go of.
+    # [FORK] Digital-Union (R17-A): the render body begins HERE, and this is the one place that
+    # knows it. Everything above is the gate plus total normalisers that cannot fail, so this
+    # marker means exactly "the gate allowed it and the pipeline was entered". Set immediately
+    # before the stream is constructed rather than after, so a fault inside `process_video` is
+    # still a started render.
+    session_state[RENDER_STARTED_KEY] = True
     render_stream = process_video(
         audio_file=audio_file,
         video_files=list(decision.paths),
@@ -5414,6 +5634,379 @@ def _on_open_output_folder_click() -> None:
     gr.Info(STATUS_OPEN_FOLDER_REQUESTED.format(path=output_dir))
 
 
+# =============================================================================================
+# [FORK] Digital-Union (R17-A Desktop Notifications): the server half of the feature.
+#
+# One per-session ledger, one publisher, one drain. The shape is deliberately the same as the
+# `_verify_revisions` map a few hundred lines above: a bounded `OrderedDict` of PLAIN DATA keyed by
+# `gr.Request.session_hash`, guarded by its own lock, holding nothing live -- no thread, no handle,
+# no lifecycle, no component and no path.
+#
+# Why a ledger rather than an extra output on each job's own event. Every one of the seven
+# producing handlers has a pinned `outputs` list and a pinned emitted arity, several of them are
+# AST-extracted and executed by their own suites, and one of them is the render wrapper whose body
+# is frozen by three further suites. Appending a component to all of them would have been a change
+# to every one of those contracts for a feature that must not alter any job's behaviour. Publishing
+# into a ledger and draining it from a `.then()` chained onto the SAME click touches no `inputs`
+# list, no `outputs` list and no emitted tuple anywhere.
+#
+# Why it is keyed by SESSION and not by job type. The accepted scope says a notification must be
+# associated with the correct owner, and must not broadcast one operator's jobs to all tabs. A
+# per-job-type slot would have been drained by whichever session's event happened to run next --
+# measurably wrong on a machine with two browser sessions, which this app supports. So each
+# producer takes `gr.Request` (injected, never an input, never listed in `inputs`) and a record can
+# only ever be read back by the session that produced it.
+#
+# Why the drain and not the publisher applies the app toggle. "The BeatSync toggle disables
+# delivery even if Chrome permission remains granted" is a statement about DELIVERY, so the gate
+# sits at the moment of delivery. A job that was started while the toggle was on and finished after
+# it was turned off therefore sends nothing -- and its record is still popped, so nothing
+# accumulates waiting for the toggle to come back.
+# =============================================================================================
+
+#: Guards :data:`_NOTIFY_PENDING` only. Its own lock rather than a shared one: a notification must
+#: never be able to block or be blocked by a render, a scan or a transfer.
+_NOTIFY_LOCK = threading.Lock()
+
+#: `session hash -> list of pending notification records`. Plain JSON-serialisable dicts produced
+#: by `desktop_notify.build`, and nothing else ever enters it.
+_NOTIFY_PENDING: "OrderedDict[str, list]" = OrderedDict()
+
+#: How many sessions may have an undelivered record at once, and how many records one session may
+#: queue. Both bounded for the same reason the revision map is: this is a hand-off buffer measured
+#: in milliseconds, not a history. Oldest-first eviction, because an undelivered record whose
+#: session never came back is the one worth dropping.
+NOTIFY_SESSION_CAP = 64
+NOTIFY_QUEUE_CAP = 8
+
+
+def _notify_session_key(request) -> str:
+    """The owning session's key, or `''` when there is no usable identity.
+
+    `''` is a REFUSAL, not a shared bucket. A publisher with no session cannot have its record
+    attributed to anyone, so it publishes nothing; a drain with no session reads nothing. That
+    fails towards silence, which is the only safe direction -- the alternative, a process-global
+    slot, is exactly the cross-session leak this ledger exists to prevent.
+    """
+    session = getattr(request, 'session_hash', None) if request is not None else None
+    return str(session) if session else ''
+
+
+def _notifications_enabled() -> bool:
+    """The saved application toggle. One reader, so no two call sites can disagree.
+
+    `is_enabled` is total: a missing, corrupt or hand-edited value in `preferences.json` reads as
+    OFF rather than raising inside a live Gradio event.
+    """
+    return fork_notify.is_enabled(_option(fork_prefs.DESKTOP_NOTIFICATIONS))
+
+
+def _notify_publish(request, job_kind, outcome, **counts) -> None:
+    """Record ONE notification for a job that has just reached a terminal state.
+
+    Called from a job's own terminal path, where the typed outcome is already known. It is the
+    only writer of the ledger, and the only place a notification identity is minted -- one
+    `uuid4().hex` per terminal event, which is what makes "at most one notification per authorized
+    job terminal event" true at the source rather than by filtering later.
+
+    **It cannot raise into the caller.** A notification is a courtesy; a job's result is not. The
+    broad guard is deliberate and narrow in consequence: everything inside it is pure dictionary
+    work on plain data, so the only thing it can swallow is a programming error in this function --
+    and swallowing that costs a toast, where letting it out would cost a finished render its final
+    frame. `desktop_notify.build` already answers `None` rather than raising for an unknown job
+    kind or outcome, so an unclassified caller is silent by contract, not by this guard.
+    """
+    try:
+        key = _notify_session_key(request)
+        if not key:
+            return
+        record = fork_notify.build(job_kind, outcome,
+                                   notification_id=uuid.uuid4().hex, counts=counts)
+        if record is None:
+            return
+        with _NOTIFY_LOCK:
+            queued = _NOTIFY_PENDING.pop(key, [])
+            queued.append(record)
+            del queued[:-NOTIFY_QUEUE_CAP]
+            _NOTIFY_PENDING[key] = queued
+            while len(_NOTIFY_PENDING) > NOTIFY_SESSION_CAP:
+                _NOTIFY_PENDING.popitem(last=False)
+    except Exception:                       # pragma: no cover - see the docstring
+        pass
+
+
+def _notify_drain(request: "gr.Request" = None) -> str:
+    """The envelope for this session's pending notifications, or the empty value.
+
+    Registered as a `.then()` on every producing click, so it runs once per top-level job event,
+    after that event has completed. `inputs` is exactly `[]` and `outputs` is exactly the one
+    hidden envelope component: nothing on the screen decides what is delivered, and nothing else
+    on the screen is written.
+
+    The pop is the duplicate guard. A record exists once, is read once, and is gone -- so a
+    reconnect, a repeated progress frame, a second `.then()` or a refused click that follows a
+    finished job cannot re-deliver it. The client keeps its own bounded ledger of delivered ids as
+    an independent second guard; neither relies on the other.
+
+    Returning the empty envelope rather than `gr.skip()` is deliberate: it clears the component
+    after every job, so the next real envelope is always a genuine change for `.change` to fire on,
+    and the dispatcher ignores an empty value.
+    """
+    key = _notify_session_key(request)
+    with _NOTIFY_LOCK:
+        queued = _NOTIFY_PENDING.pop(key, []) if key else []
+    if not _notifications_enabled():
+        # Popped and discarded: the toggle governs DELIVERY, so a record produced while it was on
+        # is dropped rather than held back for a future click to deliver out of context.
+        return fork_notify.ENVELOPE_EMPTY
+    return fork_notify.envelope(queued)
+
+
+def _on_notifications_enabled_change(enabled):
+    """Apply and persist the desktop-notification toggle the moment it is switched.
+
+    The same contract `_on_collision_policy_change` established, and for the same reason: the
+    delivery gate reads the *stored* value, so a checkbox that applied only after a separate Save
+    would mean the screen and the behaviour disagreed until a second button was pressed.
+
+    It writes ONE component -- the app-setting sentence beside it -- and deliberately not the
+    browser-status line, which the page owns and the server cannot know. Every other kind of
+    feedback is a toast, so this never becomes a writer of `pref_status`.
+
+    Switching this on asks Chrome for nothing. A permission prompt comes only from the explicit
+    button, which is what the accepted scope requires of a user gesture.
+    """
+    resolved = fork_notify.option_value(enabled)
+    _FOLDER_OPTIONS[fork_prefs.DESKTOP_NOTIFICATIONS] = resolved
+    # The WHOLE option set, not just this key. `save_preferences` replaces the file, and fills any
+    # option key the caller omits with its built-in default -- so passing one key would silently
+    # reset the collision policy, and vice versa.
+    failure = fork_prefs.save_preferences(PREFS_PATH, _FOLDER_PREFS, dict(_FOLDER_OPTIONS))
+    on = fork_notify.is_enabled(resolved)
+    if failure:
+        gr.Warning(f"{failure} The choice applies to this session only.")
+    else:
+        gr.Info(STATUS_NOTIFY_SAVED_ON if on else STATUS_NOTIFY_SAVED_OFF)
+    return fork_notify.app_setting_sentence(on)
+
+
+#: `RenderOutcomeKind` -> one of the four notification outcomes. A SINGLE render's typed outcome is
+#: already a complete four-way answer, so this is a translation and never a derivation: nothing here
+#: reads the status text, the durable path, a message prefix or an emoji.
+#:
+#: Everything that is not explicitly SUCCESS or CANCELLED is a FAILURE, including an unclassified
+#: `None`. That is the same conservative reading `process_video_guarded` already applies to the
+#: lifecycle two lines away, and it is the direction the accepted scope requires: an unknown result
+#: must never be announced as a success.
+_NOTIFY_RENDER_OUTCOMES = {
+    RenderOutcomeKind.SUCCESS: fork_notify.OUTCOME_SUCCESS,
+    RenderOutcomeKind.CANCELLED: fork_notify.OUTCOME_CANCELLED,
+}
+
+
+def _notify_render(request, outcome_kind, started) -> None:
+    """One notification for a finished single render. Called from the wrapper's terminal path.
+
+    **`started` is the gate.** A refused render -- an unconfirmed source set, a folder the operator
+    has navigated away from -- records `SHARED_FATAL` exactly as a real pipeline failure does,
+    because for batch continuation those are the same fact: every candidate would be refused
+    identically. For a *notification* they are not. The click performed no work, the refusal is
+    already on screen in front of the operator who just pressed the button, and a desktop toast
+    saying the render failed would be noise about a job that never began. So the render body having
+    been entered is read from `RENDER_STARTED_KEY`, which is the one thing that knows.
+
+    (The Variant Lab batch deliberately does **not** suppress the same case. A batch is the thing an
+    operator walks away from, its notification carries the counts that say what happened --
+    `0 completed, 1 failed, 3 not attempted` -- and a run that stopped on its first candidate is
+    exactly what they came back expecting to hear about.)
+
+    A separate named function rather than a `_notify_publish` call with an inline `.get()`, for one
+    structural reason: `process_video_guarded`'s body is AST-extracted and executed against a
+    synthesised namespace by three suites, so the fewer names its body introduces the smaller the
+    contract those harnesses carry. This is the only new name in it.
+    """
+    if not started:
+        return
+    _notify_publish(request, fork_notify.JOB_RENDER,
+                    _NOTIFY_RENDER_OUTCOMES.get(outcome_kind, fork_notify.OUTCOME_FAILED))
+
+
+def _notify_render_batch(request, outcome) -> None:
+    """One notification for a finished Variant Lab batch -- one for the BATCH, not per candidate.
+
+    The counts come from the batch's own `RenderBatchOutcome`, which is the same object the summary
+    panel is rendered from, so the toast and the panel cannot disagree. `not_attempted` is derived
+    the way the summary derives it: candidates in the selection that produced no outcome at all,
+    which is what a cancellation at a candidate boundary leaves behind.
+
+    The outcome is **not** the batch's `outcome_kind`. That field is deliberately `None` for a
+    batch that executed its whole selection even with local failures (see
+    `render_selected_variants_guarded`), so reading it would report a batch of one success and one
+    failure as an unqualified success. Cancellation is the one thing taken from it, because a
+    cancelled batch's counts describe how far it got rather than what it achieved.
+    """
+    attempted = tuple(getattr(outcome, 'outcomes', ()) or ())
+    completed = sum(1 for one in attempted if one.success)
+    failed = len(attempted) - completed
+    not_attempted = max(0, int(getattr(outcome, 'requested_count', 0) or 0) - len(attempted))
+    _notify_publish(
+        request, fork_notify.JOB_VARIANT_BATCH,
+        fork_notify.outcome_from_counts(
+            completed, failed,
+            cancelled=getattr(outcome, 'outcome_kind', None) is RenderOutcomeKind.CANCELLED),
+        completed=completed, failed=failed,
+        not_attempted=not_attempted or None)
+
+
+def _notify_cut(request, *, written=None, failed=None, cancelled=False, crashed=False) -> None:
+    """One notification for a finished single-video Raw Cutter job.
+
+    Keyword flags rather than an outcome token at the call site, for the same structural reason
+    `_notify_render` exists: `_on_cut_run` is AST-extracted and executed on every terminal path by
+    `tests/test_cut_handoff.py`, so this is the single new name its body introduces.
+
+    The counts are PUBLISHED clips, never `plan.count` -- the same rule the handoff record follows,
+    and for the same reason: a clip that did not reach disk is not a result. A crash that
+    nevertheless left clips on disk is PARTIAL rather than a failure, which is exactly how the
+    handoff record classifies it; the two readings agree because both are derived from the same
+    `completed` list.
+    """
+    if cancelled:
+        outcome = fork_notify.OUTCOME_CANCELLED
+    elif crashed:
+        outcome = (fork_notify.OUTCOME_PARTIAL if (written or 0) > 0
+                   else fork_notify.OUTCOME_FAILED)
+    else:
+        outcome = fork_notify.outcome_from_counts(written, failed)
+    _notify_publish(request, fork_notify.JOB_RAW_CUTTER, outcome,
+                    completed=written, failed=failed)
+
+
+#: The Raw Cutter batch's own `TERMINAL_*` vocabulary -> one of the four notification outcomes. A
+#: FIFTH rendering of the one classifier the headline, the manifest, the activity panel and the
+#: handoff record already share, so none of the five can describe the same batch differently.
+#:
+#: A missing key is a run that never started, and `_notify_cut_batch` sends nothing for it -- the
+#: same reading `_CUT_BATCH_ACTIVITY`'s missing key gets, and deliberately NOT spelled as a
+#: cancellation.
+_CUT_BATCH_NOTIFY_OUTCOMES = {
+    fork_cutter_batch.TERMINAL_COMPLETED: fork_notify.OUTCOME_SUCCESS,
+    fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: fork_notify.OUTCOME_PARTIAL,
+    fork_cutter_batch.TERMINAL_CANCELLED: fork_notify.OUTCOME_CANCELLED,
+    fork_cutter_batch.TERMINAL_FAILED: fork_notify.OUTCOME_FAILED,
+}
+
+
+def _notify_cut_batch(request, terminal, *, completed=None, failed=None,
+                      cancelled=None, not_attempted=None) -> None:
+    """One notification for a finished Raw Cutter folder batch -- one for the BATCH.
+
+    `terminal` is the batch's own terminal status string, so the classification comes from the
+    batch module's pure classifier and not from this one; the counts come from the same
+    `summarise` fold the manifest, the bar and the summary are built from.
+
+    An unrecognised or absent terminal status sends **nothing**. A batch refused before admission,
+    or refused before it obtained an output directory, never started -- so it has no outcome to
+    announce, and announcing one would be the opposite of what this feature is for. That is the
+    same reading the activity panel's missing key gets, and it is deliberately not a cancellation.
+    """
+    outcome = _CUT_BATCH_NOTIFY_OUTCOMES.get(terminal)
+    if outcome is None:
+        return
+    _notify_publish(request, fork_notify.JOB_RAW_CUTTER_BATCH, outcome,
+                    completed=completed, failed=failed,
+                    cancelled=cancelled or None, not_attempted=not_attempted or None)
+
+
+def _notify_audio_cut(request, *, written=None, failed=None, failed_outright=False) -> None:
+    """One notification for a finished Raw Audio Cutter job.
+
+    `failed_outright` carries NO counts, so the body is the outcome's own plain sentence rather
+    than `0 completed, 1 failed` -- a job that fell over before writing anything has no counts to
+    report, and inventing a `1 failed` would be a number nobody measured.
+
+    There is no cancellation case because the Audio Cutter has no Cancel, which is the same reason
+    its handoff record has none.
+    """
+    if failed_outright:
+        _notify_publish(request, fork_notify.JOB_AUDIO_CUTTER, fork_notify.OUTCOME_FAILED)
+        return
+    _notify_publish(request, fork_notify.JOB_AUDIO_CUTTER,
+                    fork_notify.outcome_from_counts(written, failed),
+                    completed=written, failed=failed)
+
+
+#: Which preparation operation a notification is about, keyed by `prep_activity`'s own operation
+#: vocabulary -- the same constant the activity panel and the terminal status are rendered from, so
+#: the toast cannot name a different operation from the panel beside it.
+#:
+#: Only the two that run on a worker thread are here. Verify Sources and Sample Decode are bounded
+#: read-only diagnostics that hold the render mutex and report in seconds; they are deliberately not
+#: in the accepted R17-A event list, and a missing key sends nothing.
+_PREP_NOTIFY_JOBS = {
+    fork_prep_activity.OPERATION_SCAN: fork_notify.JOB_LIBRARY_SCAN,
+    fork_prep_activity.OPERATION_ANALYZE: fork_notify.JOB_LIBRARY_ANALYSIS,
+}
+
+
+def _notify_library(request, operation, *, failed=False, refused=False) -> None:
+    """One notification for a finished Library scan or analysis pass.
+
+    `failed` and `refused` are the structural verdicts the terminal panel itself is rendered from --
+    `library_prep.is_failure_report`, which tests only the failure prefix, and an equality against
+    the one refusal notice constant. Neither is a reading of prose.
+
+    **A refusal announces nothing.** A declined pass never started, so it has no outcome, and
+    reporting it as a failure would send an operator looking for a fault in their library. That is
+    the same reading the terminal status gives it, and the same discipline a refused Raw Cutter
+    press follows.
+
+    Counts are deliberately absent: a preparation pass reports how many sources it classified in
+    its own panel, and repeating a figure here would be a second place for it to be wrong.
+    """
+    job_kind = _PREP_NOTIFY_JOBS.get(operation)
+    if job_kind is None or refused:
+        return
+    _notify_publish(request, job_kind,
+                    fork_notify.OUTCOME_FAILED if failed else fork_notify.OUTCOME_SUCCESS)
+
+
+def _notify_settings_on_load():
+    """The saved toggle, as it stands NOW, for the session that is loading the page.
+
+    `create_ui()` runs once per process, so a value computed at construction time is baked into
+    the config every browser session is served. Measured in the served app: with the toggle
+    switched ON in one tab, a second tab opened afterwards rendered the checkbox unchecked and the
+    sentence "Desktop notifications are OFF" -- while the server gate was reading ON and
+    delivering. A panel whose whole job is to state what the application will do must not be the
+    thing that is wrong about it.
+
+    **A callable `value=` was tried first and rejected on measurement.** Gradio re-evaluates one
+    per page load, which is exactly the behaviour wanted, but on the pinned `gradio==6.19.0` the
+    implicit load dependency it creates leaves a progress overlay on those components that never
+    clears -- an ever-rising stopwatch ("38.0s" and counting) sitting on top of a settings line.
+    A component's `value=` takes no `show_progress`, so there is no way to suppress it from there.
+    An explicit `app.load` does, which is the whole reason this exists as a function.
+
+    It reads one in-memory dictionary. No filesystem, no network, no poll, and nothing is written.
+    """
+    enabled = _notifications_enabled()
+    return gr.update(value=enabled), fork_notify.app_setting_sentence(enabled)
+
+
+def _notify_status_panel_html() -> str:
+    """The browser-status line's SERVER-RENDERED placeholder.
+
+    It never states a permission state, and that is the point: only the browser knows its own
+    `Notification.permission`, so a server-rendered `granted` would be a guess that goes stale the
+    moment the operator changes Chrome Site Settings. The installer replaces this text with the
+    live answer; if the script never runs, the operator reads that the check did not happen rather
+    than a confident lie.
+    """
+    return (f'<div id="{NOTIFY_STATUS_ELEMENT_ID}" data-state="checking">'
+            f'{html_lib.escape(INFO_NOTIFY_STATUS_PENDING)}</div>')
+
+
 def process_video_guarded(audio_file: str,
                           voice_files: VideoFilesInput, voice_start_delay: float,
                           voice_min_gap: float, voice_avoid_drops: bool,
@@ -5460,6 +6053,22 @@ def process_video_guarded(audio_file: str,
                           # not assumed: the first draft used the constant and took that suite down.
                           # A test pins the literal equal to the real constant so it cannot drift.
                           repeat_music=1,
+                          # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser
+                          # session, INJECTED by Gradio rather than submitted. It is appended last
+                          # with a default, so no pre-existing positional index moves, and it is
+                          # deliberately absent from the Create Music Video registration's own
+                          # `inputs` list -- the browser gains no new way to name a session, and
+                          # the handler stays callable without Gradio exactly as every suite that
+                          # calls it directly expects. (That registration is not spelled out here:
+                          # sibling suites count its exact substring in this file's raw text.)
+                          #
+                          # The annotation is a STRING. Parameter annotations are evaluated at
+                          # `def` time, and this body is AST-extracted and executed against a
+                          # synthesised namespace by three suites in which `gr` does not exist --
+                          # the same def-time trap `repeat_music`'s integer literal records.
+                          # Gradio resolves it through `typing.get_type_hints`, which reads this
+                          # module's own globals, so injection is unaffected.
+                          request: "gr.Request" = None,
                           ) -> Iterator[GuardedResult]:
     """The single-render entry point: take the render mutex, then run the shared gated core.
 
@@ -5531,6 +6140,16 @@ def process_video_guarded(audio_file: str,
             lifecycle.mark_terminal(RenderLifecycleState.FINISHED)
         else:
             lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        # [FORK] Digital-Union (R17-A): the ONE notification for this render event, recorded where
+        # the typed outcome is already in hand and the lifecycle has just been marked -- so the
+        # toast and the lifecycle are two readings of one classification rather than two
+        # derivations. It is a ledger write only: it touches no widget, no session state and no
+        # yield, cannot raise, and is unreachable on the refusal path above, which performed no
+        # work. Delivery happens in the `.then()` drain chained onto this click, and only if the
+        # operator's saved toggle is on. A render the GATE refused announces nothing -- see
+        # `_notify_render`, which reads that from `RENDER_STARTED_KEY` rather than from the typed
+        # outcome, because a refusal and a real failure are both `SHARED_FATAL`.
+        _notify_render(request, outcome_kind, session_state.get(RENDER_STARTED_KEY))
         # The terminal yield clears the invocation id from the session -- a render that finished
         # normally has nothing left for a Cancel click to signal.
         yield gr.skip(), gr.skip(), session_state, gr.skip(), gr.skip(), ''
@@ -5602,6 +6221,13 @@ def render_selected_variants_guarded(
         # `fork_music_repeat` would raise at def-time. A test pins it equal to
         # `music_repeat.DEFAULT_REPEAT`.
         repeat_music=1,
+        # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser session, injected
+        # by Gradio and appended LAST with a default, exactly as on the single-render wrapper and
+        # for the same reasons -- no pre-existing positional index moves, it is absent from the
+        # Render Selected registration's own `inputs` list, and the STRING annotation keeps the
+        # `def` evaluable in the synthesised namespaces the batch-behaviour suites build. (That
+        # registration is not spelled out here: sibling suites count its exact substring.)
+        request: "gr.Request" = None,
         ) -> Iterator[Tuple]:
     """Render the 2-4 selected candidates, one after the other. C3-R0 -> C3-R1B-b.
 
@@ -5897,6 +6523,12 @@ def render_selected_variants_guarded(
         outcomes=tuple(outcomes),
         outcome_kind=batch_outcome_kind,
     )
+    # [FORK] Digital-Union (R17-A): ONE notification for the whole batch, recorded from the batch's
+    # own outcome object -- the same one the summary panel below is rendered from. Not one per
+    # candidate: the accepted scope's unit is the top-level job event, which for a batch is the
+    # whole 2-4-candidate run, exactly as the shared `RenderLifecycle` is. A ledger write only;
+    # it touches no widget and no yield, and both early returns above are unreachable from here.
+    _notify_render_batch(request, outcome)
     # The newest successful preview wins, and a later failure never blanks an earlier success.
     preview = outcome.latest_successful_preview()
     # The batch is fully done -- nothing left for a Cancel click to signal.
@@ -6141,7 +6773,14 @@ def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
 
 
 def _run_prep_in_worker(work, state, *,
-                        operation: str = fork_prep_activity.OPERATION_SCAN) -> Iterator[Tuple]:
+                        operation: str = fork_prep_activity.OPERATION_SCAN,
+                        # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser
+                        # session, threaded in from whichever handler Gradio injected it into.
+                        # Keyword-only with a plain `None` default, for the same reason the three
+                        # arguments of `_prep_ui_updates` are: this function is AST-extracted and
+                        # executed against synthesised namespaces, so a default that evaluated a
+                        # module attribute would fail at definition time.
+                        request=None) -> Iterator[Tuple]:
     """Run one preparation step on a worker thread, streaming structured progress to the UI.
 
     Same shape as `process_video`, and for the same reasons: the pipeline prints to a stdout the GUI
@@ -6286,22 +6925,33 @@ def _run_prep_in_worker(work, state, *,
     # anywhere in this generator, so an ABANDONED event -- a closed generator, a dropped Gradio
     # request -- emits no terminal frame at all and therefore cannot be mistaken for a success.
     final_state = result_queue.get()
+    failed = fork_prep.is_failure_report(final_state.report_text)
+    refused = final_state.notice == fork_prep.REFUSAL_NOTICE
+    # [FORK] Digital-Union (R17-A): the ONE notification for a finished preparation pass, from the
+    # same two structural verdicts the terminal panel below is rendered from -- so the toast and
+    # the panel are two readings of one classification. Reached only when the stream ran to
+    # completion, exactly like the terminal frame: nothing is yielded from a `finally` here, so an
+    # ABANDONED event announces nothing, which is the behaviour an abandoned stream must have.
+    _notify_library(request, operation, failed=failed, refused=refused)
     yield _prep_ui_updates(
         final_state,
-        status=fork_prep_activity.terminal_status(
-            failed=fork_prep.is_failure_report(final_state.report_text),
-            refused=final_state.notice == fork_prep.REFUSAL_NOTICE),
+        status=fork_prep_activity.terminal_status(failed=failed, refused=refused),
         operation=operation,
         elapsed_ms=(time.perf_counter() - started) * 1000.0)
 
 
-def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tuple]:
+def _on_prep_scan_click(folder_path: str, recursive: bool, state,
+                        # [FORK] Digital-Union (R17-A Desktop Notifications): injected, appended
+                        # LAST with a default, and absent from this event's `inputs` -- the Scan
+                        # registration is untouched. A STRING annotation for the def-time reason.
+                        request: "gr.Request" = None) -> Iterator[Tuple]:
     yield from _run_prep_in_worker(
         lambda event_callback, console_logger: _prep_scan_impl(
             folder_path, recursive, state,
             event_callback=event_callback, console_logger=console_logger),
         state,
         operation=fork_prep_activity.OPERATION_SCAN,
+        request=request,
     )
 
 
@@ -7225,7 +7875,15 @@ def _restore_plan(state):
 
 
 def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds, max_seconds,
-                remove_audio, rename_output, output_profile):
+                remove_audio, rename_output, output_profile,
+                # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser session,
+                # injected by Gradio and appended LAST with a default, so no pre-existing
+                # positional index moves and the Cut Video registration's own `inputs` list is
+                # untouched -- the browser gains no new way to name a session. The annotation is a
+                # STRING because this body is AST-extracted and executed against a namespace
+                # without `gr`. (The registration is deliberately not spelled out here; a sibling
+                # suite counts that substring in this file's raw text.)
+                request: "gr.Request" = None):
     """Cut Video. A generator, so clip X / total is visible while FFmpeg works.
 
     The staleness gate is the first real step and it is deliberately strict: the plan is refused
@@ -7460,6 +8118,9 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             lines.append(offer)
         lines.append("")
         lines.append("Your source file was not modified.")
+        # [FORK] R17-A: PUBLISHED clips, from the same two lists the report and the handoff record
+        # are built from. A ledger write only -- it changes nothing about this frame.
+        _notify_cut(request, written=len(done), failed=len(failed))
         yield ("\n".join(lines), _cut_progress_html(
             CUT_CUT_DONE_TITLE,
             f'{len(done)} of {plan.count} clip(s) written'
@@ -7503,6 +8164,10 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             lines.append(offer)
         lines.append("")
         lines.append("Your source file was not modified.")
+        # [FORK] R17-A: a stop is reported AS a stop, never as a finished cut, and the counts are
+        # `completed`'s for the same reason the report's are -- the exception discarded
+        # `export_segments`' return value, so the callback's list is the only evidence.
+        _notify_cut(request, written=len(written), failed=len(failed_before_stop), cancelled=True)
         yield ("\n".join(lines), _cut_progress_html(
             CUT_CANCELLED_TEXT.split('.')[0], f'{len(written)} of {plan.count} clip(s) kept.',
             done=len(written), total=plan.count, tone='stopping',
@@ -7527,6 +8192,11 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
         text = (f"❌ Cutting failed.\n  {type(exc).__name__}: {exc}\n\n"
                 + (f"{offer}\n\n" if offer else "")
                 + f"Your source file was not modified.")
+        # [FORK] R17-A: `completed` is bound BEFORE the `try`, so counting it here is safe on every
+        # fault -- which is exactly why `done`, `failed` and `encoder` are NOT named on this path.
+        # A crash that still left clips on disk is PARTIAL, agreeing with the handoff record above
+        # because both are derived from this one list.
+        _notify_cut(request, written=sum(1 for r in completed if r.ok), crashed=True)
         # [FORK] R12: deliberately no clip counts and no encoder here. Both names are bound inside
         # the `try` and a fault can land before either exists, so naming them on this path would
         # turn a reported failure into a NameError on the generator's own thread.
@@ -7748,7 +8418,20 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         """
         totals = fork_cutter_batch.summarise(items, total)
         sink.update(finished=totals.attempted, completed=totals.completed,
-                    clips=totals.clips_written, **extra)
+                    clips=totals.clips_written,
+                    # [FORK] Digital-Union (R17-A Desktop Notifications): two more values from the
+                    # fold this function already computes -- nothing new is measured and nothing is
+                    # read back, exactly as R11's `clips` rode along. The wrapper's one notification
+                    # is then built from the same `summarise` the manifest, the bar and the summary
+                    # text are, so a fifth reading of this batch cannot disagree with the other
+                    # four. Both are correct at every call site INCLUDING the pre-backfill one,
+                    # because a `not_attempted` row is in neither `_FAILED` nor `cancelled` -- the
+                    # same equivalence argument the terminal class above rests on. `not_attempted`
+                    # itself is deliberately NOT published here for that very reason: before the
+                    # backfill it would read zero, so the wrapper derives it from `total` less
+                    # `attempted` instead of from a value that is true only sometimes.
+                    failed=totals.failed, cancelled=totals.cancelled,
+                    **extra)
 
     def finalise(is_cancelled, fatal=''):
         """[FORK] R2: the ONE terminal finalisation. Backfill, then write the manifest.
@@ -8113,7 +8796,20 @@ _CUT_BATCH_HANDOFF = {
 
 
 def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, min_seconds,
-                         max_seconds, remove_audio, rename_output, output_profile):
+                         max_seconds, remove_audio, rename_output, output_profile,
+                         # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser
+                         # session, injected by Gradio and appended LAST with a default, so no
+                         # pre-existing positional index moves and the Start Batch registration's
+                         # own `inputs` list is untouched. The annotation is a STRING because this
+                         # body is AST-extracted and executed against a namespace in which `gr`
+                         # does not exist.
+                         #
+                         # Note the wording above avoids spelling the registration's `<widget>.`
+                         # prefix literally: sibling suites count that exact substring in this
+                         # file's raw text, so a comment naming it becomes a second match. This
+                         # repository has been bitten by prose tripping a substring check
+                         # repeatedly; the two comments below follow the same discipline.
+                         request: "gr.Request" = None):
     """[FORK] Digital-Union (Raw Cutter progress P1): the batch, with a visible bar and controls.
 
     A thin presentation wrapper, on purpose. `_on_cut_batch_run` above keeps every reviewed
@@ -8215,6 +8911,17 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
         clips=sink.get('clips', 0),
         outcome=_CUT_BATCH_HANDOFF.get(sink.get('terminal'), ''))
     offer = fork_handoff.offer_text(handoff, LABEL_CUT_OPEN_LIBRARY)
+    # [FORK] Digital-Union (R17-A): ONE notification for the batch, from the SAME `TERMINAL_*`
+    # class the headline, the activity panel and the handoff record above all use -- a fifth
+    # rendering of one classifier, never a derivation from the status text. `not_attempted` is
+    # `total` less the sources whose outcome was recorded, which is what a cancellation at a source
+    # boundary leaves behind. A ledger write only: it changes nothing about this frame, and a run
+    # with no terminal class sends nothing.
+    _notify_cut_batch(request, sink.get('terminal'),
+                      completed=sink.get('completed'), failed=sink.get('failed'),
+                      cancelled=sink.get('cancelled'),
+                      not_attempted=max(0, int(sink.get('total') or 0)
+                                        - int(sink.get('finished') or 0)))
     # Both timers freeze here: the panel is emitted with `data-running="0"`, which is what stops
     # the browser interval advancing a job that is over.
     yield (status, summary + (f"\n\n{offer}" if offer else ''),
@@ -8268,7 +8975,12 @@ def _on_sample_invalidate(request: gr.Request = None) -> str:
 
 
 def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
-                           state) -> Iterator[Tuple]:
+                           state,
+                           # [FORK] Digital-Union (R17-A Desktop Notifications): injected,
+                           # appended LAST with a default, and absent from this event's `inputs` --
+                           # the Analyze registration is untouched, so the live-controls contract
+                           # above is unchanged. A STRING annotation for the def-time reason.
+                           request: "gr.Request" = None) -> Iterator[Tuple]:
     # The live preparation controls are inputs to the Analyze request, not just `gr.State` - a
     # queued `change` event must not be able to let a stale scan be analysed. Parameter names
     # mirror the widget names in `prep_analyze_btn.click(inputs=...)`, which Gradio supplies
@@ -8284,6 +8996,7 @@ def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
             event_callback=event_callback, console_logger=console_logger),
         state,
         operation=fork_prep_activity.OPERATION_ANALYZE,
+        request=request,
     )
 
 
@@ -8808,8 +9521,14 @@ def _on_collision_policy_change(policy):
     """
     resolved = fork_collision.resolve_policy(policy)
     _FOLDER_OPTIONS[fork_prefs.COLLISION_POLICY] = resolved
+    # [FORK] R17-A: the WHOLE option set, not just this key. `save_preferences` replaces the file
+    # and fills any option key the caller omits with its built-in DEFAULT, so passing the single
+    # key here silently reset every other option -- which became observable the moment a second
+    # option existed: picking a collision policy would have switched desktop notifications back
+    # off. `_FOLDER_OPTIONS` is updated on the line above, so this dictionary is both complete and
+    # current.
     failure = fork_prefs.save_preferences(
-        PREFS_PATH, _FOLDER_PREFS, {fork_prefs.COLLISION_POLICY: resolved})
+        PREFS_PATH, _FOLDER_PREFS, dict(_FOLDER_OPTIONS))
     if failure:
         # The in-memory value still applies to this session; only persistence failed, and saying
         # so is better than implying the choice did not take.
@@ -8887,8 +9606,15 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
     }
     # A pre-R8 caller supplies no policy, and must not reset the operator's choice to the default
     # as a side effect of saving folders. `None` therefore means "keep what is stored".
+    #
+    # [FORK] R17-A: when a policy IS supplied, the dictionary carries every CURRENT option and not
+    # just that one. `save_preferences` replaces the file and defaults any option key the caller
+    # omits, so the single-key form silently switched desktop notifications back off every time
+    # the operator pressed Save defaults. Spread first, then override, so the submitted radio still
+    # wins over the stored value.
     options = (None if collision_policy is None
-               else {fork_prefs.COLLISION_POLICY:
+               else {**_FOLDER_OPTIONS,
+                     fork_prefs.COLLISION_POLICY:
                      fork_collision.resolve_policy(collision_policy)})
     failure = fork_prefs.save_preferences(PREFS_PATH, values, options)
     if failure:
@@ -10944,7 +11670,14 @@ def _audio_fade_line(settings: dict, segments) -> str:
 
 
 def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, fmt,
-                  fade_edges=False):
+                  fade_edges=False,
+                  # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser session
+                  # is INJECTED again -- appended LAST with a default, absent from the Cut Audio
+                  # registration's own `inputs` list, so no pre-existing positional index moves.
+                  # R15-C removed an earlier `gr.Request` from this signature because nothing was
+                  # published here any more; something is again, and it is published to a ledger
+                  # rather than to a registry.
+                  request: "gr.Request" = None):
     """Cut: re-analyze, then write each planned clip into a fresh timestamped run folder.
 
     [FORK] Digital-Union (R15-C): the injected `gr.Request` is gone from the signature. It existed
@@ -10989,8 +11722,14 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
     try:
         silences, segments, failure = _audio_plan(info, settings)
     except Exception as failure:                      # noqa: BLE001
+        # [FORK] R17-A: the analysis actually ran, so a failure here is a terminal outcome worth
+        # announcing. The three refusals above are instantaneous input validation -- an unsupported
+        # format, an unreadable source, no output folder -- and deliberately announce nothing, the
+        # same discipline that gives a refused Raw Cutter press no activity panel.
+        _notify_audio_cut(request, failed_outright=True)
         return (f"❌ Analysis failed: {failure}", [], *blank)
     if failure:
+        _notify_audio_cut(request, failed_outright=True)
         return (failure, [], *blank)
 
     stem = fork_audio.safe_stem(info.path)
@@ -11003,6 +11742,8 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
     try:
         os.makedirs(run_directory, exist_ok=False)
     except OSError as failure:
+        # [FORK] R17-A: after the analysis, so the same reasoning applies.
+        _notify_audio_cut(request, failed_outright=True)
         return (f"❌ Could not create the output folder:\n{run_directory}\n{failure}",
                 rows, *blank)
 
@@ -11058,6 +11799,9 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
     offer = fork_handoff.offer_text(handoff, LABEL_AUDIO_OPEN_IN_PREVIEW)
     if offer:
         lines += ['', offer]
+    # [FORK] R17-A: PUBLISHED clips, from the same two collections the report and the handoff
+    # record are built from -- `len(written)` is what reached disk, never `len(segments)`.
+    _notify_audio_cut(request, written=len(written), failed=len(failures))
     report = "\n".join(lines) + manifest_note
     return (report, rows, handoff)
 
@@ -13094,6 +13838,23 @@ def create_ui() -> gr.Blocks:
         # or anything carrying `MappingProxyType` could not live here. A test walks the whole object
         # graph and asserts `copy.deepcopy(proposal) == proposal`.
         director_proposal_state = gr.State(None)
+
+        # [FORK] Digital-Union (R17-A Desktop Notifications): the one hidden channel from a
+        # finished job to the browser. It carries a compact JSON envelope of notifications for
+        # THIS session, produced by the `.then()` drain chained onto each producing click, and its
+        # single `.change` registration hands the value to the client dispatcher.
+        #
+        # A `gr.Textbox` rather than a `gr.State`, because it has to be a visible value change the
+        # client can observe: `gr.State` lives server-side and fires no browser-side listener. It
+        # is placed here, among the states, rather than inside a tab, because it belongs to no tab
+        # -- any job's completion may write it, whichever tab the operator is looking at.
+        #
+        # It starts EMPTY, and that is what makes "no notification on page load" structural: the
+        # dispatcher ignores an empty value, and nothing writes this component until a job that
+        # actually ran reaches a terminal state.
+        notify_envelope = gr.Textbox(value=fork_notify.ENVELOPE_EMPTY, visible=False,
+                                     interactive=False, show_label=False,
+                                     elem_id='notify-envelope')
 
         # [FORK] Digital-Union: the version rides in the heading, the running build on a quiet
         # second line beneath it. Two `gr.Markdown` calls rather than one so the build line can be
@@ -15251,6 +16012,60 @@ def create_ui() -> gr.Blocks:
                         show_label=False,
                         elem_id='pref-collision-policy')
 
+                # [FORK] Digital-Union (R17-A Desktop Notifications): Settings -> Desktop
+                # notifications. Placed here, immediately after the collision policy, because both
+                # are plain application options saved in the same `preferences.json` -- see
+                # `user_prefs.OPTION_KEYS`.
+                #
+                # Deliberately a plain Group rather than a collapsible panel, and for the same
+                # reason the remembered folders are: a setting that is in force must not be hidden
+                # behind a shut drawer. Five components, and the division of labour between them is
+                # the whole honesty argument of this panel:
+                #
+                #   notify_enabled      the APP setting. Server-side truth, saved on change.
+                #   notify_app_state    what that setting means, written by the server only.
+                #   notify_status       what the BROWSER says, written by the page only.
+                #   the two buttons     the one permission gesture, and one test notification.
+                #
+                # The two state lines are separate components on purpose. They answer different
+                # questions with different authorities -- "BeatSync is set not to notify" and
+                # "Chrome is blocking notifications" have different fixes -- and keeping them apart
+                # means the server can rewrite its own half without erasing the live answer the
+                # page painted into the other.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_NOTIFY_SECTION}\n\n{INFO_NOTIFY_SECTION}")
+                    # The construction-time value is the setting as it stood when the process
+                    # started, and `_notify_settings_on_load` corrects it for each browser session
+                    # -- see that function for the measured reason both halves exist.
+                    notify_enabled = gr.Checkbox(
+                        value=_notifications_enabled(),
+                        label=LABEL_NOTIFY_ENABLED,
+                        info=INFO_NOTIFY_ENABLED,
+                        elem_id='notify-enabled')
+                    notify_app_state = gr.Markdown(
+                        fork_notify.app_setting_sentence(_notifications_enabled()),
+                        elem_id='notify-app-state')
+                    # `gr.HTML`, not `gr.Markdown`: the installer addresses one element by id and
+                    # sets a `data-state` attribute on it, and the Markdown sanitizer strips every
+                    # `data-*` attribute before it reaches the browser (measured on the pinned
+                    # gradio 6.19.0 -- the same limitation `prep_status` records). The server value
+                    # is a placeholder that states no permission state at all; see
+                    # `_notify_status_panel_html`.
+                    notify_status = gr.HTML(
+                        _notify_status_panel_html(),
+                        label=LABEL_NOTIFY_STATUS,
+                        elem_id='notify-status')
+                    with gr.Row():
+                        notify_permission_btn = gr.Button(
+                            LABEL_NOTIFY_PERMISSION_BTN, variant='secondary',
+                            elem_id='notify-permission-button')
+                        notify_test_btn = gr.Button(
+                            LABEL_NOTIFY_TEST_BTN, variant='secondary',
+                            elem_id='notify-test-button')
+                        notify_refresh_btn = gr.Button(
+                            LABEL_NOTIFY_REFRESH_BTN, variant='secondary',
+                            elem_id='notify-refresh-button')
+
                 # [FORK] Digital-Union (FUN Shared Analysis Cache): Settings -> Video Analysis
                 # Cache. Placed immediately BEFORE Cache Management, because it answers "where is
                 # the analysis cache?" and that panel's most expensive button acts on the answer.
@@ -15455,6 +16270,49 @@ def create_ui() -> gr.Blocks:
             concurrency_limit=None,
         )
 
+        # [FORK] Digital-Union (R17-A Desktop Notifications): five registrations, and the split
+        # between them is the contract.
+        #
+        # ONE is a server call: the saved toggle, which persists on change for the same reason the
+        # collision policy does -- the delivery gate reads the STORED value, so a checkbox that
+        # applied only after a separate Save would mean the screen and the behaviour disagreed
+        # until a second button was pressed. It writes exactly one component, the app-setting
+        # sentence beside it, and never the browser-status line, which the page owns.
+        #
+        # FOUR carry client-side JavaScript and `fn=None`, so they register no server call at all.
+        # Each is on the allowlist in `tests/test_open_output_folder.py` by identity. None of them
+        # makes a network request, starts a job, reads a folder or writes a setting. The permission
+        # request is reachable from exactly one of them, so a page load, a render and a saved-toggle
+        # change can none of them produce a Chrome permission prompt.
+        #
+        # `concurrency_limit=None` throughout, for the measured S2-A R3 reason every other
+        # non-render registration here carries.
+        notify_enabled.change(
+            fn=_on_notifications_enabled_change,
+            inputs=[notify_enabled],
+            outputs=[notify_app_state],
+            concurrency_limit=None,
+        )
+        notify_permission_btn.click(
+            fn=None, inputs=[], outputs=[], js=NOTIFY_REQUEST_JS,
+            concurrency_limit=None,
+        )
+        notify_test_btn.click(
+            fn=None, inputs=[], outputs=[], js=NOTIFY_TEST_JS,
+            concurrency_limit=None,
+        )
+        notify_refresh_btn.click(
+            fn=None, inputs=[], outputs=[], js=NOTIFY_REFRESH_JS,
+            concurrency_limit=None,
+        )
+        # The one dispatch site. `inputs` is the envelope and `outputs` is exactly `[]`: this
+        # delivers a notification and writes nothing at all. `.change` rather than a poll, so the
+        # browser is told when a job finished instead of asking.
+        notify_envelope.change(
+            fn=None, inputs=[notify_envelope], outputs=[], js=NOTIFY_DISPATCH_JS,
+            concurrency_limit=None,
+        )
+
         # [FORK] R8 UX Refresh: Cache Management. Two read-mostly events, neither of which is a
         # render: no `_RENDER_LOCK`, no render lane, and `concurrency_limit=None` for the same
         # measured R3 reason every other non-render registration here carries -- on the pinned
@@ -15538,6 +16396,12 @@ def create_ui() -> gr.Blocks:
             # half still has to tell the rest of the app.
             outputs=[audio_report, audio_table, audio_handoff_state],
             concurrency_limit=None,
+        # [FORK] R17-A: the delivery half, chained so this registration's three outputs stay
+        # exactly three -- R15-C reduced them from seven deliberately, and the envelope is not one
+        # of them.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (R7.2 Phase 2): the Audio Preview tab's six registrations.
@@ -15694,6 +16558,11 @@ def create_ui() -> gr.Blocks:
             outputs=[cut_report, cut_progress, cut_handoff_state, cut_open_library_btn,
                      cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
+        # [FORK] R17-A: the delivery half, chained so this registration's own `outputs` list and
+        # emitted arity stay byte-identical -- both are pinned, element for element.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
         cut_cancel_btn.click(
             fn=_on_cut_cancel,
@@ -15798,6 +16667,11 @@ def create_ui() -> gr.Blocks:
                      cut_handoff_state, cut_open_library_btn,
                      cut_batch_count_btn, cut_batch_start_btn, cut_batch_cancel_btn],
             concurrency_limit=None,
+        # [FORK] R17-A: the delivery half, on the same terms. One drain for the whole folder
+        # batch, from the batch's own terminal class.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
         cut_batch_cancel_btn.click(
             fn=_on_cut_batch_cancel,
@@ -16240,6 +17114,12 @@ def create_ui() -> gr.Blocks:
             show_progress='hidden',
             concurrency_id=RENDER_CONCURRENCY_ID,
             concurrency_limit=1,
+        # [FORK] R17-A: the batch's delivery half, on the same terms as the single render's. One
+        # drain for the whole 2-4-candidate run, because the batch is one top-level render event --
+        # exactly as it carries one shared `RenderLifecycle`.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (C3-R1A): the Cancel button. Its ENTIRE input is the plain string
@@ -16310,6 +17190,13 @@ def create_ui() -> gr.Blocks:
             inputs=[prep_folder, prep_recursive, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
+        # [FORK] R17-A: the delivery half. Chained, so `prep_outputs` is byte-identical and the
+        # four-tuple arity every preparation handler emits is untouched -- the envelope is NOT an
+        # element of `prep_outputs` and must never become one, or an input `change` handler would
+        # be writing a notification channel.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
         # Analyze takes the LIVE controls as well as the state, for the same reason
         # `process_btn` does: at click time the state can lag behind the widgets, and analysing a
@@ -16320,6 +17207,11 @@ def create_ui() -> gr.Blocks:
             inputs=[prep_folder, prep_recursive, prep_batch_size, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
+        # [FORK] R17-A: the delivery half, on the same terms as Scan's. This is the Stage-5 pass,
+        # the longest operation in the application and the one this feature exists for.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
@@ -16564,6 +17456,25 @@ def create_ui() -> gr.Blocks:
             # process-global `_RENDER_LOCK` remains the authority; this is cooperative UX.
             concurrency_id=RENDER_CONCURRENCY_ID,
             concurrency_limit=1,
+        # [FORK] Digital-Union (R17-A Desktop Notifications): the delivery half, as a CHAINED
+        # event rather than a wider `outputs` list.
+        #
+        # `.then()` runs after this render event has completed, so the ledger write the wrapper's
+        # terminal path made is already there to be read. Chaining is what makes this additive:
+        # the render's own `inputs`, `outputs`, emitted arity and generator shape are all
+        # byte-identical, so every positional and arity contract that guards them is untouched.
+        #
+        # `inputs=[]` is exact -- nothing on the screen decides what is delivered; the owning
+        # session is injected into `_notify_drain` and the records come from the ledger.
+        # `outputs` is exactly the one hidden envelope component, so this writes no report panel,
+        # no state object and no execution widget. No `concurrency_id`, and
+        # `concurrency_limit=None`, for the measured S2-A R3 reason every other non-render
+        # registration here carries: on the pinned gradio 6.19.0 a full concurrency group leaves
+        # an event QUEUED rather than delivering it, and a delivery that arrives after the next
+        # job would be worse than none.
+        ).then(
+            fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (R5 Clips Preview Selector, P1): four registrations, all isolated.
@@ -16674,6 +17585,27 @@ def create_ui() -> gr.Blocks:
         # one interval per page that reads the panel's own `data-*` figures. A third separate
         # registration for the same reason the two above are separate: nothing is shared.
         app.load(fn=None, inputs=None, outputs=None, js=CUT_ACTIVITY_JS)
+        # [FORK] Digital-Union (R17-A Desktop Notifications): the notification client layer. A
+        # FOURTH separate registration for the same reason the three above are separate -- nothing
+        # is shared. `fn=None`, so it registers no server call, adds no backend poll and makes no
+        # network request of any kind: it installs one object on `window`, paints the permission
+        # read-out from the live browser answer, and waits to be handed an envelope.
+        #
+        # It deliberately does NOT request permission. `Notification.requestPermission()` is
+        # reachable only from `NOTIFY_REQUEST_JS`, wired to one button, so a page load cannot
+        # produce a prompt -- which the accepted scope requires.
+        app.load(fn=None, inputs=None, outputs=None, js=NOTIFY_JS)
+        # [FORK] Digital-Union (R17-A): the ONE server-side load registration in this file, and
+        # the only `app.load` that is not a JavaScript installer.
+        #
+        # It exists because `create_ui()` runs once per process while the toggle is a live
+        # setting: without it, a browser session opened after the toggle changed is served the
+        # value as it stood at startup, and the panel states the opposite of what the app will do.
+        # `inputs=None` and two outputs, both of them this panel's own; it reads one in-memory
+        # dictionary and writes nothing. `show_progress='hidden'` is load-bearing rather than
+        # cosmetic -- see `_notify_settings_on_load` for the measured overlay it suppresses.
+        app.load(fn=_notify_settings_on_load, inputs=None,
+                 outputs=[notify_enabled, notify_app_state], show_progress='hidden')
 
     return app
 

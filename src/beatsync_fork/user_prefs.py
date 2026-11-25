@@ -90,11 +90,25 @@ SCHEMA = "beatsync-folder-preferences-1"
 #: resolves to the safe default rather than raising.
 COLLISION_POLICY = "collision_policy"
 
-OPTION_KEYS = (COLLISION_POLICY,)
+#: [FORK] R17-A Desktop Notifications. APPENDED to `OPTION_KEYS`, never inserted: `load_options`
+#: fills a missing key from `OPTION_DEFAULTS`, so a `preferences.json` written before R17-A loads
+#: here unchanged and simply reads as OFF -- which is also the default, so nothing an operator
+#: already saved changes meaning.
+#:
+#: Stored as the STRING `"on"` / `"off"`, not a boolean, because `load_options` keeps only
+#: non-empty strings: a boolean would be dropped on every load and the toggle would silently reset
+#: itself. `desktop_notify.is_enabled` is the one reader and is total, so a hand-edited or corrupt
+#: value reads as off rather than raising inside a live Gradio event. This module deliberately
+#: does not import `desktop_notify` -- preferences are inert storage and must not acquire a
+#: dependency on the policy that happens to read them, exactly as for `COLLISION_POLICY`.
+DESKTOP_NOTIFICATIONS = "desktop_notifications"
+
+OPTION_KEYS = (COLLISION_POLICY, DESKTOP_NOTIFICATIONS)
 
 #: The built-in defaults. Every one must reproduce the behaviour the app had before the option
-#: existed, so that an operator who never opens Settings sees no change at all.
-OPTION_DEFAULTS = {COLLISION_POLICY: "skip"}
+#: existed, so that an operator who never opens Settings sees no change at all. For R17-A that
+#: means `"off"`: the accepted scope requires desktop notifications to be opt-in.
+OPTION_DEFAULTS = {COLLISION_POLICY: "skip", DESKTOP_NOTIFICATIONS: "off"}
 
 
 def empty_preferences() -> dict:
@@ -302,5 +316,6 @@ __all__ = ["CLIPS_LIBRARY", "CLIPS_REJECTED", "CLIPS_INPUT", "RAW_CUTTER_OUTPUT"
            "KEYS", "SCHEMA", "empty_preferences", "preferences_path", "load_preferences",
            "save_preferences", "missing_folders", "unavailable_notice",
            "WORK_OUTPUT_KEYS", "FINISHED_LIBRARY_KEYS", "overlapping_destinations",
-           "COLLISION_POLICY", "OPTION_KEYS", "OPTION_DEFAULTS", "empty_options",
+           "COLLISION_POLICY", "DESKTOP_NOTIFICATIONS",
+           "OPTION_KEYS", "OPTION_DEFAULTS", "empty_options",
            "load_options"]

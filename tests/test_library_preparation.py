@@ -38,6 +38,9 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import submitted_parameters
+
 from beatsync_fork import analysis_cache as fork_analysis_cache
 from beatsync_fork import freestyle as fork_freestyle
 from beatsync_fork import library_prep as lp
@@ -870,7 +873,13 @@ def test_f_the_analyze_handler_signature_matches_its_click_inputs():
     """
     kwargs = _click_kwargs(_tree(_GUI), "prep_analyze_btn")
     widgets = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
-    params = [a.arg for a in _func(_tree(_GUI), "_on_prep_analyze_click").args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. The notification layer appended a parameter
+    # annotated `gr.Request`, which Gradio INJECTS at that parameter's own index rather than taking
+    # from `inputs`, so it is deliberately absent from the click list. One shared exclusion rule
+    # lives in `tests/conftest.py`; the extra assertion keeps it honest.
+    params = submitted_parameters(_func(_tree(_GUI), "_on_prep_analyze_click"))
+    assert [a.arg for a in _func(_tree(_GUI), "_on_prep_analyze_click").args.args] == \
+        params + ["request"]
 
     assert params == ["folder_path", "recursive", "batch_size", "state"]
     assert len(params) == len(widgets)
@@ -887,8 +896,11 @@ def test_f_the_scan_click_takes_the_folder_controls_only():
     names = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
     assert names == ["prep_folder", "prep_recursive", "prep_state"]
     assert getattr(kwargs["fn"], "id", None) == "_on_prep_scan_click"
-    params = [a.arg for a in _func(_tree(_GUI), "_on_prep_scan_click").args.args]
+    # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
+    params = submitted_parameters(_func(_tree(_GUI), "_on_prep_scan_click"))
     assert params == ["folder_path", "recursive", "state"]
+    assert [a.arg for a in _func(_tree(_GUI), "_on_prep_scan_click").args.args] == \
+        params + ["request"]
 
 
 # ===========================================================================
@@ -1084,10 +1096,13 @@ def test_i_the_render_click_inputs_carry_no_preparation_state():
 
 
 def test_i_the_guard_signature_carries_no_preparation_state():
-    args = [a.arg for a in _func(_tree(_GUI), "process_video_guarded").args.args]
+    # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
+    args = submitted_parameters(_func(_tree(_GUI), "process_video_guarded"))
     # audio_input -> audio_file is the one deliberate rename between widget and parameter.
     assert args == ["audio_file"] + _RENDER_CLICK_INPUTS[1:]
     assert not any(name.startswith("prep") for name in args)
+    assert [a.arg for a in _func(_tree(_GUI), "process_video_guarded").args.args] == \
+        args + ["request"]
 
 
 def test_i_preparation_widgets_are_absent_from_source_outputs():

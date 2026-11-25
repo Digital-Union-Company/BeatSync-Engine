@@ -1906,8 +1906,10 @@ def test_i5_the_panel_adds_no_subprocess_and_no_javascript_installer():
     loads = [n for n in ast.walk(tree_)
              if isinstance(n, ast.Call) and ast.unparse(n.func) == "app.load"]
     js = [n for n in loads if any(kw.arg in {"js", "_js"} for kw in n.keywords)]
-    assert len(js) == 3, (
-        f"{len(js)} JavaScript app.load registrations; the allowlist holds 3 and F-3 adds none")
+    # [FORK] R17-A: four since the desktop-notification client installer was authorised. The claim
+    # this test makes is unchanged -- the F-3 inventory panel adds none of them.
+    assert len(js) == 4, (
+        f"{len(js)} JavaScript app.load registrations; the allowlist holds 4 and F-3 adds none")
     code = _f3_bodies()
     for forbidden in ("subprocess", "os.startfile", "Popen", "requests", "urllib"):
         assert forbidden not in code

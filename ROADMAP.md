@@ -1701,7 +1701,44 @@ default.
 
 ---
 
-### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED (source, awaiting owner review); R17-B STILL RESEARCH ONLY**
+
+> **Status, 2026-11-26.** **R17-A is built** on `feat/r17a-desktop-notifications` and is awaiting
+> owner review; nothing is merged and nothing is installed. Everything below describing R17-A is
+> now a description of shipped source rather than of a plan, with these differences from the text
+> as written — each a decision made during implementation and recorded in
+> `.claude/rules/desktop-notifications.md`:
+>
+> * **Seven event sources, not the "candidate" list**: the music video render, the Variant Lab
+>   batch, the Raw Cutter single and folder batch, the Audio Cutter, and Library **scan** and
+>   **analysis** as two separately named jobs. Verify Sources and Sample Decode are deliberately
+>   excluded — both are bounded read-only diagnostics that report in seconds.
+> * **A gate-refused render announces nothing**, and neither does a refused cut, a batch that never
+>   started or a declined preparation pass. A Variant Lab batch that stops on its first candidate
+>   *does* announce, with counts; the asymmetry is deliberate and is explained in the rule.
+> * **Clicking a notification focuses the page and does nothing else.** "…and relevant result if
+>   safe" was not implemented: selecting a tab for the operator would move the view they left.
+> * **The panel has four controls, not three** — the toggle, Allow, Send test, and a fourth
+>   *Re-check browser status*, because Chrome's per-origin permission is changed in Chrome Site
+>   Settings, which BeatSync neither sees nor controls.
+>
+> **What the live smoke verified, and what it did not.** On Windows with Chrome, against an
+> isolated instance on port 7861 and synthetic media: genuine completed Raw Cutter, Audio Cutter
+> and Library scan jobs each produced exactly one notification with truthful counts and no path in
+> the text; a genuine Audio Cutter failure produced a failure notification with no invented counts;
+> a gate-refused render produced none; the saved toggle gated delivery; duplicates, empty and
+> malformed envelopes were all suppressed; and a second browser tab received nothing from the
+> first tab's job. **Chrome's permission was never granted** — that needs a human click on browser
+> UI — so what is verified is the notification API **invocation**, not an OS-visible Windows toast.
+> A genuinely backgrounded tab could not be produced by the automation, and no successful full
+> render or Variant Lab batch was run, because `create_music_video` clears a process-global
+> directory the owner's live instance shares. Those three, plus a cancelled job, remain **unverified
+> at runtime** and are listed in the task's smoke log.
+>
+> **R17-B is untouched and remains research only.** No service worker, Push server, daemon,
+> background poller or browser extension was added, and none is authorised.
+
+**The accepted scope, as written before implementation:**
 
 Owner-requested UX improvement (2026-11-04), **accepted into the roadmap by the owner on
 2026-11-12**: after a lengthy operation finishes, **Google Chrome should offer an optional Windows
