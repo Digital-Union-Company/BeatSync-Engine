@@ -1701,7 +1701,53 @@ default.
 
 ---
 
-### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED (source, awaiting owner review); R17-B STILL RESEARCH ONLY**
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+
+> **R2 review and remediation, 2026-11-26.** A focused review of PR #112 found and closed **three
+> outcome-accuracy defects**, all of them in the translation layer — no job's result, progress,
+> cancellation or concurrency behaviour changed, and no event source, component or `outputs` list
+> was added:
+>
+> * **F1 — a Raw Cutter folder batch whose every source failed announced `finished with
+>   problems`.** `terminal_status` answers `completed_with_failures` for *any* failed source, which
+>   is right for the headline and wrong for an outcome. The four classes now split: cancellation
+>   and a fatal error stay translated, the two "ran to the end" classes are folded from the
+>   measured counts. `no_clips` and `partial` ride out of the same `summarise` fold so a run that
+>   merely had nothing worth exporting is not reported as a failure either, and a clean batch whose
+>   **manifest never reached disk** is no longer the one reading of five still calling it
+>   `finished`.
+> * **F2 — Reset defaults left the Settings panel lying about what the app would do.**
+>   `empty_options()` returns the toggle to `off` in the file *and* in the dictionary the delivery
+>   gate reads, while writing neither the checkbox nor the sentence. It now writes both, from
+>   `_notify_settings_on_load()`, which also makes the failed-save path report the setting still in
+>   force. And because Gradio's `.change` fires for a function update as well as a gesture, opening
+>   a tab was **rewriting `preferences.json` and raising an "ON" toast** for a page just loaded; the
+>   handler now returns early when nothing changed.
+> * **F3 — a library analysis pass whose Qwen worker died announced `Library analysis finished`.**
+>   `is_failure_report` recognises only the marker `record_failure` writes, and a dead worker writes
+>   none. `library_prep.analysis_run_outcome` reads the analyzer's own `*_this_run` counts;
+>   incomplete and unreadable both report `finished with problems`, and **an absent or unknown
+>   verdict is never a success.**
+>
+> Plus one client-side correction (two items sharing an id inside one envelope each called the
+> `Notification` constructor) and one latent crash removed (`_notify_cut`'s crashed branch did
+> `(written or 0) > 0`, outside the publisher's guard).
+>
+> **R2's runtime evidence, on real media through the shipped app**, against an isolated instance on
+> 7861 with preferences and the Stage-5 record store redirected into the task workspace — the
+> owner's `state/preferences.json`, both analysis caches, `input/processing`, `input/gradio_uploads`
+> and `output/` all verified unchanged: a real failed batch announcing **failed**; a real successful
+> batch and a real **cancelled** batch (the case R17-A could not produce) announcing truthfully; a
+> real **incomplete** analysis announcing `finished with problems`; the duplicate-envelope fix
+> measured both ways (pre-fix 3 constructor calls, shipped 2); Reset and page-load both leaving the
+> file byte-identical. Separately and headless, one short render: **200 planned frames published as
+> 200 counted frames**, 8.000000 s against 8.000000 s of audio, decodes clean. Whole suite green —
+> **11 398 passed, 25 skipped**.
+>
+> **Still unverified, unchanged from R17-A:** an OS-visible Windows toast (Chrome's permission for
+> the origin is `default` and granting it needs a human click the automation cannot reach), a
+> genuinely backgrounded tab, and a successful render or Variant Lab batch *through the GUI*.
+> Full detail: `.claude/rules/desktop-notifications.md` (*R2*).
 
 > **Status, 2026-11-26.** **R17-A is built** on `feat/r17a-desktop-notifications` and is awaiting
 > owner review; nothing is merged and nothing is installed. Everything below describing R17-A is

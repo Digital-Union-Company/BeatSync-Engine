@@ -34,6 +34,7 @@ from collections import OrderedDict
 import pytest
 
 from beatsync_fork import desktop_notify as dn
+from beatsync_fork import library_prep as fork_prep
 from beatsync_fork import prep_activity as fork_prep_activity
 from beatsync_fork import raw_cutter_batch as fork_cutter_batch
 from beatsync_fork import user_prefs as prefs
@@ -415,15 +416,23 @@ def test_the_notification_option_is_not_a_folder_and_never_reaches_the_folder_st
 # =============================================================================================
 
 #: Every module-level name the extracted helpers need resolved from `gui.py` itself.
+#: [FORK] R17-A R2 (F1/F3): `_CUT_BATCH_NOTIFY_OUTCOMES` is gone. The cutter batch's four terminal
+#: classes now split two ways -- the two that describe the RUN are translated, the two that mean
+#: "ran to the end" are folded from the measured counts -- and the analysis pass gained its own
+#: verdict table.
 _WANTED_ASSIGNS = ("_NOTIFY_LOCK", "_NOTIFY_PENDING", "NOTIFY_SESSION_CAP", "NOTIFY_QUEUE_CAP",
-                   "_NOTIFY_RENDER_OUTCOMES", "_CUT_BATCH_NOTIFY_OUTCOMES", "_PREP_NOTIFY_JOBS",
+                   "_NOTIFY_RENDER_OUTCOMES", "_CUT_BATCH_RUN_OUTCOMES", "_CUT_BATCH_RAN_TO_END",
+                   "_PREP_NOTIFY_JOBS", "_PREP_ANALYSIS_NOTIFY_OUTCOMES",
                    "NOTIFY_STATUS_ELEMENT_ID")
 
 _WANTED_FUNCTIONS = ("_notify_session_key", "_notifications_enabled", "_notify_publish",
                      "_notify_drain", "_notify_render", "_notify_render_batch", "_notify_cut",
                      "_notify_cut_batch", "_notify_audio_cut", "_notify_library",
                      "_notify_settings_on_load", "_notify_status_panel_html",
-                     "_on_notifications_enabled_change")
+                     "_on_notifications_enabled_change",
+                     # [FORK] R17-A R2 (F2): Reset defaults is now a writer of the notification
+                     # checkbox and the sentence beside it, so the suite executes the real body.
+                     "_on_reset_folder_prefs")
 
 
 class _Request:
@@ -469,6 +478,7 @@ def _notify_namespace(tmp_path, *, enabled=True):
         "fork_notify": dn,
         "fork_prefs": prefs,
         "fork_cutter_batch": fork_cutter_batch,
+        "fork_prep": fork_prep,
         "fork_prep_activity": fork_prep_activity,
         "RenderOutcomeKind": RenderOutcomeKind,
         "INFO_NOTIFY_STATUS_PENDING": "Checking this browser…",
@@ -478,8 +488,15 @@ def _notify_namespace(tmp_path, *, enabled=True):
         "_FOLDER_PREFS": prefs.empty_preferences(),
         "_FOLDER_OPTIONS": options,
         "_option": lambda key: options.get(key, prefs.OPTION_DEFAULTS.get(key, "")),
+        # [FORK] R17-A R2 (F2): `_on_reset_folder_prefs` composes its status line through this.
+        # Stubbed to the identity, because what the status *says* is R8's contract and this suite
+        # asserts only about the two notification outputs beside it.
+        "_folder_prefs_status": lambda text: text,
         "gr": types.SimpleNamespace(Info=lambda text: toasts.append(("info", text)),
-                                    Warning=lambda text: toasts.append(("warning", text))),
+                                    Warning=lambda text: toasts.append(("warning", text)),
+                                    # The same shape the settings-on-load test installs, so a
+                                    # programmatic component write is inspectable as plain data.
+                                    update=lambda **kwargs: ("gr.update", kwargs)),
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
                  _GUI, "exec"), namespace)      # noqa: S102 - the body under test
@@ -629,6 +646,93 @@ def test_a_failed_save_says_so_and_still_applies_to_this_session(tmp_path):
     assert "this session only" in ns["_toasts"][-1][1]
 
 
+# --- the programmatic-write guard, and Reset defaults  (R17-A R2, finding F2) -----------------
+
+def test_a_programmatic_echo_of_the_stored_setting_writes_nothing_and_says_nothing(tmp_path):
+    """Gradio's `.change` fires for a FUNCTION UPDATE as well as a user gesture, and this component
+    has two legitimate programmatic writers: `_notify_settings_on_load` (every new browser session)
+    and Reset defaults. Both re-entered the handler, so opening a tab rewrote `preferences.json`
+    and raised an "ON" toast for a page the operator had only just loaded."""
+    ns = _notify_namespace(tmp_path, enabled=True)
+    ns["_on_notifications_enabled_change"](True)                   # the real user gesture, once
+    assert ns["_toasts"] == [], "the stored value already said on; nothing changed"
+    assert not os.path.exists(ns["PREFS_PATH"]), "and nothing was written at all"
+
+    # ...and from the other direction: a programmatic OFF echo over a stored OFF.
+    off = _notify_namespace(tmp_path / "off", enabled=False)
+    off["_on_notifications_enabled_change"](False)
+    assert off["_toasts"] == []
+    assert not os.path.exists(off["PREFS_PATH"])
+
+
+def test_a_corrupt_stored_value_is_not_rewritten_by_a_programmatic_echo(tmp_path):
+    """`is_enabled` reads a hand-edited value as OFF -- the direction this setting must fail in --
+    so the comparison is on the resolved booleans and an echo of the off state it already means
+    changes nothing."""
+    ns = _notify_namespace(tmp_path, enabled=False)
+    ns["_options"][prefs.DESKTOP_NOTIFICATIONS] = "YES PLEASE"
+    assert ns["_on_notifications_enabled_change"](False) == dn.app_setting_sentence(False)
+    assert ns["_toasts"] == [] and not os.path.exists(ns["PREFS_PATH"])
+    # ...while a genuine request to turn it ON is still a change, and still persists.
+    assert ns["_on_notifications_enabled_change"](True) == dn.app_setting_sentence(True)
+    assert dn.is_enabled(prefs.load_options(ns["PREFS_PATH"])[prefs.DESKTOP_NOTIFICATIONS])
+
+
+def test_reset_defaults_leaves_the_setting_the_checkbox_and_the_sentence_in_agreement(tmp_path):
+    """Reset returns the option to `off` in the file AND in `_FOLDER_OPTIONS`, which is what the
+    delivery gate reads -- so a panel still saying "Desktop notifications are ON in BeatSync" was
+    the one thing in the room that was wrong about what the application would do."""
+    ns = _notify_namespace(tmp_path, enabled=True)
+    ns["_options"][prefs.COLLISION_POLICY] = "suffix"
+    ns["_notify_publish"](_Request("S1"), dn.JOB_RENDER, dn.OUTCOME_SUCCESS)
+    assert len(_drained(ns, "S1")) == 1, "delivering before the reset"
+
+    returned = ns["_on_reset_folder_prefs"]()
+
+    assert returned[10] == ("gr.update", {"value": False}), returned[10]
+    assert returned[11] == dn.app_setting_sentence(False)
+    assert ns["_options"][prefs.DESKTOP_NOTIFICATIONS] == dn.ENABLED_OFF
+    assert not dn.is_enabled(
+        prefs.load_options(ns["PREFS_PATH"])[prefs.DESKTOP_NOTIFICATIONS])
+    assert ns["_notifications_enabled"]() is False
+    # ...and the gate agrees with the sentence: nothing is delivered any more.
+    ns["_notify_publish"](_Request("S1"), dn.JOB_RENDER, dn.OUTCOME_SUCCESS)
+    assert _drained(ns, "S1") == []
+
+
+def test_a_reset_that_could_not_be_saved_reports_the_setting_that_is_still_in_force(tmp_path):
+    """A failed save leaves `_FOLDER_OPTIONS` untouched, so the pair must describe what is still
+    true rather than the cleared state the operator was told could not be saved."""
+    ns = _notify_namespace(tmp_path, enabled=True)
+    blocker = tmp_path / "blocked"
+    blocker.write_bytes(b"not a directory")
+    ns["PREFS_PATH"] = os.path.join(str(blocker), "preferences.json")
+
+    returned = ns["_on_reset_folder_prefs"]()
+
+    assert returned[-1].startswith("❌")
+    assert returned[10] == ("gr.update", {"value": True}), returned[10]
+    assert returned[11] == dn.app_setting_sentence(True)
+    assert ns["_notifications_enabled"]() is True, "nothing was cleared, so nothing changed"
+
+
+def test_reset_defaults_returns_exactly_as_many_values_as_its_outputs_list(tmp_path):
+    """Gradio matches `outputs` by position, so a tuple that grew without its registration -- or
+    the other way round -- silently writes the status line into the checkbox."""
+    ns = _notify_namespace(tmp_path, enabled=True)
+    call = next(node for node in ast.walk(_tree(_GUI))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and ast.unparse(node.func) == "pref_reset_btn.click")
+    listed = next(keyword.value for keyword in call.keywords if keyword.arg == "outputs")
+    outputs = [ast.unparse(element) for element in listed.elts]
+
+    assert outputs[10:12] == ["notify_enabled", "notify_app_state"], outputs
+    assert outputs[-1] == "pref_status", "the status box stays last"
+    assert "notify_status" not in outputs, \
+        "the live browser-permission line has no server-side writer"
+    assert len(ns["_on_reset_folder_prefs"]()) == len(outputs)
+
+
 def test_the_browser_status_placeholder_states_no_permission_state(tmp_path):
     """Only the browser knows its own `Notification.permission`, so a server-rendered `granted`
     would be a guess that goes stale the moment Chrome Site Settings changes."""
@@ -763,16 +867,16 @@ def test_the_single_cuts_outcome_matches_what_its_handoff_record_says(
 
 
 @pytest.mark.parametrize("terminal,expected", [
-    (fork_cutter_batch.TERMINAL_COMPLETED, dn.OUTCOME_SUCCESS),
-    (fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES, dn.OUTCOME_PARTIAL),
     (fork_cutter_batch.TERMINAL_CANCELLED, dn.OUTCOME_CANCELLED),
     (fork_cutter_batch.TERMINAL_FAILED, dn.OUTCOME_FAILED),
 ])
-def test_the_folder_batch_renders_the_same_terminal_class_the_panel_does(
-        tmp_path, terminal, expected):
+def test_the_two_run_level_batch_classes_are_translated_not_folded(tmp_path, terminal, expected):
+    """Cancellation and a crash are statements about the RUN that counts cannot express: a stopped
+    batch's counts say how far it got, and a crashed one's say what had been done when it stopped.
+    So these two come straight from the batch module's own classifier, counts notwithstanding."""
     ns = _notify_namespace(tmp_path)
     ns["_notify_cut_batch"](_Request("S1"), terminal, completed=27, failed=1,
-                            cancelled=0, not_attempted=0)
+                            cancelled=0, not_attempted=0, no_clips=0, partial=0)
     records = _drained(ns, "S1")
     assert len(records) == 1
     assert records[0]["job"] == dn.JOB_RAW_CUTTER_BATCH
@@ -796,6 +900,126 @@ def test_zero_valued_batch_counts_are_omitted_rather_than_printed_as_noise(tmp_p
     body = _drained(ns, "S1")[0]["body"]
     assert "cancelled" not in body and "not attempted" not in body
     assert body.endswith("5 completed, 0 failed")
+
+
+# =============================================================================================
+# 3a-R2. The folder batch's outcome, driven by the REAL classifier  (R17-A R2, finding F1)
+#
+# `terminal_status` answers `completed_with_failures` for ANY failed source, which is right for a
+# headline and wrong for a notification outcome: a batch whose every source failed arrives there
+# too. These cases are built as real `BatchItem` lists, folded by the real `summarise`, classified
+# by the real `terminal_status`, and only then handed to the translator -- so the expectations are
+# measured against the shipped cutter rather than asserted about a table.
+# =============================================================================================
+
+def _batch_item(index, outcome, *, written=0, planned=0):
+    return fork_cutter_batch.BatchItem(index=index, source_path=f"S{index}.mp4", outcome=outcome,
+                                       clips_written=written, clips_planned=planned)
+
+
+_B = fork_cutter_batch
+
+#: (label, items, discovered, cancelled, fatal_error, manifest_error, expected outcome)
+_F1_BATCHES = [
+    # The defect. Three unreadable sources, no clips anywhere: a total loss, and `partial` would
+    # have been the cheerful reading of one.
+    ("every source failed", [_batch_item(1, _B.OUTCOME_UNREADABLE),
+                             _batch_item(2, _B.OUTCOME_EXPORT_FAILED),
+                             _batch_item(3, _B.OUTCOME_DETECTION_FAILED)],
+     3, False, "", "", dn.OUTCOME_FAILED),
+    ("some worked, some failed", [_batch_item(1, _B.OUTCOME_COMPLETED, written=9, planned=9),
+                                  _batch_item(2, _B.OUTCOME_UNREADABLE)],
+     2, False, "", "", dn.OUTCOME_PARTIAL),
+    # A source that exported 7 of 10 clips is counted in `failed` and in NEITHER `completed` nor
+    # `no_clips`. Folding on `completed` alone would have called this a failure with the operator's
+    # clips sitting in the output folder -- the same reading `_notify_cut` refuses for a crash.
+    ("one partial source, clips on disk",
+     [_batch_item(1, _B.OUTCOME_PARTIAL, written=7, planned=10)],
+     1, False, "", "", dn.OUTCOME_PARTIAL),
+    # Read and planned correctly, genuinely nothing worth exporting. A real answer about the
+    # footage, which the panel calls `Batch finished`.
+    ("nothing worth exporting anywhere", [_batch_item(1, _B.OUTCOME_NO_CLIPS),
+                                          _batch_item(2, _B.OUTCOME_NO_CLIPS)],
+     2, False, "", "", dn.OUTCOME_SUCCESS),
+    # ...and the pair that proves `no_clips` has to be in the fold: without it this run, which
+    # mostly worked, would be announced as a FAILURE.
+    ("nothing worth exporting plus one failure", [_batch_item(1, _B.OUTCOME_NO_CLIPS),
+                                                  _batch_item(2, _B.OUTCOME_NO_CLIPS),
+                                                  _batch_item(3, _B.OUTCOME_UNREADABLE)],
+     3, False, "", "", dn.OUTCOME_PARTIAL),
+    ("fatal error outranks everything", [_batch_item(1, _B.OUTCOME_COMPLETED, written=4, planned=4),
+                                         _batch_item(2, _B.OUTCOME_UNEXPECTED_ERROR)],
+     3, False, "boom", "", dn.OUTCOME_FAILED),
+    ("cancelled with work done and work not attempted",
+     [_batch_item(1, _B.OUTCOME_COMPLETED, written=5, planned=5),
+      _batch_item(2, _B.OUTCOME_CANCELLED, written=2, planned=6),
+      _batch_item(3, _B.OUTCOME_NOT_ATTEMPTED)],
+     3, True, "", "", dn.OUTCOME_CANCELLED),
+    # The fifth rendering agreeing with the other four: the headline says the record was lost and
+    # the activity panel says PARTIAL/FAILED, so `finished` was the one reading out of step.
+    ("clean run, authoritative record lost",
+     [_batch_item(1, _B.OUTCOME_COMPLETED, written=9, planned=9),
+      _batch_item(2, _B.OUTCOME_COMPLETED, written=3, planned=3)],
+     2, False, "", "could not write", dn.OUTCOME_PARTIAL),
+    # ...and a lost record never makes an already-worse outcome look better.
+    ("every source failed AND the record was lost",
+     [_batch_item(1, _B.OUTCOME_UNREADABLE), _batch_item(2, _B.OUTCOME_EXPORT_FAILED)],
+     2, False, "", "could not write", dn.OUTCOME_FAILED),
+]
+
+
+@pytest.mark.parametrize(
+    "label,items,discovered,cancelled,fatal,manifest_error,expected",
+    _F1_BATCHES, ids=[case[0] for case in _F1_BATCHES])
+def test_the_folder_batch_outcome_is_measured_from_the_real_classifier(
+        tmp_path, label, items, discovered, cancelled, fatal, manifest_error, expected):
+    ns = _notify_namespace(tmp_path)
+    totals = fork_cutter_batch.summarise(items, discovered)
+    terminal = fork_cutter_batch.terminal_status(items, discovered, cancelled, fatal_error=fatal)
+
+    ns["_notify_cut_batch"](
+        _Request("S1"), terminal,
+        completed=totals.completed, failed=totals.failed, cancelled=totals.cancelled,
+        no_clips=totals.no_clips, partial=totals.partial,
+        record_lost=bool(manifest_error),
+        not_attempted=max(0, discovered - totals.attempted))
+
+    records = _drained(ns, "S1")
+    assert len(records) == 1, label
+    assert records[0]["job"] == dn.JOB_RAW_CUTTER_BATCH
+    assert records[0]["outcome"] == expected, (label, terminal, totals, records[0]["body"])
+
+
+def test_a_lost_record_qualifies_a_success_and_nothing_else(tmp_path):
+    """It mirrors the panel's own override, which fires only when the tone was otherwise `done`."""
+    ns = _notify_namespace(tmp_path)
+    for terminal, counts in (
+            (fork_cutter_batch.TERMINAL_CANCELLED, dict(completed=1, failed=0)),
+            (fork_cutter_batch.TERMINAL_FAILED, dict(completed=1, failed=1)),
+            (fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES,
+             dict(completed=0, failed=2, no_clips=0, partial=0))):
+        ns["_notify_cut_batch"](_Request("S1"), terminal, record_lost=True, **counts)
+    outcomes = [record["outcome"] for record in _drained(ns, "S1")]
+    assert outcomes == [dn.OUTCOME_CANCELLED, dn.OUTCOME_FAILED, dn.OUTCOME_FAILED]
+
+
+def test_the_two_batch_tables_cover_the_whole_terminal_vocabulary_exactly_once(tmp_path):
+    """Structural: a new `TERMINAL_*` class must not be able to fall silently into neither rule.
+
+    The `else: return` branch is the right home for an UNRECOGNISED status -- a run that never
+    started -- and the wrong home for a real one, so the two sets are asserted to partition the
+    batch module's own vocabulary rather than merely to be subsets of it.
+    """
+    ns = _notify_namespace(tmp_path)
+    translated = set(ns["_CUT_BATCH_RUN_OUTCOMES"])
+    folded = set(ns["_CUT_BATCH_RAN_TO_END"])
+    vocabulary = {getattr(fork_cutter_batch, name) for name in dir(fork_cutter_batch)
+                  if name.startswith("TERMINAL_")}
+
+    assert vocabulary, "the batch module declares no TERMINAL_* constants"
+    assert translated | folded == vocabulary, vocabulary - (translated | folded)
+    assert not (translated & folded)
+    assert set(ns["_CUT_BATCH_RUN_OUTCOMES"].values()) <= set(dn.OUTCOMES)
 
 
 @pytest.mark.parametrize("kwargs,expected,detail", [
@@ -854,6 +1078,141 @@ def test_verification_and_sample_decode_are_not_notification_sources(tmp_path, o
     ns = _notify_namespace(tmp_path)
     ns["_notify_library"](_Request("S1"), operation)
     assert _drained(ns, "S1") == []
+
+
+# =============================================================================================
+# 3a-R2. The library analysis pass's outcome  (R17-A R2, finding F3)
+#
+# `is_failure_report` recognises only the marker `record_failure` writes, so a pass that returned
+# normally while NOTHING it attempted completed produced no marker and was announced as
+# `Library analysis finished`. The verdict comes from the analyzer's own `*_this_run` counts.
+# =============================================================================================
+
+def _analysis_result(**overrides):
+    """A result payload shaped like `analyze_video_sources`', complete and consistent by default."""
+    payload = dict(sources_analyzed_this_run=4, qwen_jobs_this_run=4,
+                   qwen_completed_jobs_this_run=4, qwen_incomplete_jobs_this_run=0,
+                   qwen_requested_count_this_run=40, qwen_tag_count_this_run=40,
+                   cache_hits=0, source_count=4, analysis_seconds=12.0)
+    payload.update(overrides)
+    return payload
+
+
+_F3_RESULTS = [
+    ("every submitted source analysed, every Qwen job complete",
+     _analysis_result(), 4, fork_prep.ANALYSIS_COMPLETE),
+    # A fully warm batch legitimately runs no job at all, and that is a success, not a shortfall.
+    ("fully warm: nothing needed doing",
+     _analysis_result(sources_analyzed_this_run=0, qwen_jobs_this_run=0,
+                      qwen_completed_jobs_this_run=0, qwen_requested_count_this_run=0,
+                      qwen_tag_count_this_run=0, cache_hits=4), 4, fork_prep.ANALYSIS_COMPLETE),
+    # The defect: a dead shared worker. Real GPU minutes, nothing cached, no failure marker.
+    ("the shared Qwen worker died: 0 of 4 jobs completed",
+     _analysis_result(qwen_completed_jobs_this_run=0, qwen_incomplete_jobs_this_run=4,
+                      qwen_tag_count_this_run=0, analysis_seconds=301.0),
+     4, fork_prep.ANALYSIS_INCOMPLETE),
+    ("3 of 4 Qwen jobs completed",
+     _analysis_result(qwen_completed_jobs_this_run=3, qwen_incomplete_jobs_this_run=1,
+                      qwen_tag_count_this_run=30), 4, fork_prep.ANALYSIS_INCOMPLETE),
+    # `source_count` is `len(existing)`, so a source that vanished between Scan and Analyze is a
+    # measured shortfall rather than something to be silently dropped.
+    ("two submitted sources no longer existed",
+     _analysis_result(sources_analyzed_this_run=2, qwen_jobs_this_run=2,
+                      qwen_completed_jobs_this_run=2, qwen_requested_count_this_run=20,
+                      qwen_tag_count_this_run=20, source_count=2),
+     4, fork_prep.ANALYSIS_INCOMPLETE),
+    ("the result is not a mapping at all", "not-a-dict", 4, fork_prep.ANALYSIS_UNKNOWN),
+    ("a required count is missing",
+     {key: value for key, value in _analysis_result().items()
+      if key != "qwen_incomplete_jobs_this_run"}, 4, fork_prep.ANALYSIS_UNKNOWN),
+    # `bool` subclasses `int`, the trap the Stage-5 count readers already record.
+    ("a count arrived as a bool", _analysis_result(qwen_incomplete_jobs_this_run=False),
+     4, fork_prep.ANALYSIS_UNKNOWN),
+    ("a count arrived as a float", _analysis_result(source_count=4.0),
+     4, fork_prep.ANALYSIS_UNKNOWN),
+    ("a count arrived as a numeric string", _analysis_result(qwen_jobs_this_run="4"),
+     4, fork_prep.ANALYSIS_UNKNOWN),
+    # Every submitted job starts incomplete and is promoted only by its own returned evidence, so
+    # a tally that does not add up is a payload nothing should be concluded from.
+    ("the job tally does not add up",
+     _analysis_result(qwen_jobs_this_run=4, qwen_completed_jobs_this_run=2,
+                      qwen_incomplete_jobs_this_run=1), 4, fork_prep.ANALYSIS_UNKNOWN),
+    ("the submitted count is not a count", _analysis_result(), None,
+     fork_prep.ANALYSIS_UNKNOWN),
+]
+
+
+@pytest.mark.parametrize("label,result,submitted,expected", _F3_RESULTS,
+                         ids=[case[0] for case in _F3_RESULTS])
+def test_the_analysis_verdict_is_read_from_the_structured_counts(
+        label, result, submitted, expected):
+    assert fork_prep.analysis_run_outcome(result, submitted) == expected, label
+
+
+def test_the_analysis_verdict_never_raises_on_anything_a_subprocess_could_produce():
+    """It runs on a finished pass's terminal path, so it is total by contract."""
+    hostile = [None, "", 0, [], (), object(), {"source_count": object()},
+               {"qwen_jobs_this_run": float("nan")},
+               _analysis_result(source_count=-1), _analysis_result(qwen_jobs_this_run=-2)]
+    for result in hostile:
+        assert fork_prep.analysis_run_outcome(result, 4) in fork_prep.ANALYSIS_OUTCOMES
+        assert fork_prep.analysis_run_outcome(result, None) in fork_prep.ANALYSIS_OUTCOMES
+
+
+@pytest.mark.parametrize("verdict,expected", [
+    (fork_prep.ANALYSIS_COMPLETE, dn.OUTCOME_SUCCESS),
+    (fork_prep.ANALYSIS_INCOMPLETE, dn.OUTCOME_PARTIAL),
+    (fork_prep.ANALYSIS_UNKNOWN, dn.OUTCOME_PARTIAL),
+    # An absent verdict, and one from a future vocabulary this build does not know.
+    (None, dn.OUTCOME_PARTIAL),
+    ("something_new", dn.OUTCOME_PARTIAL),
+])
+def test_an_analysis_pass_is_announced_from_its_verdict_and_never_cheerfully(
+        tmp_path, verdict, expected):
+    ns = _notify_namespace(tmp_path)
+    ns["_notify_library"](_Request("S1"), fork_prep_activity.OPERATION_ANALYZE, analysis=verdict)
+    record = _drained(ns, "S1")[0]
+    assert record["job"] == dn.JOB_LIBRARY_ANALYSIS
+    assert record["outcome"] == expected
+
+
+def test_a_scan_needs_no_analysis_verdict_and_is_still_a_plain_success(tmp_path):
+    """There is no Stage-5 batch for a Scan's verdict to be about; its faults arrive through
+    `failed`, exactly as before. So the two operations are asked different questions."""
+    ns = _notify_namespace(tmp_path)
+    ns["_notify_library"](_Request("S1"), fork_prep_activity.OPERATION_SCAN)
+    assert _drained(ns, "S1")[0]["outcome"] == dn.OUTCOME_SUCCESS
+
+
+def test_a_failed_analysis_pass_stays_a_failure_whatever_verdict_arrives(tmp_path):
+    """`record_failure`'s marker is the stronger statement: the pass did not finish at all."""
+    ns = _notify_namespace(tmp_path)
+    for verdict in (None, fork_prep.ANALYSIS_COMPLETE, fork_prep.ANALYSIS_UNKNOWN):
+        ns["_notify_library"](_Request("S1"), fork_prep_activity.OPERATION_ANALYZE,
+                              failed=True, analysis=verdict)
+    assert {record["outcome"] for record in _drained(ns, "S1")} == {dn.OUTCOME_FAILED}
+
+
+def test_the_analysis_verdict_reaches_no_cache_identity_or_persisted_record():
+    """The P2/D2 boundary: a notification verdict is ephemeral invocation metadata and must not
+    appear anywhere on the Stage-5 side."""
+    for relative in ("src/video_analysis.py",
+                     "src/auto_mode/stage5_qwen_scene_worker.py"):
+        with open(os.path.join(_REPO_ROOT, relative), "r", encoding="utf-8") as handle:
+            source = handle.read()
+        for forbidden in ("analysis_run_outcome", "ANALYSIS_COMPLETE", "ANALYSIS_INCOMPLETE",
+                          "ANALYSIS_UNKNOWN", "desktop_notify", "outcome_sink"):
+            assert forbidden not in source, (relative, forbidden)
+
+
+def test_the_verdict_classifier_names_no_cache_or_completion_rule():
+    """It reads the ephemeral `*_this_run` channel and nothing durable: no record is opened, no
+    completion rule is re-answered, and no cache constant is mentioned."""
+    tree = _tree(os.path.join(_REPO_ROOT, "src", "beatsync_fork", "library_prep.py"))
+    body = ast.unparse(_func(tree, "analysis_run_outcome"))
+    for forbidden in ("_load_cache", "_cache_path", "_cache_entry_is_complete",
+                      "CACHE_CONTRACT_VERSION", "ANALYSIS_VERSION", "open(", "json"):
+        assert forbidden not in body, forbidden
 
 
 def test_no_translator_can_produce_an_unsafe_envelope(tmp_path):
@@ -1077,6 +1436,92 @@ def test_the_publisher_has_exactly_the_six_translators_as_callers():
                        "_notify_cut_batch", "_notify_audio_cut", "_notify_library"}, callers
 
 
+def test_no_translator_can_raise_into_a_finished_jobs_terminal_path(tmp_path):
+    """`_notify_publish`'s broad guard protects the PUBLISHER. The six translators run *outside*
+    it, on a finished job's terminal path, so arithmetic or attribute access at that layer is what
+    could still cost a render its final frame -- which is why R17-A R2 put the folder batch's new
+    fold in `desktop_notify.total_count` rather than in `gui.py`.
+
+    Every translator is called here with values no shipped call site produces, because the point is
+    the property and not the reachability: a notification is a courtesy, and a job's result is not.
+    """
+    ns = _notify_namespace(tmp_path)
+    # Everything a count-bearing field could arrive as, including an unhashable value: these four
+    # translators do arithmetic, which is the layer R17-A R2 moved into `total_count`.
+    hostile = ("12", None, object(), float("nan"), -3, True, [], {})
+    for value in hostile:
+        ns["_notify_cut"](_Request("S1"), written=value, failed=value)
+        ns["_notify_cut"](_Request("S1"), written=value, crashed=True)
+        ns["_notify_cut"](_Request("S1"), written=value, cancelled=True)
+        ns["_notify_cut_batch"](_Request("S1"), fork_cutter_batch.TERMINAL_COMPLETED,
+                                completed=value, failed=value, no_clips=value, partial=value,
+                                cancelled=value, not_attempted=value, record_lost=value)
+        ns["_notify_cut_batch"](_Request("S1"),
+                                fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES,
+                                completed=value, failed=value, no_clips=value, partial=value)
+        ns["_notify_audio_cut"](_Request("S1"), written=value, failed=value)
+    # The two translators whose argument is a TYPED CLASS rather than a count are given the value
+    # space their producer can actually hand over: a `RenderOutcomeKind`, `None`, or -- if the
+    # producer were broken -- some other hashable token. An unhashable one is deliberately out of
+    # scope: both read it through a dict lookup, `session_state[RENDER_OUTCOME_KEY]` and
+    # `RenderBatchOutcome.outcome_kind` are the only sources, and guarding a lookup would add a
+    # name to `process_video_guarded`'s body, which three other suites freeze.
+    for value in ("12", None, object(), float("nan"), -3, True):
+        ns["_notify_render"](_Request("S1"), value, True)
+        ns["_notify_render_batch"](_Request("S1"), value)
+    for value in hostile:
+        ns["_notify_library"](_Request("S1"), fork_prep_activity.OPERATION_ANALYZE,
+                              analysis=value if isinstance(value, (str, type(None))) else None)
+        ns["_notify_library"](_Request("S1"), value if isinstance(value, str) else "",
+                              analysis=fork_prep.ANALYSIS_COMPLETE)
+    # ...and a request object whose attribute access itself raises.
+    ns["_notify_cut_batch"](_HostileRequest(), fork_cutter_batch.TERMINAL_COMPLETED,
+                            completed=1, failed=0, no_clips=0, partial=0)
+    ns["_notify_library"](_HostileRequest(), fork_prep_activity.OPERATION_ANALYZE,
+                          analysis=fork_prep.ANALYSIS_COMPLETE)
+    # Whatever survived is still safe text; nothing above was allowed to escape.
+    for record in _drained(ns, "S1"):
+        for field in ("title", "body"):
+            assert dn.is_safe_text(record[field]), record
+
+
+def test_the_analysis_verdict_is_published_structurally_and_read_after_the_join():
+    """The sink is written by the worker thread and read by the generator, so the `thread.join()`
+    is the happens-before. Reading it earlier would be a data race on a dict."""
+    tree = _tree(_GUI)
+
+    analyse = ast.unparse(_func(tree, "_prep_analyze_impl"))
+    assert "outcome_sink['analysis'] = fork_prep.analysis_run_outcome(result, len(subset))" \
+        in analyse, analyse
+    assert analyse.count("analysis_run_outcome") == 1
+    # It is published from the SUCCESS path only. A refusal and a fault return earlier, and those
+    # are already carried by `refused` and `failed`.
+    assert analyse.index("analysis_run_outcome") > analyse.index("analyze_video_sources(")
+
+    worker = _func(tree, "_run_prep_in_worker")
+    rendered = ast.unparse(worker)
+    assert "outcome_sink" in rendered
+    assert rendered.index("thread.join()") < rendered.index("outcome_sink or {}"), \
+        "the verdict must be read only after the worker has been joined"
+    # The sink is keyword-only with a plain `None` default on both, so every existing caller --
+    # including the suites that execute these bodies against a synthesised namespace -- is
+    # unchanged, and an absent sink reads as an absent verdict rather than as a success.
+    for name in ("_prep_analyze_impl", "_run_prep_in_worker"):
+        signature = _func(tree, name).args
+        sink = next((argument for argument in signature.args + signature.kwonlyargs
+                     if argument.arg == "outcome_sink"), None)
+        assert sink is not None, name
+
+    # And the dict belongs to the CLICK, not to the module: Scan and Analyze take no mutex, so two
+    # browser sessions genuinely overlap and a shared slot would let one describe the other's run.
+    click = ast.unparse(_func(tree, "_on_prep_analyze_click"))
+    assert "analysis_outcome: dict = {}" in click
+    assert click.count("outcome_sink=analysis_outcome") == 2, click
+    assert not any(isinstance(node, ast.Assign)
+                   and getattr(node.targets[0], "id", "").endswith("_OUTCOME_SINK")
+                   for node in ast.walk(tree)), "no module-level verdict slot may be introduced"
+
+
 def test_no_notification_is_published_from_a_finally_block():
     """An abandoned Gradio stream unwinds through `finally`, and abandonment is not a terminal
     outcome -- `.then()` does not run for an abandoned event either, so a record published there
@@ -1207,6 +1652,61 @@ def test_the_dispatcher_records_an_identity_before_it_sends_it():
     remember = installer.index("remember(item.id)")
     fire = installer.index("fire(String(item.title", remember)
     assert remember < fire, "the ledger write must precede the send"
+
+
+def test_the_dispatcher_also_guards_duplicates_WITHIN_one_envelope(tmp_path):
+    """R17-A R2. `remember` re-reads `localStorage` each time, so the durable ledger was always
+    right -- but the local snapshot taken one line above the loop was not, so two items carrying
+    the SAME id inside one envelope each passed the check and called the constructor.
+
+    The server cannot produce that: `_notify_publish` mints a fresh `uuid4` per terminal event, and
+    the half of this a Python test can execute is exactly that half. Asserted structurally for the
+    client, because there is no JavaScript engine in this suite -- live behaviour is the smoke's
+    job, and the rule records which of the two this is.
+    """
+    installer = _executable(_script("NOTIFY_JS"))
+    remember = installer.index("remember(item.id)")
+    push = installer.index("delivered.push(item.id)", remember)
+    fire = installer.index("fire(String(item.title", remember)
+    assert remember < push < fire, "the in-loop snapshot must be updated before the send"
+
+    # The server side of the same guarantee, executed: six terminal events, six distinct ids.
+    ns = _notify_namespace(tmp_path)
+    for _ in range(6):
+        ns["_notify_publish"](_Request("S1"), dn.JOB_RENDER, dn.OUTCOME_SUCCESS)
+    identities = [record["id"] for record in _drained(ns, "S1")]
+    assert len(identities) == len(set(identities)) == 6
+
+
+def test_the_test_notification_is_reachable_with_the_app_toggle_off(tmp_path):
+    """It is the operator's way of checking CHROME, so gating it on the BeatSync toggle would make
+    the one diagnostic in the panel useless in exactly the state they are trying to get out of.
+
+    It reads no setting and calls no server function, so the toggle cannot reach it: the whole
+    route is `NOTIFY_TEST_JS` -> `window.__bsNotify.test()` -> `fire(...)`, whose only gate is the
+    browser's own `granted`. Pinned so a later change cannot quietly make it conditional.
+    """
+    delegate = _executable(_script("NOTIFY_TEST_JS"))
+    assert "__bsNotify.test()" in delegate
+    installer = _executable(_script("NOTIFY_JS"))
+    test_body = installer[installer.index("test: ("):]
+    test_body = test_body[:test_body.index("\n")]
+    assert "fire(TEST_TITLE, TEST_BODY, TEST_TAG)" in test_body
+    for forbidden in ("desktop_notifications", "ENABLED_ON", "enabled", "_option"):
+        assert forbidden not in test_body, forbidden
+
+    # ...and the registration carries no server call, so nothing server-side can gate it either.
+    call = next(node for node in ast.walk(_tree(_GUI))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and ast.unparse(node.func) == "notify_test_btn.click")
+    kwargs = _kwargs(call)
+    assert kwargs["fn"] == "None" and kwargs["inputs"] == "[]" and kwargs["outputs"] == "[]"
+
+    # The server-side gate really is OFF in this fixture, and the ledger really is empty -- so a
+    # test notification cannot be mistaken for a delivered one.
+    ns = _notify_namespace(tmp_path, enabled=False)
+    assert ns["_notifications_enabled"]() is False
+    assert ns["_NOTIFY_PENDING"] == {}
 
 
 def test_the_duplicate_ledger_is_shared_across_tabs_and_bounded():

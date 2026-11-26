@@ -1880,7 +1880,16 @@ NOTIFY_JS = r"""
         // Recorded BEFORE it is sent, deliberately. Chrome, Windows or Focus Assist may refuse to
         // display it, and there is no retry path -- so recording first makes a second delivery
         // attempt for the same terminal event impossible, which is the invariant that matters.
+        //
+        // Recorded in BOTH ledgers, which is R17-A R2's one client-side correction. `remember`
+        // re-reads `localStorage` each time, so the durable ledger was always right; the local
+        // snapshot taken one line above the loop was not, so two items carrying the SAME id inside
+        // one envelope each passed the check and called the constructor. The server cannot produce
+        // that -- `_notify_publish` mints a fresh `uuid4` per terminal event -- but "exactly one
+        // `new Notification()` per terminal event" is this dispatcher's own guarantee about the
+        // payload it is handed, and it should not rest on a property of the other side.
         remember(item.id);
+        delivered.push(item.id);
         fire(String(item.title || ""), String(item.body || ""), String(item.tag || item.id));
       });
       paint();
@@ -5775,14 +5784,33 @@ def _on_notifications_enabled_change(enabled):
 
     Switching this on asks Chrome for nothing. A permission prompt comes only from the explicit
     button, which is what the accepted scope requires of a user gesture.
+
+    **A write that changes nothing writes nothing** (R17-A R2, finding F2). Gradio's `.change` is
+    documented to fire for a *function update* as well as for a user gesture -- `.input` is the
+    user-only listener -- and this component has two legitimate programmatic writers:
+    `_notify_settings_on_load`, which corrects the checkbox for every new browser session, and
+    Reset defaults, which clears it. Without this guard both of them re-entered here: the page load
+    rewrote `preferences.json` and raised an "ON" toast for a tab the operator had only just
+    opened, and Reset produced a second save and a second toast on top of its own. Neither is a
+    change, and reporting one is a report of something that did not happen.
+
+    The comparison is on the resolved booleans rather than on the stored string, so a hand-edited
+    or corrupt value -- which `is_enabled` reads as off, the direction this setting must fail in --
+    is not rewritten by a programmatic echo of the off state it already means. `.change` is
+    deliberately **kept** rather than swapped for `.input`: the collision-policy radio two
+    registrations away uses `.change` for exactly this reason (Reset writes it too), and a
+    listener swap would have put the operator's own toggle on an event this repository has not
+    measured against the pinned `gradio==6.19.0`.
     """
     resolved = fork_notify.option_value(enabled)
+    on = fork_notify.is_enabled(resolved)
+    if on == _notifications_enabled():
+        return fork_notify.app_setting_sentence(on)
     _FOLDER_OPTIONS[fork_prefs.DESKTOP_NOTIFICATIONS] = resolved
     # The WHOLE option set, not just this key. `save_preferences` replaces the file, and fills any
     # option key the caller omits with its built-in default -- so passing one key would silently
     # reset the collision policy, and vice versa.
     failure = fork_prefs.save_preferences(PREFS_PATH, _FOLDER_PREFS, dict(_FOLDER_OPTIONS))
-    on = fork_notify.is_enabled(resolved)
     if failure:
         gr.Warning(f"{failure} The choice applies to this session only.")
     else:
@@ -5874,7 +5902,12 @@ def _notify_cut(request, *, written=None, failed=None, cancelled=False, crashed=
     if cancelled:
         outcome = fork_notify.OUTCOME_CANCELLED
     elif crashed:
-        outcome = (fork_notify.OUTCOME_PARTIAL if (written or 0) > 0
+        # [FORK] Digital-Union (R17-A R2): the count is read through the pure module's total
+        # reader rather than by `(written or 0) > 0`, which raised `TypeError` on anything that
+        # was not a number. No shipped call site can produce one -- both pass a `len()` or a
+        # `sum()` -- but this runs on a crashed job's terminal path, OUTSIDE `_notify_publish`'s
+        # guard, so it is the one layer where a courtesy could still cost a job its final frame.
+        outcome = (fork_notify.OUTCOME_PARTIAL if fork_notify.total_count(written) > 0
                    else fork_notify.OUTCOME_FAILED)
     else:
         outcome = fork_notify.outcome_from_counts(written, failed)
@@ -5882,36 +5915,82 @@ def _notify_cut(request, *, written=None, failed=None, cancelled=False, crashed=
                     completed=written, failed=failed)
 
 
-#: The Raw Cutter batch's own `TERMINAL_*` vocabulary -> one of the four notification outcomes. A
-#: FIFTH rendering of the one classifier the headline, the manifest, the activity panel and the
-#: handoff record already share, so none of the five can describe the same batch differently.
+#: The two `TERMINAL_*` classes that describe the **RUN** rather than its sources, translated
+#: directly because counts cannot express either: a cancelled batch's counts say how far it got
+#: rather than what it achieved, and a crashed batch's say what had been done when it stopped.
 #:
-#: A missing key is a run that never started, and `_notify_cut_batch` sends nothing for it -- the
-#: same reading `_CUT_BATCH_ACTIVITY`'s missing key gets, and deliberately NOT spelled as a
-#: cancellation.
-_CUT_BATCH_NOTIFY_OUTCOMES = {
-    fork_cutter_batch.TERMINAL_COMPLETED: fork_notify.OUTCOME_SUCCESS,
-    fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: fork_notify.OUTCOME_PARTIAL,
+#: This is the same split `_notify_render_batch` already applies to the Variant Lab batch --
+#: cancellation from the typed class, everything else from the measured counts.
+_CUT_BATCH_RUN_OUTCOMES = {
     fork_cutter_batch.TERMINAL_CANCELLED: fork_notify.OUTCOME_CANCELLED,
     fork_cutter_batch.TERMINAL_FAILED: fork_notify.OUTCOME_FAILED,
 }
 
+#: The two `TERMINAL_*` classes that mean "the batch ran to the end of its frozen list". Both are
+#: **folded from the measured per-source counts** rather than translated, and that is R17-A R2
+#: finding F1.
+#:
+#: `terminal_status` answers `completed_with_failures` for *any* failed source, which is exactly
+#: right for the headline (a batch with a failed source is a qualified run) and wrong for a
+#: notification outcome: a batch whose EVERY source failed arrives here too, and the shipped table
+#: announced it as `finished with problems`. Measured on the real classifier -- three unreadable
+#: sources, `0 completed, 3 failed`, no clips on disk -- that is the cheerful reading of a total
+#: loss, and `desktop_notify.outcome_from_counts` exists precisely to refuse it. So the counts
+#: decide, through the same pure fold the Variant Lab batch and the Audio Cutter use.
+_CUT_BATCH_RAN_TO_END = frozenset({
+    fork_cutter_batch.TERMINAL_COMPLETED,
+    fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES,
+})
+
 
 def _notify_cut_batch(request, terminal, *, completed=None, failed=None,
-                      cancelled=None, not_attempted=None) -> None:
+                      cancelled=None, not_attempted=None, no_clips=None,
+                      partial=None, record_lost=False) -> None:
     """One notification for a finished Raw Cutter folder batch -- one for the BATCH.
 
-    `terminal` is the batch's own terminal status string, so the classification comes from the
-    batch module's pure classifier and not from this one; the counts come from the same
-    `summarise` fold the manifest, the bar and the summary are built from.
+    `terminal` is the batch's own terminal status string, so **which rule applies** comes from the
+    batch module's pure classifier and never from this one; the counts come from the same
+    `summarise` fold the manifest, the bar, the summary and the handoff record are built from.
 
     An unrecognised or absent terminal status sends **nothing**. A batch refused before admission,
     or refused before it obtained an output directory, never started -- so it has no outcome to
     announce, and announcing one would be the opposite of what this feature is for. That is the
     same reading the activity panel's missing key gets, and it is deliberately not a cancellation.
+
+    **What counts as "this source went right" is three outcomes, not one** (R17-A R2, F1). A naive
+    `outcome_from_counts(completed, failed)` would have introduced two new misreports of its own,
+    both measured against the real classifier:
+
+    * `no_clips` -- a source that was read and planned successfully and genuinely has nothing worth
+      exporting is a real answer about the footage, not a failure. Two such sources plus one
+      unreadable one folded to `0 completed, 1 failed` and would have been announced as a FAILURE
+      of a run that mostly worked.
+    * `partial` -- a source that exported some of its clips and lost the rest is counted in
+      `failed` and in neither `completed` nor `no_clips`, so a single-source batch that put 7 of 10
+      clips on disk would have been announced as a FAILURE while its clips sat in the output
+      folder. It contributes to **both** sides, which is the same reading `_notify_cut` gives a
+      crash that nevertheless left clips behind, and the same reading `summarise` itself gives it.
+
+    The sum is folded by `desktop_notify.total_count`, not here: a translator runs outside
+    `_notify_publish`'s guard, so arithmetic at this call site is arithmetic that could cost a
+    finished batch its terminal frame.
+
+    **`record_lost` is the fifth rendering agreeing with the other four** (R17-A R2, F1). A batch
+    whose every source succeeded but whose authoritative record never reached disk is not a clean
+    success: the headline says `Batch finished but the record was lost`, the activity panel says
+    PARTIAL/FAILED, and the summary has always disclosed it -- while the notification said
+    `finished`. It qualifies a SUCCESS and nothing else, mirroring the panel's own override, which
+    fires only when the tone was otherwise `done`: a run already folding to partial, failed or
+    cancelled keeps the outcome its sources earned.
     """
-    outcome = _CUT_BATCH_NOTIFY_OUTCOMES.get(terminal)
-    if outcome is None:
+    if terminal in _CUT_BATCH_RUN_OUTCOMES:
+        outcome = _CUT_BATCH_RUN_OUTCOMES[terminal]
+    elif terminal in _CUT_BATCH_RAN_TO_END:
+        outcome = fork_notify.outcome_from_counts(
+            fork_notify.total_count(completed, no_clips, partial), failed)
+        if outcome == fork_notify.OUTCOME_SUCCESS and record_lost:
+            outcome = fork_notify.OUTCOME_PARTIAL
+    else:
         return
     _notify_publish(request, fork_notify.JOB_RAW_CUTTER_BATCH, outcome,
                     completed=completed, failed=failed,
@@ -5949,7 +6028,28 @@ _PREP_NOTIFY_JOBS = {
 }
 
 
-def _notify_library(request, operation, *, failed=False, refused=False) -> None:
+#: `library_prep`'s own analysis verdict -> one of the four notification outcomes (R17-A R2,
+#: finding F3). A FOURTH rendering of a classification the preparation module owns, exactly as the
+#: cutter batch's table is a rendering of `terminal_status`.
+#:
+#: `incomplete` and `unknown` share a verb on purpose, and the tokens are still separate on purpose.
+#: They are different *facts* -- "some of the work provably did not complete" against "this payload
+#: cannot be read" -- and `library_prep` keeps them apart so a future reader can. What they share is
+#: the only honest thing a four-word toast can say about either: `finished with problems`, whose
+#: body sends the operator to the panel that has the real numbers. Reporting an unreadable payload
+#: as a FAILURE would claim a fault nobody measured, and reporting it as a SUCCESS is the exact
+#: thing the accepted scope forbids.
+#:
+#: A missing key -- including an absent verdict -- resolves to PARTIAL at the call site below rather
+#: than to success.
+_PREP_ANALYSIS_NOTIFY_OUTCOMES = {
+    fork_prep.ANALYSIS_COMPLETE: fork_notify.OUTCOME_SUCCESS,
+    fork_prep.ANALYSIS_INCOMPLETE: fork_notify.OUTCOME_PARTIAL,
+    fork_prep.ANALYSIS_UNKNOWN: fork_notify.OUTCOME_PARTIAL,
+}
+
+
+def _notify_library(request, operation, *, failed=False, refused=False, analysis=None) -> None:
     """One notification for a finished Library scan or analysis pass.
 
     `failed` and `refused` are the structural verdicts the terminal panel itself is rendered from --
@@ -5963,12 +6063,31 @@ def _notify_library(request, operation, *, failed=False, refused=False) -> None:
 
     Counts are deliberately absent: a preparation pass reports how many sources it classified in
     its own panel, and repeating a figure here would be a second place for it to be wrong.
+
+    **`analysis` is why this is no longer a two-way answer** (R17-A R2, finding F3). Those two
+    verdicts tell a run that *could not start* from one that *broke*, and nothing else -- so a pass
+    whose shared Qwen worker died, burning real GPU minutes and caching nothing, returned normally,
+    produced no failure marker, and was announced as `Library analysis finished`. It is
+    `library_prep.analysis_run_outcome`'s reading of the analyzer's own `*_this_run` counts, and it
+    is deliberately **not** read off the rendered report: the summary is prose for a human, and this
+    repository does not derive an outcome class from a status string.
+
+    **An analysis pass with no verdict is UNKNOWN, never a success.** A Scan legitimately has none
+    -- there is no Stage-5 batch for it to be a verdict about, and its own faults arrive through
+    `failed` -- so the two operations are asked different questions here. For the analysis pass an
+    absent verdict means the publish point was never reached with one, which is precisely the case
+    that must not be announced cheerfully.
     """
     job_kind = _PREP_NOTIFY_JOBS.get(operation)
     if job_kind is None or refused:
         return
-    _notify_publish(request, job_kind,
-                    fork_notify.OUTCOME_FAILED if failed else fork_notify.OUTCOME_SUCCESS)
+    if failed:
+        outcome = fork_notify.OUTCOME_FAILED
+    elif job_kind == fork_notify.JOB_LIBRARY_ANALYSIS:
+        outcome = _PREP_ANALYSIS_NOTIFY_OUTCOMES.get(analysis, fork_notify.OUTCOME_PARTIAL)
+    else:
+        outcome = fork_notify.OUTCOME_SUCCESS
+    _notify_publish(request, job_kind, outcome)
 
 
 def _notify_settings_on_load():
@@ -6705,7 +6824,21 @@ def _prep_scan_impl(folder_path: str, recursive: bool, state,
 
 
 def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
-                       console_logger: StageConsoleLogger | None = None):
+                       console_logger: StageConsoleLogger | None = None,
+                       # [FORK] Digital-Union (R17-A R2, finding F3): where this run's STRUCTURAL
+                       # outcome is published for the notification layer. Keyword-only with a plain
+                       # `None` default, so every existing caller -- including the suites that call
+                       # this body positionally against a synthesised namespace -- is unchanged.
+                       #
+                       # A plain dict of primitives, written once on the success path and read only
+                       # after `_run_prep_in_worker` has joined the worker thread, so the join is
+                       # the happens-before and no lock is needed. It is the same `sink` shape
+                       # `_on_cut_batch_run` already uses to publish a terminal class structurally,
+                       # and for the same reason: the return value is a `PrepSessionState`, whose
+                       # fields the UI panels read, and a per-run verdict is not a field of the
+                       # preparation state machine. Putting one there would have to be cleared by
+                       # every other transition or it would outlive its run.
+                       outcome_sink=None):
     """Analyze one bounded batch of the subset the recorded scan classified as needing work.
 
     `live` is the preparation controls as the widgets declare them at click time, and checking it
@@ -6768,6 +6901,13 @@ def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
             state, f"PREPARATION ANALYSIS FAILED\n{exc}", notice="Preparation run failed.")
 
     _stage5_summary(console_logger, result if isinstance(result, dict) else None)
+    # [FORK] Digital-Union (R17-A R2, finding F3): the structural verdict, from the analyzer's own
+    # current-run counts and the submission this function itself made. Published here rather than
+    # derived from the summary text below, because the summary is prose for a human and this
+    # repository does not read an outcome class out of one. `analysis_run_outcome` is total and
+    # cannot raise, so this cannot cost the run its report.
+    if outcome_sink is not None:
+        outcome_sink['analysis'] = fork_prep.analysis_run_outcome(result, len(subset))
     return fork_prep.record_analysis_complete(
         state, fork_prep.summarize_analysis_run(result, submitted=len(subset)))
 
@@ -6780,7 +6920,13 @@ def _run_prep_in_worker(work, state, *,
                         # arguments of `_prep_ui_updates` are: this function is AST-extracted and
                         # executed against synthesised namespaces, so a default that evaluated a
                         # module attribute would fail at definition time.
-                        request=None) -> Iterator[Tuple]:
+                        request=None,
+                        # [FORK] Digital-Union (R17-A R2, finding F3): the dict `work` publishes
+                        # this run's structural outcome into, threaded in from whichever handler
+                        # owns it. Keyword-only with a plain `None` default for the same reason.
+                        # Read once, in the terminal frame, AFTER `thread.join()` -- so the join
+                        # is the happens-before and this generator acquires no lock.
+                        outcome_sink=None) -> Iterator[Tuple]:
     """Run one preparation step on a worker thread, streaming structured progress to the UI.
 
     Same shape as `process_video`, and for the same reasons: the pipeline prints to a stdout the GUI
@@ -6932,7 +7078,14 @@ def _run_prep_in_worker(work, state, *,
     # the panel are two readings of one classification. Reached only when the stream ran to
     # completion, exactly like the terminal frame: nothing is yielded from a `finally` here, so an
     # ABANDONED event announces nothing, which is the behaviour an abandoned stream must have.
-    _notify_library(request, operation, failed=failed, refused=refused)
+    #
+    # [FORK] Digital-Union (R17-A R2, finding F3): plus the analysis pass's own structural verdict,
+    # which those two cannot express -- a run whose Qwen jobs did not complete produced no failure
+    # marker and is not a refusal. Read AFTER the join above, so the worker's write to the sink is
+    # ordered before this read. An absent verdict stays absent: `_notify_library` reads it as
+    # unknown for an analysis pass, never as a success.
+    _notify_library(request, operation, failed=failed, refused=refused,
+                    analysis=(outcome_sink or {}).get('analysis'))
     yield _prep_ui_updates(
         final_state,
         status=fork_prep_activity.terminal_status(failed=failed, refused=refused),
@@ -8431,6 +8584,16 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     # backfill it would read zero, so the wrapper derives it from `total` less
                     # `attempted` instead of from a value that is true only sometimes.
                     failed=totals.failed, cancelled=totals.cancelled,
+                    # [FORK] Digital-Union (R17-A R2, finding F1): two more values from the same
+                    # fold, for the same cost. They are what lets the notification tell a total
+                    # loss from a partial one: `no_clips` is a source that was read correctly and
+                    # genuinely had nothing worth exporting, and `partial` is a source that put
+                    # some clips on disk and lost the rest. Both are already in `summarise`'s
+                    # answer and in the summary text; neither was reachable by the one reading of
+                    # this batch that had only `completed` and `failed`. Correct at every call
+                    # site including the pre-backfill one, by the same equivalence argument: a
+                    # `not_attempted` row is in neither `no_clips` nor `partial`.
+                    no_clips=totals.no_clips, partial=totals.partial,
                     **extra)
 
     def finalise(is_cancelled, fatal=''):
@@ -8917,9 +9080,17 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     # `total` less the sources whose outcome was recorded, which is what a cancellation at a source
     # boundary leaves behind. A ledger write only: it changes nothing about this frame, and a run
     # with no terminal class sends nothing.
+    #
+    # [FORK] Digital-Union (R17-A R2, finding F1): `no_clips` and `partial` ride along from the
+    # same `summarise` fold, so a run whose every source failed is announced as a FAILURE while a
+    # run that merely had nothing worth exporting is not. `record_lost` is the *same* condition the
+    # headline override above tested two statements ago -- read from the sink rather than from the
+    # local `tone`, so the two readings share a fact and not a variable.
     _notify_cut_batch(request, sink.get('terminal'),
                       completed=sink.get('completed'), failed=sink.get('failed'),
                       cancelled=sink.get('cancelled'),
+                      no_clips=sink.get('no_clips'), partial=sink.get('partial'),
+                      record_lost=bool(sink.get('manifest_error')),
                       not_attempted=max(0, int(sink.get('total') or 0)
                                         - int(sink.get('finished') or 0)))
     # Both timers freeze here: the panel is emitted with `data-running="0"`, which is what stops
@@ -8990,13 +9161,22 @@ def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
     # declaration describes the *classification* (folder, recursive), and a batch-size change must
     # never be read as "the scan no longer describes what the user is declaring".
     live = fork_prep.LivePrepDeclaration.from_widgets(folder_path, recursive)
+    # [FORK] Digital-Union (R17-A R2, finding F3): one plain dict, owned by this click and shared
+    # with nothing else, through which the worker publishes this run's structural outcome and the
+    # terminal frame reads it. Per-click rather than a module-level slot, deliberately: Scan and
+    # Analyze take no mutex, so two browser sessions can genuinely overlap and a shared slot would
+    # let one session's verdict describe the other's run -- the same mistake UX-PREP-ACTIVITY R2
+    # corrected for `_prep_phase`. It holds primitives only; nothing live may enter it.
+    analysis_outcome: dict = {}
     yield from _run_prep_in_worker(
         lambda event_callback, console_logger: _prep_analyze_impl(
             state, live, batch_size,
-            event_callback=event_callback, console_logger=console_logger),
+            event_callback=event_callback, console_logger=console_logger,
+            outcome_sink=analysis_outcome),
         state,
         operation=fork_prep_activity.OPERATION_ANALYZE,
         request=request,
+        outcome_sink=analysis_outcome,
     )
 
 
@@ -11480,18 +11660,48 @@ def _on_reset_folder_prefs():
     [FORK] R8 appends the Render output box to the cleared set and returns the collision policy
     to its default. The tuple grew by two and its ORDER matches the registration's `outputs`
     positionally, as every return on this handler must.
+
+    [FORK] Digital-Union (R17-A R2, finding F2): and it now writes the desktop-notification
+    checkbox and the sentence beside it. `empty_options()` returns that option to `off` in the file
+    **and** in `_FOLDER_OPTIONS`, which is what the delivery gate reads -- so before this, pressing
+    Reset defaults with notifications ON left the panel saying "Desktop notifications are ON in
+    BeatSync" over an application that would send nothing. A panel whose whole job is to state what
+    the application will do must not be the thing that is wrong about it, which is the same reason
+    `_notify_settings_on_load` exists.
+
+    Both values come from `_notify_settings_on_load()` rather than from two literals, so there is
+    one reader of this setting and no second place for it to disagree. That also makes the
+    **persistence-failure** path correct for free: a failed save leaves `_FOLDER_OPTIONS`
+    untouched, so the pair reports the state that is genuinely still in force instead of the
+    cleared state the operator was told could not be saved.
+
+    (The nine folder boxes and the collision radio are returned cleared on that failure path too,
+    which they were before this change and which is not accurate -- nothing was cleared. It is a
+    pre-existing R8 reporting inaccuracy in a different subsystem, it makes no claim about what the
+    application will *do*, and it is deliberately left for a separate decision rather than widened
+    into this one.)
     """
     failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences(),
                                           fork_prefs.empty_options())
     if failure:
+        # Read BEFORE the in-memory update below is reached, which on this path it never is -- so
+        # the pair describes the setting that is genuinely still in force.
+        notify_toggle, notify_sentence = _notify_settings_on_load()
         return ('', '', '', '', '', '', '', '', '',
-                fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY], f"❌ {failure}")
+                fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
+                notify_toggle, notify_sentence, f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
     _FOLDER_OPTIONS.update(fork_prefs.empty_options())
+    # ...and AFTER it here, so the pair describes the cleared state the file now holds. Unpacked
+    # into two locals rather than concatenated into the tuple, so both returns stay FLAT tuples of
+    # one value per output -- `tests/test_audio_preview_tab.py` reads that arity structurally, and
+    # Gradio matches `outputs` by position.
+    notify_toggle, notify_sentence = _notify_settings_on_load()
     # [FORK] R8 Owner Fixes (P2): composed like every other status write, so a reset cannot leave
     # a warning behind that describes the settings it has just cleared.
     return ('', '', '', '', '', '', '', '', '',
             fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
+            notify_toggle, notify_sentence,
             _folder_prefs_status("✅ Defaults cleared. No folder or file was deleted."))
 
 
@@ -16256,6 +16466,15 @@ def create_ui() -> gr.Blocks:
                      # returns to its default. Both are APPENDED before the status box, and the
                      # handler's return tuple matches this order positionally.
                      pref_render_output, pref_collision,
+                     # [FORK] Digital-Union (R17-A R2, finding F2): appended after those, for the
+                     # same reason again, and still before the status box. Reset returns the
+                     # notification option to `off` in the file AND in `_FOLDER_OPTIONS`, so the
+                     # checkbox and the sentence beside it have to follow or the panel states a
+                     # setting the delivery gate is not using. `notify_status` -- the live
+                     # browser-permission line -- is deliberately absent: the page owns it, the
+                     # server cannot know it, and clearing a saved folder default changes nothing
+                     # about what Chrome allows.
+                     notify_enabled, notify_app_state,
                      pref_status],
         )
 

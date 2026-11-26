@@ -20,6 +20,70 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-26 (R17-A R2: three outcome-accuracy defects in the notification layer)
+
+R17-A's own rule is *"do not announce success while the result is unknown"*. A focused review of
+PR #112 found three of its seven job families breaking it. All three fixes are in the **translation**
+layer: no job's result, progress, cancellation or concurrency behaviour changed, no event source,
+component, `inputs` or `outputs` list was added, and `CACHE_CONTRACT_VERSION` / `ANALYSIS_VERSION`
+are untouched.
+
+* **A Raw Cutter folder batch whose every source failed announced `finished with problems`.**
+  `raw_cutter_batch.terminal_status` answers `completed_with_failures` for *any* failed source —
+  correct for the headline, wrong for an outcome, and a batch of three unreadable files with no
+  clips on disk arrived there too. Its four terminal classes now split: `cancelled` and `failed`
+  describe the **run** and stay translated; `completed` and `completed_with_failures` mean the run
+  reached the end of its frozen list and are **folded from the measured counts**. `no_clips` and
+  `partial` ride out of the same `summarise` fold, so a run that merely found nothing worth
+  exporting is not reported as a failure either, and a source that put 7 of 10 clips on disk still
+  counts on both sides. A clean batch whose **authoritative record could not be written** is now
+  qualified too — the headline, the activity panel and the summary all said the record was lost
+  while the notification alone said `finished`.
+* **Reset defaults left the Settings panel stating a setting the application was not using.**
+  `user_prefs.empty_options()` returns the toggle to `off` in `preferences.json` **and** in the
+  in-memory options the delivery gate reads, while the handler wrote neither the checkbox nor the
+  sentence beside it. Both are now written, from `_notify_settings_on_load()`, which also makes the
+  persistence-failure path report the setting that is genuinely still in force.
+* **…and a programmatic component write was persisting itself.** Gradio's `.change` fires for a
+  function update as well as a user gesture, so `_notify_settings_on_load` — which corrects the
+  checkbox for every new browser session — re-entered the save handler: **opening a tab rewrote
+  `preferences.json` and raised an "ON" toast for a page the operator had only just loaded.** The
+  handler now returns early when the resolved boolean already matches the stored one. `.change` is
+  kept rather than swapped for `.input`, exactly as `pref_collision.change` is.
+* **A library analysis pass whose shared Qwen worker died announced `Library analysis finished`.**
+  Real GPU minutes, nothing cached, no exception — and therefore no failure marker for
+  `library_prep.is_failure_report` to recognise. The new `library_prep.analysis_run_outcome` reads
+  the analyzer's own current-run counts (`qwen_incomplete_jobs_this_run`, the job tally, and
+  `source_count` against what was submitted) and answers `complete` / `incomplete` / `unknown`;
+  the last two are both reported as `finished with problems`, and **an absent or unrecognised
+  verdict is never a success**. It travels in a caller-owned sink written on the success path and
+  read after the worker thread is joined — no new field on `PrepSessionState`, no write path, no
+  second analyzer call, no record read.
+
+Two smaller corrections found while verifying the above:
+
+* **Two items sharing an id inside one envelope each called the `Notification` constructor.** The
+  dispatcher's `delivered` snapshot was read once before the loop and never updated, so only the
+  durable `localStorage` ledger was right. Measured in Chrome against the pre-fix script: **3**
+  constructor calls where the shipped one makes **2**.
+* **`_notify_cut`'s crashed branch could raise into a finished job's terminal path.** It compared
+  `(written or 0) > 0`, outside `_notify_publish`'s guard. Translator arithmetic now goes through
+  the pure, total `desktop_notify.total_count`, and a property test exercises every shipped
+  translator with values no call site produces.
+
+**Verified at runtime on real media** through an isolated instance whose preferences *and* Stage-5
+record store were redirected into a task workspace — the owner's `state/preferences.json`, both
+analysis caches, `input/processing`, `input/gradio_uploads` and `output/` all measured unchanged:
+a real failed folder batch announcing **failed**; real successful and **cancelled** batches
+announcing truthfully; a real **incomplete** analysis announcing `finished with problems`; Reset and
+a page load each leaving `preferences.json` byte-identical. Separately and headless, one short
+render published **200 of 200 planned frames** at 8.000000 s against 8.000000 s of audio and decoded
+clean. Whole suite: **11 398 passed, 25 skipped**.
+
+**Still not claimed:** an OS-visible Windows toast. Chrome's permission for the origin is `default`
+and granting it needs a human click on browser UI automation cannot reach, so everything up to and
+including the constructor call is verified and whether Windows drew a toast is not.
+
 ### Added — 2026-11-26 (R17-A: optional desktop notifications when a long job finishes)
 
 One Windows desktop notification, through the already-open Chrome tab, when an **authoritative**

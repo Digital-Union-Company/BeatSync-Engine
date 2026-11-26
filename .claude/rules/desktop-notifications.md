@@ -35,10 +35,10 @@ Seven event sources, all of them places where the server already holds a reliabl
 | Music video render | `process_video_guarded`, beside `lifecycle.mark_terminal` | `session_state[RENDER_OUTCOME_KEY]` |
 | Variant Lab batch | `render_selected_variants_guarded`, after `RenderBatchOutcome` is built | that object's candidate records |
 | Raw Cutter (single) | the three terminal yields of `_on_cut_run` | the `done`/`failed`/`completed` lists |
-| Raw Cutter (folder batch) | `_on_cut_batch_run_ui`'s terminal frame | `sink['terminal']` + the `summarise` fold |
+| Raw Cutter (folder batch) | `_on_cut_batch_run_ui`'s terminal frame | `sink['terminal']` chooses the *rule*; for the two "ran to the end" classes the `summarise` fold then decides (R2 / F1) |
 | Audio Cutter | `_on_audio_cut`'s export terminal + its three post-analysis failures | `written`/`failures` |
 | Library scan | `_run_prep_in_worker`'s terminal frame | `is_failure_report` / `REFUSAL_NOTICE` |
-| Library analysis (Stage 5) | the same frame, told apart by `operation` | the same two verdicts |
+| Library analysis (Stage 5) | the same frame, told apart by `operation` | those two **plus** `library_prep.analysis_run_outcome` over the analyzer's `*_this_run` counts (R2 / F3) |
 
 **Scoped by real job lifecycle, never by a timer, a guessed duration or "the FFmpeg process
 disappeared".** And deliberately absent:
@@ -170,6 +170,28 @@ regression the moment there were two: `_on_collision_policy_change` and `_on_sav
 both corrected, and a test pins that every `save_preferences` call with an options argument passes
 `dict(_FOLDER_OPTIONS)`, `options` or `empty_options()`.
 
+**…and every option *reader on screen* must follow a write it did not make (R2 / F2).** Reset
+defaults writes `empty_options()`, which returns this option to `off` in the file **and** in
+`_FOLDER_OPTIONS` — the dictionary the delivery gate reads — while writing neither the checkbox nor
+the sentence. So pressing it with notifications ON left the panel saying *"Desktop notifications
+are ON in BeatSync"* over an application that would send nothing: the same class of defect
+`_notify_settings_on_load` exists to prevent, from the other direction. `pref_reset_btn.click` now
+writes `notify_enabled` and `notify_app_state`, both from `_notify_settings_on_load()` rather than
+from literals, which also makes the **persistence-failure** path right for free — a failed save
+leaves `_FOLDER_OPTIONS` untouched, so the pair reports what is still in force.
+
+**A programmatic write that changes nothing writes nothing (R2 / F2).** Gradio's `.change` fires
+for a *function update* as well as a user gesture (`.input` is the user-only listener), and this
+component has two legitimate programmatic writers — `_notify_settings_on_load` and now Reset. Both
+re-entered `_on_notifications_enabled_change`, so **opening a tab rewrote `preferences.json` and
+raised an "ON" toast for a page the operator had only just loaded**. The handler now returns early
+when the resolved boolean already equals the stored one. `.change` is deliberately **kept**: the
+collision-policy radio two registrations away uses it for exactly this reason (Reset writes that
+too), and swapping the operator's own toggle onto an event this repository has not measured against
+the pinned `gradio==6.19.0` would be a worse trade than a three-line guard. The comparison is on
+the resolved booleans, so a hand-edited value — which `is_enabled` reads as off — is not rewritten
+by an echo of the off state it already means.
+
 ## Content: no caller may supply text
 
 `build(job_kind, outcome, *, notification_id, counts=None)` takes a job-kind token, an outcome token
@@ -190,9 +212,22 @@ that reads as a path, a URL or a log line.
   `cancelled`. A batch where every item failed is a **failure**, not a partial — calling it partial
   would be the cheerful reading of a total loss. Cancellation wins over everything, because a
   stopped job's counts describe how far it got rather than what it achieved.
+
+  **R2 / F1: the Raw Cutter folder batch did not obey that rule, and now does.** It was the one
+  job family whose outcome was *translated* from a terminal class rather than folded from counts,
+  and `terminal_status` answers `completed_with_failures` for **any** failed source — so a batch of
+  three unreadable files, `0 completed, 3 failed`, nothing on disk, announced `finished with
+  problems`. See *R2* below for the split that replaced the table.
 - **The batch's own `outcome_kind` supplies only cancellation.** It is deliberately `None` for a
   batch that executed its whole selection even with local failures, so reading it would report one
   success and one failure as an unqualified success. Counts come from the candidate records.
+- **`total_count` is where a translator's arithmetic lives, not the call site.** Summing two or
+  three subsystem counts into one "this went right" tally is a thing several translators need; it
+  is done once, in the pure module, where a value it cannot read is dropped rather than raising. A
+  translator runs on a finished job's terminal path **outside** `_notify_publish`'s guard, so
+  arithmetic there is arithmetic that could cost a finished job its final frame — which is not a
+  hypothetical: R2 found `_notify_cut`'s crashed branch doing `(written or 0) > 0`, and a
+  property test over every shipped translator is what found it.
 
 ## The browser half
 
@@ -237,6 +272,107 @@ other four are one-line delegates, so no registration can grow a second interpre
   whenever a click produced no terminal event, so "no notification on page load" and "no
   notification for a refused click" are structural rather than checks that could be forgotten.
 
+## R2: three outcome-accuracy findings, and the one client-side correction
+
+R17-A's own rule was *"do not announce success while the result is unknown"*, and three of its seven
+job families did not obey it. All three are **translation** defects: nothing about a job's result,
+progress, cancellation or concurrency changed, and no new event source, component or `outputs` list
+appeared.
+
+**F1 — the Raw Cutter folder batch.** Its four `TERMINAL_*` classes now split two ways instead of
+feeding one table:
+
+```
+_CUT_BATCH_RUN_OUTCOMES   CANCELLED, FAILED      translated: counts cannot express either
+_CUT_BATCH_RAN_TO_END     COMPLETED, …WITH_FAILURES   folded from the measured counts
+unrecognised / absent     -> nothing, as before (a run that never started)
+```
+
+A test asserts the two sets **partition** the batch module's own vocabulary, so a new terminal class
+cannot fall silently into the `return` branch that means "never started".
+
+**What counts as "this source went right" is three outcomes, not one**, and each was measured
+against the real classifier rather than reasoned about:
+
+| contributes to | why |
+|---|---|
+| `completed` | obvious |
+| `no_clips` | read and planned successfully, genuinely nothing worth exporting — a real answer about the footage. Without it, two such sources plus one unreadable one folded to `0 completed, 1 failed` and would have been announced as a FAILURE of a run that mostly worked |
+| `partial` | exported some clips and lost the rest; counted in `failed` and in neither of the above, so a single-source batch that put 7 of 10 clips on disk would have been announced as a FAILURE with the clips sitting in the output folder. It contributes to **both** sides — the same reading `_notify_cut` gives a crash that left clips behind |
+
+`publish()` carries `no_clips` and `partial` out of the fold it already computes, exactly as R11's
+`clips` and R17-A's `failed`/`cancelled` ride along, and both are correct at the pre-backfill call
+site by the same equivalence argument (a `not_attempted` row is in neither).
+
+**And `record_lost` makes the fifth rendering agree with the other four.** A clean run whose
+manifest never reached disk shows the headline `Batch finished but the record was lost`, an activity
+panel of PARTIAL/FAILED, and a summary that has always disclosed it — while the toast said
+`finished`. It qualifies a SUCCESS and nothing else, mirroring the panel's own override, which fires
+only when the tone was otherwise `done`.
+
+**F2 — Reset defaults and the programmatic-write loop.** Both halves are in *The app toggle gates
+DELIVERY* above.
+
+**F3 — the library analysis pass.** `is_failure_report` recognises only the marker
+`record_failure` writes, so a pass whose shared Qwen worker **died** — real GPU minutes, nothing
+cached, no exception, no marker — was announced as `Library analysis finished`.
+`library_prep.analysis_run_outcome` is the structural answer, read from the analyzer's own
+`*_this_run` counts and `source_count`, never from the rendered summary:
+
+```
+qwen_incomplete_jobs_this_run > 0        -> incomplete   (issued, therefore NOT cached)
+source_count < submitted                 -> incomplete   (a submitted path no longer existed)
+non-mapping / missing or malformed count
+  / completed + incomplete != jobs       -> unknown
+otherwise                                -> complete
+```
+
+Four things it deliberately does not do:
+
+- **It has no `nothing_completed` token.** "No Qwen job completed" is not "nothing was cached" — a
+  candidate-less source is legitimately checkpointed with no Qwen work — so a total-loss verdict the
+  payload cannot support is not invented.
+- **`incomplete` and `unknown` share a verb and stay separate tokens.** They are different facts and
+  `library_prep` keeps them apart; what they share is the only honest thing a four-word toast can
+  say about either, `finished with problems`, whose body sends the operator to the panel that has the
+  numbers. An absent verdict, or one from a future vocabulary, lands there too — **never** on success.
+- **A Scan is asked a different question.** There is no Stage-5 batch for its verdict to be about and
+  its own faults arrive through `failed`, so an absent verdict is a plain success for a scan only.
+- **A warm batch that ran no job at all is COMPLETE.** `sources_analyzed_this_run == 0` with every
+  submitted source a cache hit is a success, not a shortfall.
+
+The verdict travels in a **caller-owned sink**, the shape `_on_cut_batch_run` already uses:
+`_on_prep_analyze_click` creates one plain dict per click, `_prep_analyze_impl` writes it on the
+success path only, and `_run_prep_in_worker` reads it **after** `thread.join()` — so the join is the
+happens-before and no lock is involved. Per-click rather than a module-level slot deliberately: Scan
+and Analyze take no mutex, so two browser sessions genuinely overlap and a shared slot would let one
+session's verdict describe the other's run (the mistake UX-PREP-ACTIVITY R2 corrected for
+`_prep_phase`). It is **not** a field of `PrepSessionState`: it describes one run, so every other
+transition would have to clear it or it would outlive its run.
+
+**One residual limitation, recorded rather than guessed at.** A source the analyzer opened but could
+not decode is counted as analysed, is correctly not cached, and issues no Qwen job — so the
+classifier reads such a run as complete. The payload carries no count for it, and adding one would
+mean changing the Stage-5 orchestrator to make a notification easier to classify. The panel still
+reports the batch's own numbers and the next scan still shows the source as needing analysis.
+
+**The one client-side correction.** `remember()` re-reads `localStorage` each time, so the durable
+ledger was always right — but the `delivered` snapshot taken one line above the dispatch loop was
+not, so two items carrying the **same id inside one envelope** each passed the check and called the
+constructor. The server cannot produce that (`_notify_publish` mints a fresh `uuid4` per terminal
+event, and a test executes that half), but "exactly one `new Notification()` per terminal event" is
+the dispatcher's own guarantee about the payload it is handed and should not rest on a property of
+the other side. One line: `delivered.push(item.id)` beside the `remember`. **Asserted structurally**
+— there is no JavaScript engine in the suite — so it is the live smoke that observes it, and this
+sentence is the record of which of the two that is.
+
+**The test notification is deliberately NOT gated on the app toggle.** It is the operator's way of
+checking *Chrome*, so gating it on the BeatSync setting would make the one diagnostic in the panel
+useless in exactly the state they are trying to get out of. The whole route is `NOTIFY_TEST_JS` →
+`window.__bsNotify.test()` → `fire(...)`, whose only gate is the browser's own `granted`; it reads
+no setting and calls no server function, and a test pins that so a later change cannot quietly make
+it conditional.
+
 ## The browser lifecycle boundary — state it, do not work around it
 
 V1 works while an authorised BeatSync page is **actually open** and receives the job's terminal
@@ -279,6 +415,64 @@ a replayed envelope, an empty one and a malformed one all suppressed; a second t
   in-flight clips of a render they had started. Their terminal points and outcome translations are
   executed against the shipped `gui.py` bodies in the test suite instead.
 - **A cancelled job.** The synthetic fixtures finish in under a second.
+
+### What R2's smoke added
+
+Same method — Chrome against an isolated instance on **7861**, synthetic media, Chrome's permission
+still `default` so `window.Notification` was again a recording stub. Two things were different and
+both are worth copying: **`PREFS_PATH` was redirected into the task workspace from the launcher** and
+the two preference globals reloaded from it *before* `create_ui()`, so Save defaults, Reset defaults
+and the toggle never reached the owner's `state/preferences.json` at all (measured untouched,
+same mtime and hash before and after); and `BEATSYNC_SHARED_CONFIG` pointed the Stage-5 record store
+at the workspace, so neither the production local cache (14 235 records) nor the configured shared
+cache on `D:` (11 794) was written — all 8 records of the session landed in the isolated folder.
+`input/processing`, `input/gradio_uploads` and `output/` were all verified unchanged.
+
+**Newly verified, on real media through the shipped app:**
+
+- **A real failed folder batch announces a FAILURE.** Two genuinely unreadable files (FFprobe
+  exits 1 on both): panel `⚠️ Batch finished with failures`, counts `0 completed / 2 failed`,
+  0 clips — and the toast `Raw Cutter batch failed · 0 completed, 2 failed`. On the pre-R2 head the
+  same run said `finished with problems`.
+- **A real successful folder batch** (3 sources, 8 clips) → exactly one `Raw Cutter batch finished ·
+  3 completed, 0 failed`, while the on-screen summary carried the full `E:\…` path the toast did not.
+- **A real cancelled folder batch** — the case R17-A could not produce, reached with 4 × 90 s 720p
+  sources and Cancel pressed during the first: `Raw Cutter batch cancelled · 0 completed, 0 failed,
+  1 cancelled, 3 not attempted`. Zero `completed` and still CANCELLED, which is the translated
+  branch holding.
+- **A real incomplete library analysis** — one source deleted between Scan and Analyze:
+  `Submitted 3 / Sources analyzed 2`, no failure marker, and the toast `Library analysis finished
+  with problems`. Pre-R2 it said `Library analysis finished`. A complete analysis (3 of 3) and a
+  Library scan each still produce one plain `finished`.
+- **The duplicate-within-one-envelope fix, both ways.** The **pre-fix** dispatch loop, extracted
+  from `32165fb` and run in the same tab, called the constructor **3** times for an envelope
+  carrying one id twice plus one distinct id; the shipped loop calls it **2**. Replayed, empty,
+  whitespace, malformed, wrong-version, non-array and id-less envelopes all deliver nothing, and the
+  ledger holds at 64 after 70 events.
+- **Reset defaults, and the write that is not a change.** With the toggle ON and the collision
+  policy on `suffix`: a reload rendered the checkbox ON and the sentence ON **with no toast** and a
+  **byte-identical, same-mtime** `preferences.json` — the programmatic-write guard. Reset then left
+  the checkbox unticked, the sentence OFF, the policy back on `skip`, the file cleared, and again
+  **no** second toast; a publish afterwards delivered nothing, so the gate agreed with the sentence.
+- **The test notification fires with the app toggle ON and OFF**, once each, with the pure module's
+  wording.
+
+**Still not verified, and the list has not shortened in the ways that matter:** an OS-visible
+Windows toast (the permission is still `default`); a genuinely backgrounded tab; a successful render
+or a Variant Lab batch *through the GUI*. The render path was instead exercised **headless** and
+separately isolated — `video_processor.py` on an 8 s track and 3 synthetic sources, with the cache
+redirected and `-o` into the workspace — and the result is frame-exact: the plan's 200 frames were
+published as **200 counted frames**, 8.000000 s against 8.000000 s of audio, two streams
+(h264 + `pcm_s24le`), full decode to null exit 0. That is evidence about the **renderer**, not about
+the render's notification, whose terminal point remains covered by the suite alone.
+
+**One honest wrinkle this created.** The preparation panel's terminal chip reads `COMPLETED` for the
+incomplete-analysis run while the toast says `finished with problems`. They answer different
+questions — the chip asks whether the *pass* ran to completion (`is_failure_report` /
+`REFUSAL_NOTICE`, unchanged by R2), the toast asks whether the work it set out to do succeeded — and
+the report between them carries the `Submitted 3 / Sources analyzed 2` that explains the gap.
+Teaching the chip the verdict means changing `prep_activity`'s own pinned contract, which is a
+different subsystem and a separate decision; it is recorded here rather than done.
 
 ## What this feature must never do
 

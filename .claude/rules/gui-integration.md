@@ -761,6 +761,31 @@ automatically.
     handler may make. Every outcome is **translated** from the subsystem's own typed
     classification — `RENDER_OUTCOME_KEY`, `RenderBatchOutcome`, the cutter's `TERMINAL_*`
     vocabulary, `summarise`, `is_failure_report` — and never derived from a status string.
+  * **…and a translated class is not always a complete answer (R2).** Three of the seven families
+    announced a result they could not vouch for, all three in the translation layer alone. The
+    Raw Cutter folder batch's `completed_with_failures` is produced for *any* failed source, so a
+    batch whose every source failed announced `finished with problems`; a clean batch whose
+    manifest never reached disk announced `finished` while the other four renderings said the
+    record was lost; and a library analysis pass whose Qwen worker died announced `finished`
+    because `is_failure_report` only recognises the marker `record_failure` writes. The batch's
+    four classes now split into `_CUT_BATCH_RUN_OUTCOMES` (translated) and
+    `_CUT_BATCH_RAN_TO_END` (folded from the measured counts, with `no_clips` and `partial` riding
+    out of `summarise`), and the analysis pass carries
+    `library_prep.analysis_run_outcome` through a **caller-owned `outcome_sink` dict** —
+    per click, written on the success path, read after `thread.join()`. **An absent or unknown
+    verdict is `finished with problems`, never a success.**
+  * **A translator's arithmetic belongs in `desktop_notify`, not at the call site.** The six run
+    *outside* `_notify_publish`'s broad guard, so a `TypeError` there would escape into a finished
+    job's terminal path. `desktop_notify.total_count` is the total fold; R2 found
+    `_notify_cut`'s crashed branch doing `(written or 0) > 0` and routed it through the same.
+  * **Reset defaults is a writer of the notification panel (R2).** `empty_options()` returns the
+    option to `off` in the file *and* in `_FOLDER_OPTIONS`, which is what the delivery gate reads,
+    so `pref_reset_btn.click` writes `notify_enabled` and `notify_app_state` too — both from
+    `_notify_settings_on_load()`, which also makes the failed-save path report what is still in
+    force. And because Gradio's `.change` fires for a function update as well as a gesture,
+    `_on_notifications_enabled_change` now returns early when nothing changed: without it, opening
+    a tab rewrote `preferences.json` and raised an "ON" toast for a page just loaded. `.change` is
+    kept rather than swapped for `.input`, exactly as `pref_collision.change` is.
   * **Nothing is published from a `finally`.** Abandonment is not a terminal outcome, and `.then()`
     does not run for an abandoned event either.
   * **`_notify_publish` cannot raise into a job's terminal path.** A notification is a courtesy; a

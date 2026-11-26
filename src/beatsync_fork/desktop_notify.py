@@ -421,6 +421,23 @@ def decode_envelope(text):
 # passes the token's VALUE.
 # ---------------------------------------------------------------------------------------------
 
+def total_count(*values):
+    """The sum of the supplied counts, as a **total** operation.
+
+    Anything that is not a whole non-negative ``int`` contributes nothing instead of raising, which
+    is the same refusal :func:`_count` applies to a reported count -- and for a stronger reason
+    here. A translator runs on a finished job's terminal path, *outside* the publisher's broad
+    guard, so arithmetic performed at the call site is arithmetic that could take a finished job's
+    final frame down with it. Folding two or three subsystem counts into one "this went right" tally
+    is a thing several translators legitimately need to do, so it is done here, once, where it
+    cannot raise and where every branch of it is executable on a bare interpreter.
+
+    It is deliberately **not** a lenient coercer: a value it cannot read is dropped, never guessed
+    at, so a malformed count can only ever make an outcome *less* cheerful.
+    """
+    return sum(_count(value) or 0 for value in values)
+
+
 def outcome_from_counts(completed, failed, *, cancelled=False):
     """The four-way outcome for a job that counted things.
 
@@ -456,5 +473,5 @@ __all__ = [
     "SEEN_STORAGE_KEY", "SEEN_LIMIT", "ENVELOPE_VERSION", "ENVELOPE_EMPTY",
     "FORBIDDEN_CHARACTERS", "is_safe_text",
     "ID_MIN_LENGTH", "ID_MAX_LENGTH", "is_valid_id",
-    "detail_text", "build", "envelope", "decode_envelope", "outcome_from_counts",
+    "detail_text", "build", "envelope", "decode_envelope", "total_count", "outcome_from_counts",
 ]
