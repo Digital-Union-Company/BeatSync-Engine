@@ -1502,7 +1502,10 @@ def test_a_fatal_on_the_final_candidate_keeps_its_own_cause_while_the_event_fini
 def test_the_lifecycle_derivation_reads_selection_exhaustion_not_the_last_candidate():
     """Structural half: the old `session_state[RENDER_OUTCOME_KEY]` read must be gone."""
     body = _gui_body("render_selected_variants_guarded")
-    assert "len(outcomes) == request.count" in body, \
+    # [FORK] R17-A R4: the batch's own request record is `batch_request`; the name changed because
+    # `request` shadowed the injected `gr.Request` and cost the batch its notification. The
+    # completion test itself -- selection exhaustion -- is unchanged.
+    assert "len(outcomes) == batch_request.count" in body, \
         "the completion test is not selection exhaustion"
     marking = body.split("if lifecycle.cancel_requested():")[-1]
     assert "RENDER_OUTCOME_KEY" not in marking.split("_clear_active_render")[0], \

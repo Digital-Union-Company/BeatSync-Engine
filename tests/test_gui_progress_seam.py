@@ -339,7 +339,10 @@ def test_the_batch_prefixes_the_existing_status_text_without_parsing_it():
     body = _gui_body("render_selected_variants_guarded")
     # the ordinal line, then the untouched inner text
     # `ast.unparse` normalises f-strings to single quotes, hence the spelling here.
-    assert "f'Rendering candidate {position} / {request.count}'" in body
+    # [FORK] R17-A R4: the batch's own request record is `batch_request` now. It used to be
+    # `request`, which shadowed the injected `gr.Request` and silently cost the batch its
+    # notification; the prefix itself, and everything this test is about, is unchanged.
+    assert "f'Rendering candidate {position} / {batch_request.count}'" in body
     assert "f'{prefix}" + chr(92) + "n" + chr(92) + "n{last_status}'" in body
     # nothing reads stage identity back out of prose — the mistake Phase 2A deleted
     for forbidden in ("re.search", "re.match", "Stage (", "\\d+", ".index('Stage",

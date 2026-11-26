@@ -749,6 +749,13 @@ automatically.
   notify_envelope.change(js=NOTIFY_DISPATCH_JS)    the ONE dispatch site
   ```
 
+  * **…and a producer may not REBIND it (R4).** `render_selected_variants_guarded` assigned
+    `build_request`'s `RenderBatchRequest` to `request`, shadowing the injected session, so the
+    terminal `_notify_render_batch(request, outcome)` published nothing and **a finished Variant
+    Lab batch announced nothing at all** — silently, because an unattributable record is refused by
+    design. The batch's own record is `batch_request`; a test walks all seven producers for any
+    `Store`/`Del` binding of `request`, and the batch's delivery is now executed end to end against
+    the real ledger rather than asserted as an AST call count.
   * **`request: "gr.Request" = None` is injected, appended LAST, and absent from every `inputs`
     list** — on `process_video_guarded`, `render_selected_variants_guarded`, `_on_cut_run`,
     `_on_cut_batch_run_ui`, `_on_audio_cut`, `_on_prep_scan_click` and `_on_prep_analyze_click`.

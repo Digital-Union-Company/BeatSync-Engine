@@ -6477,12 +6477,21 @@ def render_selected_variants_guarded(
     batch = variant_batch_state
     summary_only = (gr.skip(), gr.skip(), gr.skip())
 
-    request, refusal = fork_render_batch.build_request(
+    # [FORK] Digital-Union (R17-A R4): named `batch_request`, and the name is the whole fix. This
+    # used to be assigned to `request`, which SHADOWED the injected `gr.Request` parameter for the
+    # rest of the body -- so the terminal `_notify_render_batch(request, outcome)` handed the
+    # publisher a `RenderBatchRequest`, `_notify_session_key`'s `getattr(request, 'session_hash',
+    # None)` answered `None`, and `_notify_publish` returned at its `if not key` guard. No
+    # exception, no record, no toast: measured as two real 2/2-SUCCESS batches producing zero
+    # notifications while a Raw Cutter batch in the same session delivered normally. The two
+    # objects are both "a request" and neither is wrong on its own; only one of them is the
+    # browser session, so they may never share a name here.
+    batch_request, refusal = fork_render_batch.build_request(
         batch, variant_render_selection,
         user_base=output_filename or 'music_video',
         request_tag=_render_batch_request_tag(),
     )
-    if request is None:
+    if batch_request is None:
         yield summary_only[0], f"❌ {refusal}", session_state, refusal, ''
         return
 
@@ -6521,7 +6530,7 @@ def render_selected_variants_guarded(
             freestyle_finale, freestyle_drop, freestyle_chorus, freestyle_bridge,
             freestyle_breakdown, freestyle_verse, freestyle_body)
 
-        for position, candidate in enumerate(request.candidates, start=1):
+        for position, candidate in enumerate(batch_request.candidates, start=1):
             # [FORK] Digital-Union (C3-R1A): checked BEFORE starting each candidate, closing the
             # candidate-boundary race the frozen authorization calls out explicitly -- a Cancel
             # click that lands in the gap between two candidates must stop the batch here rather
@@ -6531,7 +6540,7 @@ def render_selected_variants_guarded(
                 stopped = True
                 break
 
-            prefix = f"Rendering candidate {position} / {request.count}"
+            prefix = f"Rendering candidate {position} / {batch_request.count}"
             recipe = candidate.creative_recipe
             audio = candidate.audio_recipe
             last_status, last_video = '', None
@@ -6692,7 +6701,7 @@ def render_selected_variants_guarded(
         # the lifecycle therefore reads FINISHED.
         if lifecycle.cancel_requested():
             lifecycle.mark_terminal(RenderLifecycleState.CANCELLED)
-        elif len(outcomes) == request.count:
+        elif len(outcomes) == batch_request.count:
             lifecycle.mark_terminal(RenderLifecycleState.FINISHED)
         else:
             lifecycle.mark_terminal(RenderLifecycleState.FAILED)
@@ -6724,13 +6733,13 @@ def render_selected_variants_guarded(
     # suffered it; the batch executed its policy to the end and has no terminal cause of its own.
     # Only the candidate that actually ended the run contributes one, which is why this reads the
     # LAST appended outcome rather than searching for the first failure.
-    # `stopped and len(outcomes) < request.count` is the precise test for "a candidate ended the
-    # run with work still outstanding". A fatal on the FINAL selected candidate left nothing
-    # unattempted, so the batch completed its selection and has no terminal cause -- the candidate
-    # owns its failure, exactly as a CANDIDATE_LOCAL one does.
+    # `stopped and len(outcomes) < batch_request.count` is the precise test for "a candidate
+    # ended the run with work still outstanding". A fatal on the FINAL selected candidate left
+    # nothing unattempted, so the batch completed its selection and has no terminal cause -- the
+    # candidate owns its failure, exactly as a CANDIDATE_LOCAL one does.
     if lifecycle.cancel_requested():
         batch_outcome_kind = RenderOutcomeKind.CANCELLED
-    elif stopped and outcomes and len(outcomes) < request.count:
+    elif stopped and outcomes and len(outcomes) < batch_request.count:
         terminal = outcomes[-1]
         batch_outcome_kind = (
             terminal.outcome_kind
@@ -6740,7 +6749,7 @@ def render_selected_variants_guarded(
     else:
         batch_outcome_kind = None
     outcome = fork_render_batch.RenderBatchOutcome(
-        requested_count=request.count,
+        requested_count=batch_request.count,
         outcomes=tuple(outcomes),
         outcome_kind=batch_outcome_kind,
     )
@@ -6749,6 +6758,11 @@ def render_selected_variants_guarded(
     # candidate: the accepted scope's unit is the top-level job event, which for a batch is the
     # whole 2-4-candidate run, exactly as the shared `RenderLifecycle` is. A ledger write only;
     # it touches no widget and no yield, and both early returns above are unreachable from here.
+    #
+    # [FORK] Digital-Union (R17-A R4): `request` here is the INJECTED `gr.Request` -- the owning
+    # browser session -- and not the batch's own record, which is `batch_request` above. The
+    # ledger is session-keyed, so handing it anything else is silently indistinguishable from
+    # "this job produced nothing to announce".
     _notify_render_batch(request, outcome)
     # The newest successful preview wins, and a later failure never blanks an earlier success.
     preview = outcome.latest_successful_preview()

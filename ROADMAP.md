@@ -1701,7 +1701,36 @@ default.
 
 ---
 
-### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED + R3 DIAGNOSTICS FIXED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED + R3 DIAGNOSTICS FIXED + R4 VARIANT-BATCH PRODUCER FIXED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+
+> **R4 — the attended JOB playtest, 2026-11-26.** The owner accepted all six R3 diagnostic checks,
+> including three real Windows notifications, and the job families were then measured for real. Six
+> jobs, four notifications: the Raw Cutter folder batch (twice), a successful music video render and
+> a failed one each announced exactly once and truthfully — and **two Variant Lab batches, both
+> *2 / 2 succeeded*, announced nothing at all.**
+>
+> **One name used for two things.** `render_selected_variants_guarded` assigned
+> `fork_render_batch.build_request(...)`'s `RenderBatchRequest` to `request`, **shadowing the
+> injected `gr.Request`**. The terminal `_notify_render_batch(request, outcome)` therefore handed
+> the publisher an object with no `session_hash`, `_notify_session_key` answered `''`, and
+> `_notify_publish` returned at its `if not key` guard — no exception, no record, no toast, because
+> an unattributable record is refused by design. The batch's own record is now `batch_request`.
+> Selection, lifecycle, mutex, concurrency, cancellation, continuation and every output are
+> unchanged, and the session-identity guard was not weakened.
+>
+> **Why 11 463 passing tests missed it.** The translator was tested directly with a correct fake
+> request; the only suite that executed this handler's real body *stubbed* `_notify_render_batch` to
+> a no-op; and the producer-call assertion pins an AST **call count** — the call was there, exactly
+> once, and nothing checked the argument. Sixteen new tests now run the shipped wrapper against the
+> real translator, publisher, ledger and drain (success, partial, cancellation, total failure, a
+> refused batch, session isolation, consume-once, the toggle), plus a structural rule that **none of
+> the seven producers may rebind its injected `request`**. Nine fail against pre-fix `bdb342fd`, the
+> headline one with *"expected one batch notification, got 0"*.
+>
+> **An operator trap worth knowing, found the same session:** pointing Settings → *Render output* at
+> a folder on another volume makes every render fail at publication (`errno.EXDEV` — the promotion
+> is a single same-volume atomic rename, failing closed by design). It is documented behaviour, not
+> a defect, and it is how the failed-render notification above came to be measured.
 
 > **R3 — the owner's first playtest, 2026-11-26.** The permission was granted and the **first**
 > "Send test notification" produced a **real Windows notification**. Every click after it produced

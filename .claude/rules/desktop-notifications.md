@@ -478,6 +478,54 @@ useless in exactly the state they are trying to get out of. The whole route is `
 no setting and calls no server function, and a test pins that so a later change cannot quietly make
 it conditional.
 
+## R4: the producer must hand the publisher the BROWSER session
+
+A finished **Variant Lab batch** announced nothing. Two real 2-candidate batches, both *2 / 2
+succeeded*, produced **zero** notifications; a Raw Cutter folder batch run straight afterwards in
+the same tab and session delivered normally, which is what isolates the fault to the one producer
+rather than to the ledger, the drain, the envelope or the dispatcher.
+
+```python
+def render_selected_variants_guarded(…, request: "gr.Request" = None):
+    batch_request, refusal = fork_render_batch.build_request(…)   # NOT `request` — R4
+    …
+    _notify_render_batch(request, outcome)                        # the injected session
+```
+
+The body used to assign `build_request`'s `RenderBatchRequest` to `request`, **shadowing the
+injected parameter**. Every later `request.count` / `request.candidates` was right for the batch
+record and the terminal notification call was wrong, so `_notify_session_key`'s
+`getattr(request, 'session_hash', None)` answered `None`, the key was `''`, and `_notify_publish`
+returned at its `if not key` guard.
+
+**It failed silently, and that is a property of the design rather than an oversight.** `''` is a
+refusal (see *Why a ledger, and why it is keyed by session*), so an unattributable record is
+dropped on purpose — the safe direction for a cross-session leak and the invisible direction for a
+producer handing over the wrong object. There is deliberately **no** louder failure here: raising
+would put a notification's problem on a finished job's terminal path, which is exactly what
+`_notify_publish`'s guard exists to prevent. The protection is therefore structural, upstream of
+the publisher:
+
+- **No producer may rebind its injected `request`.** A test walks all seven and fails on any
+  `ast.Name(id="request")` in a `Store`/`Del` context. "A request" is a natural name for more than
+  one thing in a 300-line handler, which is precisely why the rule is mechanical.
+- **The counterpart is pinned too** — `batch_request, refusal = fork_render_batch.build_request(`
+  and `_notify_render_batch(request, outcome)` — because the absence rule alone would also be
+  satisfied by deleting the request entirely.
+
+**And the behavioural half is what actually catches a wrong argument.** Before R4 the call site was
+asserted only as an AST **call count** (`_PRODUCER_CALLS`), which was true: the call existed,
+exactly once. Nothing asserted *what was passed*. The one suite that executed this handler's real
+body (`tests/test_delivery_share.py`) stubbed `_notify_render_batch` to a no-op, and the suite that
+executed the translator never ran the handler. So R4's tests exec the shipped wrapper **into the
+same namespace as the shipped ledger**, and a record has to travel the whole way from the terminal
+path to a decoded envelope: success, partial, cancellation, total failure, a refused batch, session
+isolation, consume-once and the delivery toggle. Nine of the sixteen fail against pre-fix
+`bdb342fd`; the headline one reports *"expected one batch notification, got 0"*.
+
+**When adding a producer, assert delivery end to end.** A stub on the notification path makes a
+producer test pass while proving nothing about the notification, which is how this shipped.
+
 ## The browser lifecycle boundary — state it, do not work around it
 
 V1 works while an authorised BeatSync page is **actually open** and receives the job's terminal

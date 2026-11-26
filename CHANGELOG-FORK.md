@@ -20,6 +20,51 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-26 (R17-A R4: a Variant Lab batch never sent its notification)
+
+The attended job-notification playtest found that a finished **Variant Lab batch** announced
+nothing at all. Two real two-candidate batches, both reporting *2 / 2 succeeded*, produced **zero**
+notifications, while a Raw Cutter folder batch run immediately afterwards in the same browser tab
+and session delivered normally — so the ledger, the session key, the chained drain, the hidden
+envelope and the client dispatcher were all healthy, and the batch was the only broken producer.
+
+**One name, used for two different things.** `render_selected_variants_guarded` takes the injected
+`gr.Request` as its last parameter, and then opened its body with
+
+```python
+request, refusal = fork_render_batch.build_request(...)
+```
+
+which **rebound that parameter** to the batch's own `RenderBatchRequest`. Every later use —
+`request.count`, `request.candidates` — was correct for the batch record, and the terminal
+`_notify_render_batch(request, outcome)` was not: it handed the publisher an object with no
+`session_hash`, so `_notify_session_key` answered `''` and `_notify_publish` returned at its
+`if not key` guard. **No exception was raised**, because a record that cannot be attributed to a
+session is refused by design — the safe direction for the cross-session leak the ledger exists to
+prevent, and the invisible direction for this. The batch's own record is now `batch_request`, and
+the injected session reaches the publisher unchanged.
+
+Nothing else moved. The selection, lifecycle, mutex, concurrency, cancellation, continuation policy
+and every output are identical; the session-identity guard was not weakened; no component,
+endpoint, `inputs` or `outputs` list was added; and the ledger and notification subsystem are
+untouched.
+
+**The suite could not see it, and that gap is closed too.** The translator was tested directly with
+a correct fake request, the one test that executed this handler's real body *stubbed*
+`_notify_render_batch` to a no-op, and the producer-call assertion pins a **call count** read off
+the AST — the call was there, exactly once, and nothing asserted what was passed to it. Sixteen new
+tests now execute the shipped wrapper against the real translator, publisher, ledger and drain,
+covering success, partial failure, cancellation, total failure, a refused batch, session isolation,
+consume-once and the application toggle — plus a structural rule, applied to **all seven**
+producers, that none of them may rebind its injected `request`. Measured against the pre-fix
+`bdb342fd`, nine of those sixteen fail (the headline one with *"expected one batch notification,
+got 0"*); against the correction all sixteen pass.
+
+**Verified in Chrome against the shipped build**, on a storage-isolated instance: one real
+two-candidate Variant Lab batch produced **exactly one** envelope and **exactly one**
+`new Notification(...)` call, tagged `beatsync-<id>`, with a Raw Cutter folder batch retained as a
+positive control in the same session.
+
 ### Fixed — 2026-11-26 (R17-A R3: the two notification diagnostics were not repeatable or responsive)
 
 The owner granted Chrome's permission, received a **real Windows notification** from their first

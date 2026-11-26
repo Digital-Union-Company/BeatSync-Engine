@@ -1323,7 +1323,9 @@ def test_the_batch_states_its_own_terminal_cause_to_the_formatter():
     # -- even one carrying local failures -- still ends up with `None`.
     assert "if lifecycle.cancel_requested():" in body, body
     assert "batch_outcome_kind = RenderOutcomeKind.CANCELLED" in body, body
-    assert "len(outcomes) < request.count" in body, \
+    # [FORK] R17-A R4: `batch_request` is the batch's own request record. The rename removed the
+    # shadowing of the injected `gr.Request`; the branch it guards is unchanged.
+    assert "len(outcomes) < batch_request.count" in body, \
         "the fatal branch must require that work was actually left unattempted"
     assert "outcome_kind=batch_outcome_kind" in body, \
         "the batch outcome is built without stating its terminal cause"

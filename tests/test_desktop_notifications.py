@@ -2178,3 +2178,261 @@ def test_no_substitution_placeholder_survives_into_a_shipped_script(name):
     """
     leftovers = [token for token in re.findall(r"__[A-Z][A-Z0-9_]*__", _script(name))]
     assert leftovers == [], leftovers
+
+
+# =============================================================================================
+# 7. R4: a producer must hand the publisher the BROWSER session, not its own request record
+# =============================================================================================
+#
+# The defect this section exists for was invisible to every assertion above it. The ledger is
+# keyed by `gr.Request.session_hash`, `_notify_session_key` answers `''` for an object that has
+# none, and `_notify_publish` then returns at its `if not key` guard -- no exception, no record,
+# no toast. So a producer that passes the WRONG object is indistinguishable, from the inside,
+# from a job that had nothing to announce.
+#
+# `render_selected_variants_guarded` did exactly that: `request, refusal =
+# fork_render_batch.build_request(...)` rebound the injected parameter, and the terminal
+# `_notify_render_batch(request, outcome)` handed the publisher a `RenderBatchRequest`. Measured
+# live: two real 2/2-SUCCESS Variant Lab batches produced zero notifications, while a Raw Cutter
+# batch in the same browser session delivered normally.
+#
+# Two kinds of test, because either one alone would have missed it:
+#
+#   * the STRUCTURAL one below generalises the defect to all seven producers, and would have
+#     caught this before it shipped;
+#   * the BEHAVIOURAL ones execute the real wrapper against the real translator, publisher,
+#     ledger and drain. Nothing on the notification path is stubbed -- which is the gap that let
+#     it through, since the only suite that ran this body replaced `_notify_render_batch` with a
+#     no-op, and the only suite that ran the translator never ran this body.
+
+_INJECTED_PRODUCERS = ("process_video_guarded", "render_selected_variants_guarded",
+                       "_on_cut_run", "_on_cut_batch_run_ui", "_on_audio_cut",
+                       "_on_prep_scan_click", "_on_prep_analyze_click")
+
+
+@pytest.mark.parametrize("handler", _INJECTED_PRODUCERS)
+def test_no_producer_rebinds_the_injected_request(handler):
+    """The injected `gr.Request` must still be the `gr.Request` when the terminal path reads it.
+
+    A producer's body is long, and "a request" is a natural name for more than one thing in it --
+    the batch's own `RenderBatchRequest` being the obvious case. Rebinding the parameter is
+    therefore an easy, silent mistake, and its consequence is a notification that is never made
+    rather than an error anybody sees.
+    """
+    node = _func(_tree(_GUI), handler)
+    assert node.args.args[-1].arg == "request", handler
+    rebinds = [child for child in ast.walk(node)
+               if isinstance(child, ast.Name) and child.id == "request"
+               and isinstance(child.ctx, (ast.Store, ast.Del))]
+    assert rebinds == [], (
+        f"{handler} rebinds its injected `request` at line(s) "
+        f"{[child.lineno for child in rebinds]} -- the session is then unreachable from the "
+        f"terminal notification path, and the publisher fails silently")
+
+
+def test_the_batch_names_its_own_request_record_separately():
+    """The positive half of the rule above, pinned at the one call site that needs the
+    distinction. Asserting only the absence of a rebind would also be satisfied by deleting the
+    request entirely.
+    """
+    body = ast.unparse(_func(_tree(_GUI), "render_selected_variants_guarded"))
+    assert "batch_request, refusal = fork_render_batch.build_request(" in body
+    assert "_notify_render_batch(request, outcome)" in body
+    assert "requested_count=batch_request.count" in body
+
+
+# --- the real wrapper, the real ledger ---------------------------------------------------------
+
+class _NoSkip:
+    def __repr__(self):                                 # pragma: no cover - debugging aid only
+        return "<skip>"
+
+
+def _batch_namespace(tmp_path, *, enabled=True):
+    """`_notify_namespace` PLUS the shipped batch wrapper, executed into the same namespace.
+
+    Sharing one namespace is the point: the `_notify_render_batch`, `_notify_publish`, ledger and
+    `_notify_drain` the wrapper reaches are the real ones already defined there, so a record has
+    to travel the whole way from the terminal path to a decoded envelope.
+    """
+    import threading as _threading
+    import uuid as _uuid
+
+    import beatsync_fork.render_batch as fork_render_batch
+    import beatsync_fork.render_worker as fork_render_worker
+
+    namespace = _notify_namespace(tmp_path, enabled=enabled)
+    namespace["gr"].skip = _NoSkip
+    lifecycles: list = []
+    started: list = []
+    plan: dict = {}
+
+    def tracking_lifecycle(invocation_id):
+        lifecycle = fork_render_worker.RenderLifecycle(invocation_id=invocation_id)
+        lifecycles.append(lifecycle)
+        return lifecycle
+
+    def guarded_unlocked(*args, **kwargs):
+        index = len(started)
+        started.append(index)
+        session_state = args[24]
+
+        def stream():
+            step = plan.get(index, {})
+            if step.get("cancel"):
+                lifecycles[-1].request_cancel()
+            session_state["render_outcome_kind"] = step.get("kind")
+            session_state["last_output_path"] = step.get("durable", "")
+            session_state["audio_layers_report"] = ""
+            session_state["smart_mix_report"] = ""
+            yield (None, "inner status", session_state, "", "", "inv")
+
+        return stream()
+
+    namespace.update({
+        "uuid": _uuid,
+        "threading": _threading,
+        "fork_render_batch": fork_render_batch,
+        "RenderLifecycle": tracking_lifecycle,
+        "RenderLifecycleState": fork_render_worker.RenderLifecycleState,
+        "RenderOutcomeKind": fork_render_worker.RenderOutcomeKind,
+        "RenderCancelled": fork_render_worker.RenderCancelled,
+        "RENDER_OUTCOME_KEY": "render_outcome_kind",
+        "LAST_OUTPUT_PATH_KEY": "last_output_path",
+        "AUDIO_LAYERS_REPORT_KEY": "audio_layers_report",
+        "SMART_MIX_REPORT_KEY": "smart_mix_report",
+        "RENDER_BUSY_MESSAGE": "busy",
+        "_RENDER_LOCK": _threading.Lock(),
+        "_busy_message": lambda: "busy",
+        "_mark_lock_holder": lambda token=None: None,
+        "_LOCK_HOLDER_RENDER": "render",
+        "_install_active_render": lambda lifecycle: None,
+        "_clear_active_render": lambda invocation_id: None,
+        "_render_batch_request_tag": lambda: "T",
+        "_process_video_guarded_unlocked": guarded_unlocked,
+        "Iterator": None, "Tuple": None, "VideoFilesInput": None,
+    })
+    exec(compile(ast.Module(body=[_func(_tree(_GUI), "render_selected_variants_guarded")],
+                            type_ignores=[]), _GUI, "exec"), namespace)      # noqa: S102
+    namespace["_plan"] = plan
+    namespace["_started"] = started
+    namespace["_lifecycles"] = lifecycles
+    return namespace
+
+
+def _drive_batch(namespace, session, *, selection=(0, 1), count=2):
+    """Run the real wrapper to exhaustion for one browser session."""
+    import test_render_failure_classification as rfc
+
+    stream = namespace["render_selected_variants_guarded"](
+        rfc._root_92_batch(count=count), list(selection), "track.mp3", None, 2.0, 1.0, True, "",
+        rfc.fork_smart_mix.ROLE_ORDER,
+        "folder", "C:/src", False, None, "music_video", "h264", 30.0, {}, None,
+        request=_Request(session))
+    for _ in stream:
+        pass
+
+
+_SUCCESS = {"kind": RenderOutcomeKind.SUCCESS, "durable": "C:/out/c.mp4"}
+
+
+def test_a_real_successful_batch_delivers_one_notification_to_its_own_session(tmp_path):
+    """The regression. Against `bdb342fd` this drains NOTHING, because the publisher never saw a
+    session: the injected request had been overwritten by the batch's own request record."""
+    ns = _batch_namespace(tmp_path)
+    ns["_plan"].update({0: _SUCCESS, 1: _SUCCESS})
+
+    _drive_batch(ns, "S1")
+
+    assert ns["_started"] == [0, 1], "both candidates must have run"
+    records = _drained(ns, "S1")
+    assert len(records) == 1, f"expected one batch notification, got {len(records)}"
+    assert records[0]["job"] == dn.JOB_VARIANT_BATCH
+    assert records[0]["outcome"] == dn.OUTCOME_SUCCESS
+    assert "2 completed" in records[0]["body"]
+    assert records[0]["tag"] == dn.TAG_PREFIX + records[0]["id"]
+
+
+def test_the_batch_notification_reaches_no_other_session(tmp_path):
+    ns = _batch_namespace(tmp_path)
+    ns["_plan"].update({0: _SUCCESS, 1: _SUCCESS})
+
+    _drive_batch(ns, "S1")
+
+    assert _drained(ns, "S2") == [], "another browser session must not read this batch's record"
+    assert len(_drained(ns, "S1")) == 1
+
+
+def test_a_second_drain_does_not_redeliver_the_batch(tmp_path):
+    ns = _batch_namespace(tmp_path)
+    ns["_plan"].update({0: _SUCCESS, 1: _SUCCESS})
+
+    _drive_batch(ns, "S1")
+
+    assert len(_drained(ns, "S1")) == 1
+    assert _drained(ns, "S1") == [], "consume-once still holds for the batch"
+
+
+def test_a_real_partly_failed_batch_keeps_its_PARTIAL_classification(tmp_path):
+    """One candidate durable, one locally failed. The run attempted its whole selection, so the
+    batch has no terminal cause of its own and the counts decide -- exactly as before R4."""
+    ns = _batch_namespace(tmp_path)
+    ns["_plan"].update({0: _SUCCESS,
+                        1: {"kind": RenderOutcomeKind.CANDIDATE_LOCAL, "durable": ""}})
+
+    _drive_batch(ns, "S1")
+
+    assert ns["_started"] == [0, 1], "a CANDIDATE_LOCAL failure must not stop the batch"
+    records = _drained(ns, "S1")
+    assert len(records) == 1
+    assert records[0]["outcome"] == dn.OUTCOME_PARTIAL
+    assert "1 completed" in records[0]["body"] and "1 failed" in records[0]["body"]
+
+
+def test_a_real_cancelled_batch_keeps_its_CANCELLED_classification(tmp_path):
+    """Cancellation wins over the counts, and the untried candidate is reported as not attempted."""
+    ns = _batch_namespace(tmp_path)
+    ns["_plan"].update({0: {"kind": RenderOutcomeKind.CANCELLED, "durable": "", "cancel": True}})
+
+    _drive_batch(ns, "S1")
+
+    assert ns["_started"] == [0], "a cancelled batch must not start the second candidate"
+    records = _drained(ns, "S1")
+    assert len(records) == 1
+    assert records[0]["outcome"] == dn.OUTCOME_CANCELLED
+    assert "1 not attempted" in records[0]["body"]
+
+
+def test_a_real_wholly_failed_batch_is_a_FAILURE_not_a_PARTIAL(tmp_path):
+    ns = _batch_namespace(tmp_path)
+    ns["_plan"].update({0: {"kind": RenderOutcomeKind.SHARED_FATAL, "durable": ""}})
+
+    _drive_batch(ns, "S1")
+
+    records = _drained(ns, "S1")
+    assert len(records) == 1
+    assert records[0]["outcome"] == dn.OUTCOME_FAILED
+
+
+def test_a_refused_batch_announces_nothing(tmp_path):
+    """`build_request` refuses a selection that is not 2-4 distinct candidates. Nothing was
+    rendered, the refusal is already on screen, and a toast would describe a job that never ran."""
+    ns = _batch_namespace(tmp_path)
+
+    _drive_batch(ns, "S1", selection=(0,), count=2)
+
+    assert ns["_started"] == [], "a refused batch must render nothing"
+    assert _drained(ns, "S1") == []
+
+
+def test_the_batch_still_respects_the_application_toggle(tmp_path):
+    """The record is made; only DELIVERY is gated, and a gated record is discarded rather than
+    held back for a later click to deliver out of context."""
+    ns = _batch_namespace(tmp_path, enabled=False)
+    ns["_plan"].update({0: _SUCCESS, 1: _SUCCESS})
+
+    _drive_batch(ns, "S1")
+
+    assert ns["_NOTIFY_PENDING"]["S1"], "the terminal path still recorded the batch"
+    assert _drained(ns, "S1") == []
+    assert ns["_NOTIFY_PENDING"] == {}
