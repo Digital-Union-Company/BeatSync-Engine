@@ -1701,7 +1701,158 @@ default.
 
 ---
 
-### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED**
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED + R3 DIAGNOSTICS FIXED + R4 VARIANT-BATCH PRODUCER FIXED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+
+> **R4 — the attended JOB playtest, 2026-11-26.** The owner accepted all six R3 diagnostic checks,
+> including three real Windows notifications, and the job families were then measured for real. Six
+> jobs, four notifications: the Raw Cutter folder batch (twice), a successful music video render and
+> a failed one each announced exactly once and truthfully — and **two Variant Lab batches, both
+> *2 / 2 succeeded*, announced nothing at all.**
+>
+> **One name used for two things.** `render_selected_variants_guarded` assigned
+> `fork_render_batch.build_request(...)`'s `RenderBatchRequest` to `request`, **shadowing the
+> injected `gr.Request`**. The terminal `_notify_render_batch(request, outcome)` therefore handed
+> the publisher an object with no `session_hash`, `_notify_session_key` answered `''`, and
+> `_notify_publish` returned at its `if not key` guard — no exception, no record, no toast, because
+> an unattributable record is refused by design. The batch's own record is now `batch_request`.
+> Selection, lifecycle, mutex, concurrency, cancellation, continuation and every output are
+> unchanged, and the session-identity guard was not weakened.
+>
+> **Why 11 463 passing tests missed it.** The translator was tested directly with a correct fake
+> request; the only suite that executed this handler's real body *stubbed* `_notify_render_batch` to
+> a no-op; and the producer-call assertion pins an AST **call count** — the call was there, exactly
+> once, and nothing checked the argument. Sixteen new tests now run the shipped wrapper against the
+> real translator, publisher, ledger and drain (success, partial, cancellation, total failure, a
+> refused batch, session isolation, consume-once, the toggle), plus a structural rule that **none of
+> the seven producers may rebind its injected `request`**. Nine fail against pre-fix `bdb342fd`, the
+> headline one with *"expected one batch notification, got 0"*.
+>
+> **An operator trap worth knowing, found the same session:** pointing Settings → *Render output* at
+> a folder on another volume makes every render fail at publication (`errno.EXDEV` — the promotion
+> is a single same-volume atomic rename, failing closed by design). It is documented behaviour, not
+> a defect, and it is how the failed-render notification above came to be measured.
+
+> **R3 — the owner's first playtest, 2026-11-26.** The permission was granted and the **first**
+> "Send test notification" produced a **real Windows notification**. Every click after it produced
+> nothing visible, and "Re-check browser status" never acknowledged a press. Both are diagnostics,
+> both are fixed, and neither touched a job:
+>
+> * **The test notification's tag was the fixed `beatsync-test`.** Two notifications sharing a tag
+>   are one notification to the API: the second **replaces** the first in place, silently. The
+>   constructor had returned normally every time, so nothing in the app could tell. Each deliberate
+>   click now mints `beatsync-test-<clock>-<counter>`. **A job's tag is untouched** — still the
+>   stable `beatsync-<id>`, so the browser-level duplicate collapse is unchanged. `renotify` was
+>   considered and rejected (service-worker-only, and a unique tag leaves nothing to re-alert).
+> * **Neither diagnostic acknowledged a click.** `paint()` early-returns when the permission state
+>   is unchanged — correct for the MutationObserver that calls it constantly, and the reason
+>   Re-check looked dead. All three buttons now write a **timestamped** line, and the timestamp is
+>   the point: a repeated identical answer is only visibly a new answer if something moves.
+>
+> The success wording describes the **request** — *"Test notification requested successfully"* plus
+> what can still suppress it — and never the delivery. The four refusals name four different
+> obstacles, because an unasked permission, a denied one, a missing API and a constructor that threw
+> need four different things from the operator; an unrecognised result reads as *unknown*, never as
+> a success. No component, endpoint, `inputs` or `outputs` list was added: the acknowledgement is a
+> second `div` inside the one component with no server-side writer, and it ships empty.
+>
+> **R3's runtime evidence**, same isolation recipe but on **port 7860** — deliberately, because
+> Chrome's permission is per-origin and 7861 can only ever read `default`; nothing was listening and
+> no BeatSync process existed, so nothing was displaced. With the **real** API: the correct refusal
+> line and **no prompt**; two Re-check clicks four seconds apart giving the same sentence with two
+> different timestamps; a fresh load giving zero notifications, zero permission requests and an
+> empty line. With a recording stub through the real buttons: **3 clicks → 3 calls → 3 distinct
+> tags**, where the pre-R3 code replayed in the same tab gave **3 calls → 1 tag**; the permission
+> button calling `requestPermission` exactly once; denied / unsupported / threw each answering
+> distinctly; and a job envelope still delivering 2 of 3, 0 on replay, with `beatsync-<id>` tags and
+> without overwriting the operator's line.
+>
+> **Still unverified:** an OS-visible Windows toast. The Chrome profile holding the grant for
+> `http://127.0.0.1:7860` is not the one the automation drives, and granting a permission is a human
+> action on browser UI — so the constructor call is verified and the toast is an **attended owner
+> step**. Full detail: `.claude/rules/desktop-notifications.md` (*R3*).
+
+> **R2 review and remediation, 2026-11-26.** A focused review of PR #112 found and closed **three
+> outcome-accuracy defects**, all of them in the translation layer — no job's result, progress,
+> cancellation or concurrency behaviour changed, and no event source, component or `outputs` list
+> was added:
+>
+> * **F1 — a Raw Cutter folder batch whose every source failed announced `finished with
+>   problems`.** `terminal_status` answers `completed_with_failures` for *any* failed source, which
+>   is right for the headline and wrong for an outcome. The four classes now split: cancellation
+>   and a fatal error stay translated, the two "ran to the end" classes are folded from the
+>   measured counts. `no_clips` and `partial` ride out of the same `summarise` fold so a run that
+>   merely had nothing worth exporting is not reported as a failure either, and a clean batch whose
+>   **manifest never reached disk** is no longer the one reading of five still calling it
+>   `finished`.
+> * **F2 — Reset defaults left the Settings panel lying about what the app would do.**
+>   `empty_options()` returns the toggle to `off` in the file *and* in the dictionary the delivery
+>   gate reads, while writing neither the checkbox nor the sentence. It now writes both, from
+>   `_notify_settings_on_load()`, which also makes the failed-save path report the setting still in
+>   force. And because Gradio's `.change` fires for a function update as well as a gesture, opening
+>   a tab was **rewriting `preferences.json` and raising an "ON" toast** for a page just loaded; the
+>   handler now returns early when nothing changed.
+> * **F3 — a library analysis pass whose Qwen worker died announced `Library analysis finished`.**
+>   `is_failure_report` recognises only the marker `record_failure` writes, and a dead worker writes
+>   none. `library_prep.analysis_run_outcome` reads the analyzer's own `*_this_run` counts;
+>   incomplete and unreadable both report `finished with problems`, and **an absent or unknown
+>   verdict is never a success.**
+>
+> Plus one client-side correction (two items sharing an id inside one envelope each called the
+> `Notification` constructor) and one latent crash removed (`_notify_cut`'s crashed branch did
+> `(written or 0) > 0`, outside the publisher's guard).
+>
+> **R2's runtime evidence, on real media through the shipped app**, against an isolated instance on
+> 7861 with preferences and the Stage-5 record store redirected into the task workspace — the
+> owner's `state/preferences.json`, both analysis caches, `input/processing`, `input/gradio_uploads`
+> and `output/` all verified unchanged: a real failed batch announcing **failed**; a real successful
+> batch and a real **cancelled** batch (the case R17-A could not produce) announcing truthfully; a
+> real **incomplete** analysis announcing `finished with problems`; the duplicate-envelope fix
+> measured both ways (pre-fix 3 constructor calls, shipped 2); Reset and page-load both leaving the
+> file byte-identical. Separately and headless, one short render: **200 planned frames published as
+> 200 counted frames**, 8.000000 s against 8.000000 s of audio, decodes clean. Whole suite green —
+> **11 398 passed, 25 skipped**.
+>
+> **Still unverified, unchanged from R17-A:** an OS-visible Windows toast (Chrome's permission for
+> the origin is `default` and granting it needs a human click the automation cannot reach), a
+> genuinely backgrounded tab, and a successful render or Variant Lab batch *through the GUI*.
+> Full detail: `.claude/rules/desktop-notifications.md` (*R2*).
+
+> **Status, 2026-11-26.** **R17-A is built** on `feat/r17a-desktop-notifications` and is awaiting
+> owner review; nothing is merged and nothing is installed. Everything below describing R17-A is
+> now a description of shipped source rather than of a plan, with these differences from the text
+> as written — each a decision made during implementation and recorded in
+> `.claude/rules/desktop-notifications.md`:
+>
+> * **Seven event sources, not the "candidate" list**: the music video render, the Variant Lab
+>   batch, the Raw Cutter single and folder batch, the Audio Cutter, and Library **scan** and
+>   **analysis** as two separately named jobs. Verify Sources and Sample Decode are deliberately
+>   excluded — both are bounded read-only diagnostics that report in seconds.
+> * **A gate-refused render announces nothing**, and neither does a refused cut, a batch that never
+>   started or a declined preparation pass. A Variant Lab batch that stops on its first candidate
+>   *does* announce, with counts; the asymmetry is deliberate and is explained in the rule.
+> * **Clicking a notification focuses the page and does nothing else.** "…and relevant result if
+>   safe" was not implemented: selecting a tab for the operator would move the view they left.
+> * **The panel has four controls, not three** — the toggle, Allow, Send test, and a fourth
+>   *Re-check browser status*, because Chrome's per-origin permission is changed in Chrome Site
+>   Settings, which BeatSync neither sees nor controls.
+>
+> **What the live smoke verified, and what it did not.** On Windows with Chrome, against an
+> isolated instance on port 7861 and synthetic media: genuine completed Raw Cutter, Audio Cutter
+> and Library scan jobs each produced exactly one notification with truthful counts and no path in
+> the text; a genuine Audio Cutter failure produced a failure notification with no invented counts;
+> a gate-refused render produced none; the saved toggle gated delivery; duplicates, empty and
+> malformed envelopes were all suppressed; and a second browser tab received nothing from the
+> first tab's job. **Chrome's permission was never granted** — that needs a human click on browser
+> UI — so what is verified is the notification API **invocation**, not an OS-visible Windows toast.
+> A genuinely backgrounded tab could not be produced by the automation, and no successful full
+> render or Variant Lab batch was run, because `create_music_video` clears a process-global
+> directory the owner's live instance shares. Those three, plus a cancelled job, remain **unverified
+> at runtime** and are listed in the task's smoke log.
+>
+> **R17-B is untouched and remains research only.** No service worker, Push server, daemon,
+> background poller or browser extension was added, and none is authorised.
+
+**The accepted scope, as written before implementation:**
 
 Owner-requested UX improvement (2026-11-04), **accepted into the roadmap by the owner on
 2026-11-12**: after a lengthy operation finishes, **Google Chrome should offer an optional Windows

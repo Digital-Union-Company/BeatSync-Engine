@@ -1075,6 +1075,11 @@ def test_the_real_batch_continues_past_a_candidate_share_failure(tmp_path):
         "_clear_active_render": lambda invocation_id: None,
         "_render_batch_request_tag": lambda: "T",
         "_process_video_guarded_unlocked": guarded_unlocked,
+        # [FORK] R17-A: the batch's one desktop-notification write, stubbed for the same reason it
+        # is stubbed in `tests/test_render_failure_classification.py` -- it must exist or the
+        # wrapper's terminal path raises a `NameError`, and what it says is another suite's
+        # subject. It writes no component, so nothing about share publication depends on it.
+        "_notify_render_batch": lambda request, outcome: None,
         "Iterator": None, "Tuple": None, "VideoFilesInput": None,
     }
     exec(compile(ast.Module(body=[rfc._gui_func("render_selected_variants_guarded")],

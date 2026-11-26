@@ -40,6 +40,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `library-preparation.md` | `src/beatsync_fork/library_prep.py`, **`src/video_analysis.py`** (where `classify_library_sources` and the cache seams live), `tests/test_library_preparation.py` |
 | `source-verification.md` | `src/beatsync_fork/media_verify.py`, `src/ffmpeg_processing.py` (the FFprobe metadata probe), `tests/test_media_verify.py` |
 | `prep-activity.md` | `src/beatsync_fork/prep_activity.py`, `tests/test_prep_activity.py` — the in-flight activity for Scan / Analyze / Verify / Sample; the two diagnostics' mutex gate lives in their frames generators in `src/gui.py` |
+| `desktop-notifications.md` | `src/beatsync_fork/desktop_notify.py`, `tests/test_desktop_notifications.py` — what a finished-job desktop notification may say; the per-session ledger, the seven terminal points and the five client scripts live in `src/gui.py` |
 | `scale-diagnostics.md` | `src/beatsync_fork/input_report.py`, `src/video_processor.py`, `src/video_analysis.py`, `tests/test_scale_diagnostics.py` |
 | `fork-package.md` | `src/beatsync_fork/**/*.py`, `tests/test_no_runtime_dependency.py`, `tests/test_fork_identity.py` |
 | `clips-preview.md` | `src/beatsync_fork/clips_review.py`, `src/clips_media_server.py`, `tests/test_clips_{review,media_server}.py`, `docs/claude/clips-preview-selector-v1.md` |

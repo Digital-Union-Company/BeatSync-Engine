@@ -100,8 +100,11 @@ because an event must describe what actually happened. And abandonment is still 
 
 **The C3 batch prefixes; it never replaces.** The 2–4-candidate batch wrapper emits no
 `ProgressEvent` of its own, adds no stage, no phase, no counter and no ETA, and parses nothing out of
-the rendered text. It yields `f"Rendering candidate {position} / {request.count}"` — the count is the
-user's own selection, 2 to 4 — then a blank line, and then today's `ProgressView` output verbatim, so
+the rendered text. It yields `f"Rendering candidate {position} / {batch_request.count}"` — the count
+is the user's own selection, 2 to 4; the record is named `batch_request` since R17-A R4, because
+`request` there shadowed the injected `gr.Request` and silently cost the batch its desktop
+notification (`.claude/rules/desktop-notifications.md`) — then a blank line, and then today's
+`ProgressView` output verbatim, so
 the panel reads exactly as it always has with one line of context above it. A status-only yield uses
 `gr.skip()` for the video so a finished candidate's preview is never blanked by the next candidate's
 progress, which also keeps an earlier success visible when a later candidate fails locally and the

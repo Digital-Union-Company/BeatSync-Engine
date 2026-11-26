@@ -844,7 +844,105 @@ def _int(value: Any) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (R17-A R2, finding F3): how an analysis BATCH ended
+# ---------------------------------------------------------------------------
+# `summarize_analysis_run` above renders the numbers for a human. It answers no question a caller
+# can branch on, and `is_failure_report` only recognises the marker `record_failure` writes -- so a
+# pass whose shared Qwen worker died, returning a payload in which **zero** of its jobs completed
+# and nothing was cached, is not a "failure report" and used to be announced as an unqualified
+# success. These three tokens are the structural answer, read from the same `*_this_run` fields the
+# summary already quotes.
+#
+# Deliberately NOT four tokens. There is no `nothing_completed`: "no Qwen job completed" is not the
+# same fact as "nothing at all was cached" -- a candidate-less source is legitimately checkpointed
+# with no Qwen work (see `.claude/rules/stage5-cache-durability.md`) -- and inventing a total-loss
+# verdict the payload cannot support is exactly the kind of claim this classifier exists to refuse.
+
+#: Every submitted source was accounted for and every Qwen job this run issued completed.
+ANALYSIS_COMPLETE = "complete"
+#: The run finished, but some of the work it attempted provably did not complete. Authoritative:
+#: `qwen_incomplete_jobs_this_run` counts jobs that were issued and were therefore NOT cached, and
+#: `source_count` below the submitted count counts submitted paths the analyzer never saw.
+ANALYSIS_INCOMPLETE = "incomplete"
+#: The result payload cannot be read, or contradicts itself. **Not a failure and not a success** --
+#: the caller is expected to report it as neither.
+ANALYSIS_UNKNOWN = "unknown"
+
+ANALYSIS_OUTCOMES = (ANALYSIS_COMPLETE, ANALYSIS_INCOMPLETE, ANALYSIS_UNKNOWN)
+
+#: The `*_this_run` fields this verdict rests on, plus the invocation's own cache-scan counts. Every
+#: one is ephemeral top-level metadata by the R1 contract (`.claude/rules/stage5-reporting.md`):
+#: none of them enters a cache payload, a cache key or the completion contract.
+_ANALYSIS_FIELDS = ("sources_analyzed_this_run", "qwen_jobs_this_run",
+                    "qwen_completed_jobs_this_run", "qwen_incomplete_jobs_this_run",
+                    "source_count")
+
+
+def _strict_count(value: Any) -> int | None:
+    """A whole non-negative count, or ``None`` for "not supplied or not a count".
+
+    Deliberately **not** :func:`_int`, which coerces a missing or malformed field to ``0``. Zero is
+    a measurement here -- `0 incomplete jobs` is what makes a run complete -- so a field that is
+    absent, a string, a float or a `bool` must read as *unknown* rather than as a reassuring zero.
+    `bool` is rejected first because it subclasses `int`, the same trap the Stage-5 count readers
+    record.
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def analysis_run_outcome(result: Any, submitted: Any) -> str:
+    """Did this preparation analysis batch actually do what it was asked to do?
+
+    One of :data:`ANALYSIS_OUTCOMES`. Total: it never raises, never guesses and never reads a word
+    of the rendered report -- it is a reading of the analyzer's own structured current-run counts,
+    exactly as `raw_cutter_batch.terminal_status` is a reading of the cutter's own per-source
+    outcomes.
+
+    ``submitted`` is what the caller handed the analyzer, which is knowable without trusting the
+    result payload at all. It is compared against ``source_count`` -- the analyzer's count of the
+    submitted paths that still existed -- so a source that vanished between Scan and Analyze is
+    reported rather than silently dropped.
+
+    **An unknown verdict is returned rather than approximated.** A non-mapping result, a missing or
+    malformed count, or a job tally that does not add up all answer :data:`ANALYSIS_UNKNOWN`; it is
+    the caller's job to report that as neither a success nor a failure.
+
+    **One residual limitation, recorded rather than guessed at.** A source the analyzer opened but
+    could not decode is counted as analysed, is correctly not cached, and issues no Qwen job -- so
+    this classifier reads such a run as complete. The payload carries no count for it, and adding
+    one would mean changing the Stage-5 orchestrator to make a notification easier to classify.
+    The operator's own panel still reports the batch's numbers, and the next scan still shows the
+    source as needing analysis.
+    """
+    asked = _strict_count(submitted)
+    if not isinstance(result, Mapping) or asked is None:
+        return ANALYSIS_UNKNOWN
+    counts = {field: _strict_count(result.get(field)) for field in _ANALYSIS_FIELDS}
+    if any(value is None for value in counts.values()):
+        return ANALYSIS_UNKNOWN
+    jobs = counts["qwen_jobs_this_run"]
+    completed = counts["qwen_completed_jobs_this_run"]
+    incomplete = counts["qwen_incomplete_jobs_this_run"]
+    # Every submitted job starts incomplete and is promoted only by its own returned evidence, so
+    # these three must agree. They are read off a payload a subprocess influenced; a tally that
+    # does not add up is a payload nothing should be concluded from.
+    if completed + incomplete != jobs:
+        return ANALYSIS_UNKNOWN
+    if incomplete:
+        return ANALYSIS_INCOMPLETE
+    if counts["source_count"] < asked:
+        return ANALYSIS_INCOMPLETE
+    return ANALYSIS_COMPLETE
+
+
 __all__ = [
+    "ANALYSIS_COMPLETE",
+    "ANALYSIS_INCOMPLETE",
+    "ANALYSIS_OUTCOMES",
+    "ANALYSIS_UNKNOWN",
     "BACKEND_UNVERIFIED_TEXT",
     "BATCH_FINISHED_TEXT",
     "DEFAULT_ANALYZE_BATCH_SIZE",
@@ -864,6 +962,7 @@ __all__ = [
     "SEMANTIC_MODE_TEXT",
     "STALE_DECLARATION_TEXT",
     "SourceClassification",
+    "analysis_run_outcome",
     "analyze_refusal",
     "build_scan_result",
     "declaration_refusal",

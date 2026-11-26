@@ -23,7 +23,7 @@ import os
 import sys
 
 import pytest
-from conftest import write_file
+from conftest import submitted_parameters, write_file
 
 import beatsync_fork.render_worker as fork_render_worker
 from beatsync_fork.input_confirmation import SourceMode
@@ -282,7 +282,14 @@ def test_gui_guarded_signature_matches_the_click_inputs():
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == "process_video_guarded"
     )
-    parameters = [arg.arg for arg in handler.args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. The notification layer appended a parameter
+    # annotated `gr.Request`, which Gradio INJECTS at that parameter's own index rather than taking
+    # from `inputs` -- so it is deliberately absent from the click list, and comparing it against a
+    # widget would assert the opposite of this contract. One shared exclusion rule lives in
+    # `tests/conftest.py`; the assertion below pins that it is genuinely the last parameter, so the
+    # exclusion cannot become a way to hide a widget argument that was never wired up.
+    parameters = submitted_parameters(handler)
+    assert [arg.arg for arg in handler.args.args] == parameters + ["request"]
 
     click_call = next(
         node
@@ -295,6 +302,7 @@ def test_gui_guarded_signature_matches_the_click_inputs():
     )
     inputs_node = next(kw.value for kw in click_call.keywords if kw.arg == "inputs")
     input_names = [node.id for node in inputs_node.elts if isinstance(node, ast.Name)]
+    assert "request" not in input_names, "the injected session must not be a submitted input"
 
     assert len(parameters) == len(input_names), (
         f"handler takes {parameters}, click supplies {input_names}"

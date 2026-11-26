@@ -16,6 +16,9 @@ import re
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import INJECTED_ANNOTATIONS, submitted_parameters
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
 _EXPORT = os.path.join(_REPO_ROOT, "src", "raw_cutter_export.py")
@@ -992,8 +995,25 @@ def test_the_cut_inputs_match_the_handler_signature(gui_tree):
                             ("cut_run_btn", "_on_cut_run")):
         inputs = _kwargs(_click(gui_tree, widget))["inputs"]
         names = [ast.unparse(e) for e in inputs.elts]
-        parameters = [a.arg for a in _func(gui_tree, handler).args.args]
+        parameters = submitted_parameters(_func(gui_tree, handler))
         assert len(names) == len(parameters), (widget, names, parameters)
+
+
+def test_the_injected_session_is_not_a_submitted_input(gui_tree):
+    """[FORK] R17-A: the exclusion above must not become a way to hide a real input.
+
+    The notification layer's `request` is INJECTED, so the browser gains no new way to name a
+    session: it must appear in neither Raw Cutter registration's `inputs`, and it must be the LAST
+    parameter of each handler so no pre-existing positional index moved.
+    """
+    for widget, handler in (("cut_run_btn", "_on_cut_run"),
+                            ("cut_batch_start_btn", "_on_cut_batch_run_ui")):
+        inputs = _kwargs(_click(gui_tree, widget))["inputs"]
+        assert "request" not in [ast.unparse(e) for e in inputs.elts], widget
+        arguments = _func(gui_tree, handler).args.args
+        assert arguments[-1].arg == "request", handler
+        assert ast.unparse(arguments[-1].annotation) in INJECTED_ANNOTATIONS, handler
+        assert len(submitted_parameters(_func(gui_tree, handler))) == len(arguments) - 1
 
 
 #: The three button updates `_cut_buttons` / `_cut_batch_buttons` return as one set.

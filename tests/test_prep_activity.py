@@ -582,6 +582,13 @@ def _load_prep_worker_seam():
         # preserved because the verification handlers already exec'd above resolve `gr` by name.
         "gr": types.SimpleNamespace(
             Request=_FakeRequest, update=lambda **kw: ("gr.update", kw)),
+        # [FORK] R17-A: the one desktop-notification write `_run_prep_in_worker`'s terminal frame
+        # makes, recorded rather than performed. It is a RECORDER so a case can read back what the
+        # terminal frame asked to announce; what a notification may SAY, and the scan/analyze job
+        # mapping, are `tests/test_desktop_notifications.py`'s subject. It still has to exist, or
+        # every frame of every preparation stream dies on a `NameError`.
+        "_notify_library": lambda request, operation, **verdict:
+            namespace.setdefault("_notified", []).append((operation, verdict)),
     })
     nodes = [_func(tree, name) for name in
              ("_prep_ui_updates", "_prep_busy_updates", "_run_prep_in_worker")]

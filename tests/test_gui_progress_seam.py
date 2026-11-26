@@ -339,7 +339,10 @@ def test_the_batch_prefixes_the_existing_status_text_without_parsing_it():
     body = _gui_body("render_selected_variants_guarded")
     # the ordinal line, then the untouched inner text
     # `ast.unparse` normalises f-strings to single quotes, hence the spelling here.
-    assert "f'Rendering candidate {position} / {request.count}'" in body
+    # [FORK] R17-A R4: the batch's own request record is `batch_request` now. It used to be
+    # `request`, which shadowed the injected `gr.Request` and silently cost the batch its
+    # notification; the prefix itself, and everything this test is about, is unchanged.
+    assert "f'Rendering candidate {position} / {batch_request.count}'" in body
     assert "f'{prefix}" + chr(92) + "n" + chr(92) + "n{last_status}'" in body
     # nothing reads stage identity back out of prose — the mistake Phase 2A deleted
     for forbidden in ("re.search", "re.match", "Stage (", "\\d+", ".index('Stage",
@@ -452,6 +455,14 @@ class _RenderHarness:
             "RenderLifecycleState": _render_worker.RenderLifecycleState,
             "RenderOutcomeKind": _render_worker.RenderOutcomeKind,
             "RENDER_OUTCOME_KEY": "render_outcome_kind",
+            # [FORK] R17-A: the gate core's "did the render body run" marker, and the one
+            # desktop-notification write the single-render wrapper's terminal path makes. The
+            # notification is stubbed rather than performed -- this harness has no business
+            # writing a process-global ledger, and what a notification says is
+            # `tests/test_desktop_notifications.py`'s subject. Both names must EXIST, or the
+            # extracted bodies die on a `NameError`.
+            "RENDER_STARTED_KEY": "render_body_entered",
+            "_notify_render": lambda request, outcome_kind, started: None,
             # the real capacity-one active-render slot's own lock and (initially empty) slot; the
             # three slot helpers are extracted from gui.py by the tests that need them
             "_ACTIVE_RENDER_SLOT_LOCK": threading.Lock(),

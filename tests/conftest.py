@@ -7,6 +7,7 @@ and cleans up, so no repository-local scratch is created (see CLAUDE.md, PCBUS-H
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from dataclasses import dataclass, field
@@ -49,6 +50,32 @@ def isolated_shared_config(tmp_path_factory):
             os.environ.pop(analysis_cache.ENV_CONFIG_PATH, None)
         else:
             os.environ[analysis_cache.ENV_CONFIG_PATH] = previous
+
+
+# [FORK] Digital-Union (R17-A Desktop Notifications): one definition of "Gradio injects this
+# parameter", shared by every suite that pins a positional `inputs`-to-signature contract.
+#
+# Gradio passes a click's `inputs` positionally, and several suites assert that the two lists line
+# up name for name or that a particular argument is last. A parameter annotated `gr.Request` is
+# **injected by Gradio**, not submitted by the browser: it is deliberately absent from `inputs`, and
+# Gradio inserts its value at the annotated parameter's own index, which is exactly what keeps every
+# submitted argument aligned. So it has to be excluded before the comparison -- but excluded by a
+# rule stated ONCE, because eight suites carry that contract and a local copy in each is eight
+# chances for one of them to drift into excluding something real.
+#
+# The STRING spellings are listed because the render and Raw Cutter handlers annotate it as
+# `"gr.Request"`: their bodies are AST-extracted and executed against synthesised namespaces in
+# which `gr` does not exist, and a live annotation is evaluated at `def` time and would raise there.
+# Gradio resolves the string through `typing.get_type_hints` against the module's own globals, so
+# injection is unaffected.
+INJECTED_ANNOTATIONS = ("gr.Request", "'gr.Request'", '"gr.Request"')
+
+
+def submitted_parameters(func) -> list[str]:
+    """The handler parameters Gradio fills from `inputs`, in order, injected ones excluded."""
+    return [arg.arg for arg in func.args.args
+            if arg.annotation is None
+            or ast.unparse(arg.annotation) not in INJECTED_ANNOTATIONS]
 
 
 def write_file(path: str, content: bytes) -> str:

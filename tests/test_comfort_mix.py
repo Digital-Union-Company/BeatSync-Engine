@@ -14,6 +14,9 @@ import os
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import submitted_parameters
+
 from beatsync_fork import audio_mix as mix
 from beatsync_fork import loudness as loud
 
@@ -491,7 +494,12 @@ def test_the_controls_ride_at_the_end_of_the_positional_contract(gui_tree: ast.M
     keeping.
     """
     handler = _func(gui_tree, "process_video_guarded")
-    names = [a.arg for a in handler.args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. The notification layer appended a parameter annotated
+    # `gr.Request`, which Gradio INJECTS at that parameter's own index rather than taking from
+    # `inputs`; comparing it against a widget would assert the opposite of this contract. The
+    # shared exclusion lives in `tests/conftest.py`, and the assertion below keeps it honest.
+    names = submitted_parameters(handler)
+    assert [a.arg for a in handler.args.args] == names + ["request"]
 
     for call in ast.walk(gui_tree):
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)

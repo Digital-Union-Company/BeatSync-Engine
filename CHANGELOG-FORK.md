@@ -20,6 +20,241 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-26 (R17-A R4: a Variant Lab batch never sent its notification)
+
+The attended job-notification playtest found that a finished **Variant Lab batch** announced
+nothing at all. Two real two-candidate batches, both reporting *2 / 2 succeeded*, produced **zero**
+notifications, while a Raw Cutter folder batch run immediately afterwards in the same browser tab
+and session delivered normally — so the ledger, the session key, the chained drain, the hidden
+envelope and the client dispatcher were all healthy, and the batch was the only broken producer.
+
+**One name, used for two different things.** `render_selected_variants_guarded` takes the injected
+`gr.Request` as its last parameter, and then opened its body with
+
+```python
+request, refusal = fork_render_batch.build_request(...)
+```
+
+which **rebound that parameter** to the batch's own `RenderBatchRequest`. Every later use —
+`request.count`, `request.candidates` — was correct for the batch record, and the terminal
+`_notify_render_batch(request, outcome)` was not: it handed the publisher an object with no
+`session_hash`, so `_notify_session_key` answered `''` and `_notify_publish` returned at its
+`if not key` guard. **No exception was raised**, because a record that cannot be attributed to a
+session is refused by design — the safe direction for the cross-session leak the ledger exists to
+prevent, and the invisible direction for this. The batch's own record is now `batch_request`, and
+the injected session reaches the publisher unchanged.
+
+Nothing else moved. The selection, lifecycle, mutex, concurrency, cancellation, continuation policy
+and every output are identical; the session-identity guard was not weakened; no component,
+endpoint, `inputs` or `outputs` list was added; and the ledger and notification subsystem are
+untouched.
+
+**The suite could not see it, and that gap is closed too.** The translator was tested directly with
+a correct fake request, the one test that executed this handler's real body *stubbed*
+`_notify_render_batch` to a no-op, and the producer-call assertion pins a **call count** read off
+the AST — the call was there, exactly once, and nothing asserted what was passed to it. Sixteen new
+tests now execute the shipped wrapper against the real translator, publisher, ledger and drain,
+covering success, partial failure, cancellation, total failure, a refused batch, session isolation,
+consume-once and the application toggle — plus a structural rule, applied to **all seven**
+producers, that none of them may rebind its injected `request`. Measured against the pre-fix
+`bdb342fd`, nine of those sixteen fail (the headline one with *"expected one batch notification,
+got 0"*); against the correction all sixteen pass.
+
+**Verified in Chrome against the shipped build**, on a storage-isolated instance: one real
+two-candidate Variant Lab batch produced **exactly one** envelope and **exactly one**
+`new Notification(...)` call, tagged `beatsync-<id>`, with a Raw Cutter folder batch retained as a
+positive control in the same session.
+
+### Fixed — 2026-11-26 (R17-A R3: the two notification diagnostics were not repeatable or responsive)
+
+The owner granted Chrome's permission, received a **real Windows notification** from their first
+"Send test notification", and then saw nothing from any click afterwards. Two separate defects, both
+in the Settings panel's diagnostics and neither anywhere near a job's terminal path.
+
+* **The test notification carried one fixed tag, so every click after the first replaced its
+  predecessor silently.** It was `beatsync-test`, always, and two notifications sharing a tag are
+  one notification as far as the Notification API is concerned: the second replaces the first in
+  place, with no banner and no sound. The constructor had been returning normally every time. Each
+  deliberate click now mints a fresh tag, `beatsync-test-<clock>-<counter>`, so each is a new
+  notification rather than an edit of the last one. **A real job's tag is untouched** — still
+  `beatsync-<id>` from the per-event identity, so the browser-level collapse that sits underneath
+  the client ledger still guards a genuine duplicate. (`renotify` was considered and rejected: it is
+  specified for `ServiceWorkerRegistration.showNotification`, this feature has no service worker by
+  accepted scope, and with a unique tag there is nothing left for it to re-alert.)
+* **Neither diagnostic button acknowledged a click at all.** "Send test notification" discarded the
+  one fact it had — whether the constructor was even reached — and "Re-check browser status"
+  delegated to a painter that returns early when the permission state has not changed, which is the
+  overwhelmingly common case. Both were indistinguishable from dead buttons. All three diagnostic
+  buttons now write a timestamped line into the panel, and the timestamp is load-bearing rather than
+  decorative: a repeated identical answer is only *visibly* a new answer if something on the line
+  moves.
+
+The success wording describes the **request**, never the delivery: *"Test notification requested
+successfully. Whether it appears is Windows' decision — Focus Assist, Do Not Disturb or a
+notification setting can still suppress it."* A constructor that returned proves only that the
+browser accepted the call. Each refusal names its own obstacle and its own fix, because an unasked
+permission, a denied one, an unsupported API and a constructor that threw need four different
+things from the operator — and an unrecognised result reads as *unknown*, never as a success.
+
+No server call, endpoint, component, `inputs` or `outputs` list was added: the three diagnostic
+registrations are still `fn=None` with empty `inputs` and `outputs`, the acknowledgement is a second
+`div` inside the one component that has no server-side writer, and it ships **empty** so a freshly
+loaded page carries no stale claim about a browser action that never happened.
+
+**Verified in Chrome against the shipped build**, on an isolated instance whose preferences and
+Stage-5 record store were redirected into a task workspace: with the real Notification API and a
+`default` permission, a test click produced the correct refusal line and **no permission prompt**;
+two Re-check clicks four seconds apart produced the same sentence with two different timestamps;
+with a recording stub, three clicks produced **three constructor calls with three distinct tags**
+where the pre-R3 code produced three calls with **one**; the granted, denied, unsupported and
+constructor-threw paths each produced their own sentence; a replayed job envelope still delivered
+nothing and still used `beatsync-<id>`; and a fresh page load produced zero notifications, zero
+permission requests and an empty feedback line.
+
+**Still not claimed:** an OS-visible Windows toast. The Chrome profile holding the owner's grant for
+`http://127.0.0.1:7860` is not the profile the automation drives, and granting one is a human action
+on browser UI — so everything up to and including the constructor call is verified and whether
+Windows drew a toast is not.
+
+### Fixed — 2026-11-26 (R17-A R2: three outcome-accuracy defects in the notification layer)
+
+R17-A's own rule is *"do not announce success while the result is unknown"*. A focused review of
+PR #112 found three of its seven job families breaking it. All three fixes are in the **translation**
+layer: no job's result, progress, cancellation or concurrency behaviour changed, no event source,
+component, `inputs` or `outputs` list was added, and `CACHE_CONTRACT_VERSION` / `ANALYSIS_VERSION`
+are untouched.
+
+* **A Raw Cutter folder batch whose every source failed announced `finished with problems`.**
+  `raw_cutter_batch.terminal_status` answers `completed_with_failures` for *any* failed source —
+  correct for the headline, wrong for an outcome, and a batch of three unreadable files with no
+  clips on disk arrived there too. Its four terminal classes now split: `cancelled` and `failed`
+  describe the **run** and stay translated; `completed` and `completed_with_failures` mean the run
+  reached the end of its frozen list and are **folded from the measured counts**. `no_clips` and
+  `partial` ride out of the same `summarise` fold, so a run that merely found nothing worth
+  exporting is not reported as a failure either, and a source that put 7 of 10 clips on disk still
+  counts on both sides. A clean batch whose **authoritative record could not be written** is now
+  qualified too — the headline, the activity panel and the summary all said the record was lost
+  while the notification alone said `finished`.
+* **Reset defaults left the Settings panel stating a setting the application was not using.**
+  `user_prefs.empty_options()` returns the toggle to `off` in `preferences.json` **and** in the
+  in-memory options the delivery gate reads, while the handler wrote neither the checkbox nor the
+  sentence beside it. Both are now written, from `_notify_settings_on_load()`, which also makes the
+  persistence-failure path report the setting that is genuinely still in force.
+* **…and a programmatic component write was persisting itself.** Gradio's `.change` fires for a
+  function update as well as a user gesture, so `_notify_settings_on_load` — which corrects the
+  checkbox for every new browser session — re-entered the save handler: **opening a tab rewrote
+  `preferences.json` and raised an "ON" toast for a page the operator had only just loaded.** The
+  handler now returns early when the resolved boolean already matches the stored one. `.change` is
+  kept rather than swapped for `.input`, exactly as `pref_collision.change` is.
+* **A library analysis pass whose shared Qwen worker died announced `Library analysis finished`.**
+  Real GPU minutes, nothing cached, no exception — and therefore no failure marker for
+  `library_prep.is_failure_report` to recognise. The new `library_prep.analysis_run_outcome` reads
+  the analyzer's own current-run counts (`qwen_incomplete_jobs_this_run`, the job tally, and
+  `source_count` against what was submitted) and answers `complete` / `incomplete` / `unknown`;
+  the last two are both reported as `finished with problems`, and **an absent or unrecognised
+  verdict is never a success**. It travels in a caller-owned sink written on the success path and
+  read after the worker thread is joined — no new field on `PrepSessionState`, no write path, no
+  second analyzer call, no record read.
+
+Two smaller corrections found while verifying the above:
+
+* **Two items sharing an id inside one envelope each called the `Notification` constructor.** The
+  dispatcher's `delivered` snapshot was read once before the loop and never updated, so only the
+  durable `localStorage` ledger was right. Measured in Chrome against the pre-fix script: **3**
+  constructor calls where the shipped one makes **2**.
+* **`_notify_cut`'s crashed branch could raise into a finished job's terminal path.** It compared
+  `(written or 0) > 0`, outside `_notify_publish`'s guard. Translator arithmetic now goes through
+  the pure, total `desktop_notify.total_count`, and a property test exercises every shipped
+  translator with values no call site produces.
+
+**Verified at runtime on real media** through an isolated instance whose preferences *and* Stage-5
+record store were redirected into a task workspace — the owner's `state/preferences.json`, both
+analysis caches, `input/processing`, `input/gradio_uploads` and `output/` all measured unchanged:
+a real failed folder batch announcing **failed**; real successful and **cancelled** batches
+announcing truthfully; a real **incomplete** analysis announcing `finished with problems`; Reset and
+a page load each leaving `preferences.json` byte-identical. Separately and headless, one short
+render published **200 of 200 planned frames** at 8.000000 s against 8.000000 s of audio and decoded
+clean. Whole suite: **11 398 passed, 25 skipped**.
+
+**Still not claimed:** an OS-visible Windows toast. Chrome's permission for the origin is `default`
+and granting it needs a human click on browser UI automation cannot reach, so everything up to and
+including the constructor call is verified and whether Windows drew a toast is not.
+
+### Added — 2026-11-26 (R17-A: optional desktop notifications when a long job finishes)
+
+One Windows desktop notification, through the already-open Chrome tab, when an **authoritative**
+long-running job reaches a terminal state. **OFF by default**, saved with the other application
+options in `state/preferences.json`.
+
+Seven event sources, each reading the classification its own subsystem already publishes: the music
+video render, the Variant Lab batch, the Raw Cutter (single and folder batch), the Audio Cutter, and
+Library scan and analysis. Four outcomes — success, partial, failed, cancelled — with safe counts:
+`BeatSync — Raw Cutter batch finished with problems · 27 completed, 1 failed`.
+
+**No service worker, Push infrastructure, daemon, background poller, timer or browser extension**,
+and no new job or progress coordinator. All five client scripts register `fn=None` and contain no
+network call of any kind; the browser is *told* when a job finished rather than asking.
+
+```
+a job's terminal path  -> _notify_<family>(request, …)   translate a typed class, never derive
+                       -> _notify_publish(…)             one uuid4 id, one bounded session ledger
+.then() on the SAME click
+                       -> _notify_drain(request)         POP; apply the saved toggle
+                       -> notify_envelope (hidden)       one JSON envelope
+notify_envelope.change(js=…)
+                       -> dispatch()                     dedupe, then new Notification()
+```
+
+**Nothing about any job changed.** Not one producing handler's `inputs`, `outputs`, emitted arity or
+generator shape was touched: delivery is a chained event, and the owning browser session arrives as
+an **injected** `gr.Request` appended last to seven signatures and present in no `inputs` list. The
+ledger is keyed by session, so one operator's job can never be announced to another's tab, and
+`_notify_publish` cannot raise into a terminal path — a notification is a courtesy, a job's result
+is not.
+
+**Content cannot leak a location, because no caller may supply text.** `desktop_notify.build` takes
+a job token, an outcome token and integers; the words come from its own tables. An unknown job kind,
+an unknown outcome or an unusable id answers `None` rather than the cheerful default, and a count
+that is not a whole non-negative `int` is dropped rather than guessed. Measured live: the Audio
+Cutter's failure report shows the full `E:\…` path on screen and the notification does not.
+
+**Three duplicate guards, none relying on another**: one id minted per terminal event, a drain that
+*pops*, and a bounded `localStorage` ledger written **before** the send and shared across tabs.
+
+**The panel states what it can and cannot promise.** The page has to stay open; Focus Assist, Do Not
+Disturb and Chrome's own settings can suppress a toast; BeatSync can neither revoke nor restore a
+Chrome permission. `Notification.requestPermission()` has one implementation and one route to it —
+a button — so a page load, a render and a saved-toggle change can none of them produce a prompt.
+
+**One pre-existing defect fixed on the way.** `save_preferences` replaces the whole file and fills
+any option key the caller omits with its default, so the single-key writes in
+`_on_collision_policy_change` and `_on_save_folder_prefs` were harmless only while there was one
+option. With two, picking a collision policy switched notifications back off. Both now pass the
+complete set; verified live — `"collision_policy": "suffix"` survived a toggle write.
+
+**Three defects were found by the live smoke and fixed before the first commit**: a gate-refused
+render announced "render failed" (it records `SHARED_FATAL` exactly as a real failure does, so
+`RENDER_STARTED_KEY` now tells them apart); the browser-status line never painted on Gradio's
+lazily-rendered Settings tab; and a second browser session was served a stale toggle, rendering
+"OFF" while the gate was delivering.
+
+**Verified.** The whole suite passes. `tests/test_desktop_notifications.py` adds 196 cases over
+four tiers — the pure policy exhaustively, the real `user_prefs` store, the shipped ledger and all
+six outcome translators AST-extracted from `gui.py` and **executed**, and the five client scripts
+structurally. Live on Windows with Chrome, against an isolated instance and synthetic media:
+genuine completed Raw Cutter, Audio Cutter and Library scan jobs each produced exactly one truthful
+notification; a genuine failure produced a failure notification with no invented counts; a
+gate-refused render produced none; the toggle gated delivery; duplicates, empty and malformed
+envelopes were suppressed; and a second tab received nothing from the first tab's job.
+
+**What the smoke could not establish, stated plainly.** Chrome's permission was never granted —
+that needs a human click on browser UI nobody authorised — so what is verified is the notification
+API **invocation**, not an OS-visible Windows toast. The automation could not produce a genuinely
+backgrounded tab. No successful full render or Variant Lab batch was run live, because
+`create_music_video` clears a process-global directory the owner's running instance shares; their
+terminal points are covered by the executed tests instead. A cancelled job was not reproduced —
+the synthetic fixtures finish in under a second.
+
 ### Fixed — 2026-11-23 (UX-PREP-VISUAL-PROGRESS R1 remediation: two source-review findings on PR #111)
 
 Both findings are defects in the entry below, found by source review before the change reached the

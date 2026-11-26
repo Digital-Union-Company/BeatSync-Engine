@@ -27,6 +27,9 @@ from typing import Any, Dict, List, Sequence
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import submitted_parameters
+
 from beatsync_fork import creative as fork_creative
 from beatsync_fork import presets as fork_presets
 
@@ -857,7 +860,12 @@ def test_all_four_controls_are_live_render_request_inputs():
     assert ast.unparse(kwargs["fn"]) == "process_video_guarded"
 
     inputs = [n.id for n in kwargs["inputs"].elts if isinstance(n, ast.Name)]
-    parameters = [a.arg for a in _func(tree, "process_video_guarded").args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. `request` is annotated `gr.Request`, so Gradio
+    # injects it at its own index and it is deliberately absent from `inputs`. See
+    # `tests/conftest.py`; the assertion below pins that it is the last parameter, so this
+    # exclusion cannot become a way to hide a real widget argument.
+    parameters = submitted_parameters(_func(tree, "process_video_guarded"))
+    assert [a.arg for a in _func(tree, "process_video_guarded").args.args][-1] == "request"
 
     assert len(inputs) == len(parameters), f"{inputs} vs {parameters}"
     for widget in _ALL_CREATIVE_WIDGETS:

@@ -24,6 +24,9 @@ import os
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import submitted_parameters
+
 from beatsync_fork import audio_mix as fork_audio_mix
 from beatsync_fork import render_worker as fork_render_worker
 from beatsync_fork import smart_mix as fork_smart_mix
@@ -432,7 +435,8 @@ def test_the_audio_controls_are_live_render_request_inputs_in_order():
         raise AssertionError("process_btn.click not found")
 
     inputs = [n.id for n in kwargs["inputs"].elts if isinstance(n, ast.Name)]
-    parameters = [a.arg for a in func("process_video_guarded").args.args]
+    # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
+    parameters = submitted_parameters(func("process_video_guarded"))
 
     assert len(inputs) == len(parameters)
     for widget in ("voice_files", "voice_start_delay", "voice_min_gap",
@@ -1358,7 +1362,8 @@ def test_the_click_inputs_align_with_the_guard_parameters():
                  and ast.unparse(node.func) == "process_btn.click")
     kwargs = {kw.arg: kw.value for kw in click.keywords}
     inputs = [getattr(n, "id", None) for n in kwargs["inputs"].elts]
-    params = [a.arg for a in func("process_video_guarded").args.args]
+    # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
+    params = submitted_parameters(func("process_video_guarded"))
     # audio_input -> audio_file is the one deliberate rename
     assert params[0] == "audio_file"
     assert inputs[1:] == params[1:]
@@ -1697,7 +1702,10 @@ def test_the_public_wrapper_keeps_its_positional_gradio_contract():
     wrapper rather than the core — otherwise the single render would bypass the render mutex.
     """
     root = tree()
-    params = [a.arg for a in func("process_video_guarded").args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. `request` is annotated `gr.Request`, so Gradio
+    # injects it and it is deliberately absent from `inputs`; comparing it against a widget would
+    # assert the opposite of the contract. See `tests/conftest.py`.
+    params = submitted_parameters(func("process_video_guarded"))
     click = next(n for n in ast.walk(root)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and ast.unparse(n.func) == "process_btn.click")
@@ -1716,6 +1724,10 @@ def test_the_public_wrapper_keeps_its_positional_gradio_contract():
     # the core is the shape a per-caller overwrite policy would take.
     assert func(GATE_CORE).args.kwonlyargs == []
     assert "refuse_existing_output" not in params
+    # [FORK] R17-A: and the injected parameter must be the LAST one, so no pre-existing positional
+    # index moved. Asserted here rather than only excluded above, so the exclusion cannot become a
+    # way to hide a real widget argument.
+    assert [a.arg for a in func("process_video_guarded").args.args][-1] == "request"
     for name in ("process_video_guarded", "render_selected_variants_guarded", GATE_CORE):
         assert "refuse_existing_output" not in body_source(name), \
             f"{name} still threads a per-caller overwrite policy"

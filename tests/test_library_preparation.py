@@ -38,6 +38,9 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import pytest
 
+# [FORK] R17-A: one shared definition of "Gradio injects this parameter" (see `tests/conftest.py`).
+from conftest import submitted_parameters
+
 from beatsync_fork import analysis_cache as fork_analysis_cache
 from beatsync_fork import freestyle as fork_freestyle
 from beatsync_fork import library_prep as lp
@@ -870,7 +873,13 @@ def test_f_the_analyze_handler_signature_matches_its_click_inputs():
     """
     kwargs = _click_kwargs(_tree(_GUI), "prep_analyze_btn")
     widgets = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
-    params = [a.arg for a in _func(_tree(_GUI), "_on_prep_analyze_click").args.args]
+    # [FORK] R17-A: the SUBMITTED parameters. The notification layer appended a parameter
+    # annotated `gr.Request`, which Gradio INJECTS at that parameter's own index rather than taking
+    # from `inputs`, so it is deliberately absent from the click list. One shared exclusion rule
+    # lives in `tests/conftest.py`; the extra assertion keeps it honest.
+    params = submitted_parameters(_func(_tree(_GUI), "_on_prep_analyze_click"))
+    assert [a.arg for a in _func(_tree(_GUI), "_on_prep_analyze_click").args.args] == \
+        params + ["request"]
 
     assert params == ["folder_path", "recursive", "batch_size", "state"]
     assert len(params) == len(widgets)
@@ -887,8 +896,11 @@ def test_f_the_scan_click_takes_the_folder_controls_only():
     names = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
     assert names == ["prep_folder", "prep_recursive", "prep_state"]
     assert getattr(kwargs["fn"], "id", None) == "_on_prep_scan_click"
-    params = [a.arg for a in _func(_tree(_GUI), "_on_prep_scan_click").args.args]
+    # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
+    params = submitted_parameters(_func(_tree(_GUI), "_on_prep_scan_click"))
     assert params == ["folder_path", "recursive", "state"]
+    assert [a.arg for a in _func(_tree(_GUI), "_on_prep_scan_click").args.args] == \
+        params + ["request"]
 
 
 # ===========================================================================
@@ -1084,10 +1096,13 @@ def test_i_the_render_click_inputs_carry_no_preparation_state():
 
 
 def test_i_the_guard_signature_carries_no_preparation_state():
-    args = [a.arg for a in _func(_tree(_GUI), "process_video_guarded").args.args]
+    # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
+    args = submitted_parameters(_func(_tree(_GUI), "process_video_guarded"))
     # audio_input -> audio_file is the one deliberate rename between widget and parameter.
     assert args == ["audio_file"] + _RENDER_CLICK_INPUTS[1:]
     assert not any(name.startswith("prep") for name in args)
+    assert [a.arg for a in _func(_tree(_GUI), "process_video_guarded").args.args] == \
+        args + ["request"]
 
 
 def test_i_preparation_widgets_are_absent_from_source_outputs():
@@ -1259,6 +1274,10 @@ class _Recorder:
         self.classify_result: dict = {}
         self.probe_result: dict | None = None
         self.ready_paths: list[str] = []
+        # [FORK] R17-A R2 (F3): an override for what `analyze_video_sources` returns, so a test can
+        # drive the real handler with a payload shaped like a dead worker's or a partial run's.
+        # `None` keeps the sparse default every pre-R2 case was written against.
+        self.analyze_result: dict | None = None
 
 
 def _gui_namespace(recorder: _Recorder, tmp_path) -> Dict[str, Any]:
@@ -1288,6 +1307,8 @@ def _gui_namespace(recorder: _Recorder, tmp_path) -> Dict[str, Any]:
             "video_files": list(video_files or []), "audio_profile": audio_profile,
             "enable_ai": enable_ai, "qwen_model_path": qwen_model_path, "use_gpu": use_gpu,
         })
+        if recorder.analyze_result is not None:
+            return recorder.analyze_result
         return {"sources_analyzed_this_run": len(video_files or []),
                 "qwen_jobs_this_run": 0, "analysis_seconds": 2.5}
 
@@ -3051,3 +3072,122 @@ def test_m_verification_does_not_touch_the_director_media_summary():
     for forbidden in ("verify_media_health", "MediaStatus", "fork_media_verify",
                       "probe_media_metadata"):
         assert forbidden not in summary, f"the Director summary now consults {forbidden}"
+
+
+# ===========================================================================
+# N. THE ANALYSIS RUN'S STRUCTURAL OUTCOME  (R17-A R2, finding F3)
+#
+# `record_analysis_complete` carries a rendered summary and `is_failure_report` recognises only
+# the marker `record_failure` writes, so a pass whose shared Qwen worker died -- real GPU minutes,
+# nothing cached, no exception -- was indistinguishable from a clean one. The verdict is published
+# into a caller-owned sink, from the analyzer's own `*_this_run` counts, and nothing about it may
+# change what the panel says or what the handler returns.
+# ===========================================================================
+
+
+def _analyze_payload(**overrides) -> dict:
+    """A result shaped like `analyze_video_sources`', complete and self-consistent by default."""
+    payload = {
+        "sources_analyzed_this_run": 4, "qwen_jobs_this_run": 4,
+        "qwen_completed_jobs_this_run": 4, "qwen_incomplete_jobs_this_run": 0,
+        "qwen_requested_count_this_run": 40, "qwen_tag_count_this_run": 40,
+        "cache_hits": 0, "source_count": 4, "analysis_seconds": 12.0,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, lp.ANALYSIS_COMPLETE),
+    # The defect: the batch returned, and not one of its jobs completed.
+    ({"qwen_completed_jobs_this_run": 0, "qwen_incomplete_jobs_this_run": 4},
+     lp.ANALYSIS_INCOMPLETE),
+    ({"qwen_completed_jobs_this_run": 3, "qwen_incomplete_jobs_this_run": 1},
+     lp.ANALYSIS_INCOMPLETE),
+    # `source_count` is `len(existing)`: two submitted paths no longer existed.
+    ({"source_count": 2}, lp.ANALYSIS_INCOMPLETE),
+])
+def test_n_the_real_analyze_handler_publishes_the_runs_structural_outcome(
+        gui, overrides, expected):
+    namespace, recorder, _track = gui
+    scanned = _scan_with_outstanding(namespace, recorder, 4)
+    recorder.analyze_result = _analyze_payload(**overrides)
+    sink: dict = {}
+
+    finished = namespace["_prep_analyze_impl"](
+        scanned, _live_for(scanned.scan), 100, outcome_sink=sink)
+
+    assert sink == {"analysis": expected}, sink
+    # ...and the verdict changed nothing about the pass itself.
+    assert finished.scan is None, "the stale scan is still dropped"
+    assert finished.report_text.startswith("PREPARATION BATCH COMPLETE")
+    assert not lp.is_failure_report(finished.report_text)
+    assert len(recorder.analyze_calls) == 1
+
+
+def test_n_an_unreadable_result_payload_is_published_as_unknown_not_as_complete(gui):
+    """The sparse payload the pre-R2 stub returned, which is also what a future analyzer that
+    stopped emitting a count would produce. Unknown is the honest answer, and the caller is
+    required not to announce it as a success."""
+    namespace, recorder, _track = gui
+    scanned = _scan_with_outstanding(namespace, recorder, 4)
+    sink: dict = {}
+
+    namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan), 100, outcome_sink=sink)
+
+    assert sink == {"analysis": lp.ANALYSIS_UNKNOWN}, sink
+
+
+def test_n_a_refused_analyze_publishes_no_verdict_at_all(gui):
+    """A refusal returns before the analyzer is reached, so there is nothing to be a verdict
+    about -- and the refusal is already carried by `REFUSAL_NOTICE`."""
+    namespace, recorder, _track = gui
+    scanned = _scan_with_outstanding(namespace, recorder, 4)
+    stale = lp.LivePrepDeclaration.from_widgets("/somewhere/else", scanned.scan.recursive)
+    sink: dict = {}
+
+    refused = namespace["_prep_analyze_impl"](scanned, stale, 100, outcome_sink=sink)
+
+    assert sink == {}, sink
+    assert refused.notice == lp.REFUSAL_NOTICE
+    assert recorder.analyze_calls == [], "nothing was analysed"
+
+
+def test_n_the_handler_still_works_with_no_sink_at_all(gui):
+    """Keyword-only with a plain `None` default, so every pre-R2 caller is unchanged."""
+    namespace, recorder, _track = gui
+    scanned = _scan_with_outstanding(namespace, recorder, 4)
+    recorder.analyze_result = _analyze_payload()
+
+    finished = namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan), 100)
+
+    assert finished.report_text.startswith("PREPARATION BATCH COMPLETE")
+
+
+def test_n_the_verdict_is_not_a_field_of_the_preparation_state_machine():
+    """It describes ONE run, so putting it on `PrepSessionState` would mean every other transition
+    had to clear it or it would outlive its run. The sink is the caller's, by design."""
+    assert not any(field.startswith("analysis")
+                   for field in lp.PrepSessionState.__dataclass_fields__), \
+        lp.PrepSessionState.__dataclass_fields__
+    for name in ("record_analysis_complete", "record_failure", "record_scan", "initial_state"):
+        body = ast.unparse(_func(_tree(_PREP), name))
+        assert "analysis_run_outcome" not in body, name
+
+
+def test_n_the_verdict_adds_no_write_path_and_no_second_analysis_call(gui):
+    """Preparation's ownership boundary is unchanged: the verdict is read from the value the one
+    existing analyzer call already returned."""
+    namespace, recorder, _track = gui
+    scanned = _scan_with_outstanding(namespace, recorder, 4)
+    recorder.analyze_result = _analyze_payload()
+    sink: dict = {}
+
+    namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan), 100, outcome_sink=sink)
+
+    assert len(recorder.analyze_calls) == 1
+    body = _body_code(_func(_tree(_GUI), "_prep_analyze_impl"))
+    assert body.count("analysis_run_outcome") == 1
+    for forbidden in ("_checkpoint_cache", "_save_cache", "_load_cache", "_cache_path",
+                      "json.dump", "open("):
+        assert forbidden not in body, forbidden

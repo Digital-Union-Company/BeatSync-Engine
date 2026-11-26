@@ -1050,6 +1050,11 @@ def _run_batch(kinds, durables, cancel_after=None):
         "_clear_active_render": lambda invocation_id: None,
         "_render_batch_request_tag": lambda: "T",
         "_process_video_guarded_unlocked": guarded_unlocked,
+        # [FORK] R17-A: the batch's one desktop-notification write, recorded rather than performed.
+        # The real helper is exercised by `tests/test_desktop_notifications.py`; here it is a stub
+        # so these cases neither touch the process-global ledger nor depend on what a notification
+        # says. It still has to EXIST, or the wrapper's terminal path dies on a `NameError`.
+        "_notify_render_batch": lambda request, outcome: _NOTIFIED.append(outcome),
         "Iterator": None, "Tuple": None, "VideoFilesInput": None,
     }
     exec(compile(ast.Module(body=[_gui_func("render_selected_variants_guarded")],
@@ -1497,7 +1502,10 @@ def test_a_fatal_on_the_final_candidate_keeps_its_own_cause_while_the_event_fini
 def test_the_lifecycle_derivation_reads_selection_exhaustion_not_the_last_candidate():
     """Structural half: the old `session_state[RENDER_OUTCOME_KEY]` read must be gone."""
     body = _gui_body("render_selected_variants_guarded")
-    assert "len(outcomes) == request.count" in body, \
+    # [FORK] R17-A R4: the batch's own request record is `batch_request`; the name changed because
+    # `request` shadowed the injected `gr.Request` and cost the batch its notification. The
+    # completion test itself -- selection exhaustion -- is unchanged.
+    assert "len(outcomes) == batch_request.count" in body, \
         "the completion test is not selection exhaustion"
     marking = body.split("if lifecycle.cancel_requested():")[-1]
     assert "RENDER_OUTCOME_KEY" not in marking.split("_clear_active_render")[0], \
@@ -1670,6 +1678,12 @@ def test_shared_fatal_now_has_real_producers_in_the_module():
 # ===========================================================================
 # Helpers that read the real `gui.py` handlers
 # ===========================================================================
+
+
+#: [FORK] R17-A: what the batch wrapper asked to announce, in call order. A module-level list so
+#: the stub in the namespace above can be a one-line lambda; nothing here asserts on it, but a
+#: future case that wants to can read it.
+_NOTIFIED: list = []
 
 
 def _innermost_try_around(call_name):

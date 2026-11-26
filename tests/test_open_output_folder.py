@@ -835,6 +835,23 @@ AUTHORIZED_JAVASCRIPT_REGISTRATIONS = (
     # still fails. `tests/test_raw_cutter_activity.py` pins what this one is allowed to contain --
     # notably that it performs no network call of any kind.
     ("app.load", "CUT_ACTIVITY_JS"),
+    # [FORK] Digital-Union (R17-A Desktop Notifications): FIVE more authorised entries, on exactly
+    # the same terms -- every one carries `fn=None`, so none registers a server call, and none
+    # makes a network request. The allowlist is still asserted by identity, so a SIXTH notification
+    # registration, or a different script in any slot, still fails.
+    #
+    # One installer, which paints the live permission read-out and waits to be handed an envelope;
+    # four one-line delegates into it -- the dispatch site, the permission gesture, the test
+    # notification, and a re-check of a state only Chrome can answer. The dispatch site hangs off
+    # the hidden envelope component's `.change`, which is what makes a notification a consequence
+    # of a finished job rather than of a poll. `tests/test_desktop_notifications.py` pins what each
+    # is allowed to contain -- notably that `Notification.requestPermission()` is called in exactly
+    # one of them.
+    ("app.load", "NOTIFY_JS"),
+    ("notify_envelope.change", "NOTIFY_DISPATCH_JS"),
+    ("notify_permission_btn.click", "NOTIFY_REQUEST_JS"),
+    ("notify_refresh_btn.click", "NOTIFY_REFRESH_JS"),
+    ("notify_test_btn.click", "NOTIFY_TEST_JS"),
 )
 
 
@@ -904,7 +921,11 @@ def test_only_the_authorized_registration_carries_client_side_javascript():
 #: unchanged and is still identity-based, so a third registration, or a different script in either
 #: slot, still fails.
 #: amended again by Raw Cutter R12, which added the Activity & Performance tick.
-_AUTHORIZED_JS_SCRIPTS = ("CLIPS_GALLERY_JS", "AUDIO_GALLERY_JS", "CUT_ACTIVITY_JS")
+#: amended again by R17-A Desktop Notifications, which added the notification client installer.
+#: Only `app.load` installers belong here -- R17-A's three button/`change` delegates are in
+#: `AUTHORIZED_JAVASCRIPT_REGISTRATIONS` above and are deliberately NOT `app.load` registrations,
+#: because each one is a response to a specific gesture rather than a page-load install.
+_AUTHORIZED_JS_SCRIPTS = ("CLIPS_GALLERY_JS", "AUDIO_GALLERY_JS", "CUT_ACTIVITY_JS", "NOTIFY_JS")
 
 
 def test_the_authorized_registration_is_the_gallery_installer_and_nothing_else():

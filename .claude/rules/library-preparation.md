@@ -196,3 +196,46 @@ Load-bearing details:
   cache payload gained a field, and `video_analysis.py` was **not modified by this feature at all** —
   a test asserts the batch names appear nowhere in it. Persistence stays entirely with the existing
   `analyze_video_sources` → `_checkpoint_cache` path; bounding the input adds no write path.
+
+### A batch's own structural outcome (R17-A R2)
+
+`summarize_analysis_run` renders numbers for a human and answers no question a caller can branch on,
+and `is_failure_report` recognises only the marker `record_failure` writes. So a pass whose shared
+Qwen worker **died** — real GPU minutes, nothing cached, no exception and therefore no marker — was
+indistinguishable from a clean one, and the R17-A notification announced it as `Library analysis
+finished`. `analysis_run_outcome(result, submitted)` is the structural answer:
+
+```
+qwen_incomplete_jobs_this_run > 0                     -> ANALYSIS_INCOMPLETE
+source_count < submitted                              -> ANALYSIS_INCOMPLETE
+non-mapping, missing/malformed count, or
+  completed + incomplete != jobs                      -> ANALYSIS_UNKNOWN
+otherwise                                             -> ANALYSIS_COMPLETE
+```
+
+- **It reads only the ephemeral `*_this_run` channel** plus `source_count`, which is `len(existing)`
+  — the submitted paths that still existed. Every one of those is R1 invocation metadata that enters
+  no cache payload, no key and no completion rule (`.claude/rules/stage5-reporting.md`), and a test
+  asserts the verdict's names appear nowhere in `video_analysis.py` or the Qwen worker.
+- **`_strict_count`, not `_int`.** Zero is a *measurement* here — `0 incomplete jobs` is what makes a
+  run complete — so an absent, string, float or `bool` field reads as **unknown** rather than as a
+  reassuring zero. `bool` is rejected first because it subclasses `int`.
+- **A warm batch that ran no job at all is COMPLETE**, not a shortfall: every submitted source was
+  already cached, which is exactly the outcome preparation exists to produce.
+- **There is no total-loss token.** "No Qwen job completed" is not "nothing was cached" — a
+  candidate-less source is legitimately checkpointed with no Qwen work — so a verdict the payload
+  cannot support is not invented. Three tokens, and `unknown` is a real answer.
+- **It is not a field of `PrepSessionState`.** It describes one *run*, so every other transition
+  would have to clear it or it would outlive its run. `_prep_analyze_impl` publishes it into a
+  **caller-owned `outcome_sink` dict** — the shape `_on_cut_batch_run` already uses — written on the
+  success path only, after the one existing analyzer call, and read by `_run_prep_in_worker` after
+  `thread.join()`. Per click, never a module-level slot: Scan and Analyze hold no mutex, so two
+  sessions genuinely overlap (the mistake UX-PREP-ACTIVITY R2 corrected for `_prep_phase`).
+- **It adds no write path, no second analyzer call and no record read.** Preparation's ownership
+  boundary is unchanged.
+- **One residual limitation, recorded rather than guessed at.** A source the analyzer opened but
+  could not decode is counted as analysed, is correctly not cached, and issues no Qwen job — so this
+  reads such a run as complete. The payload carries no count for it, and adding one would mean
+  changing the Stage-5 orchestrator to make a notification easier to classify.
+
+Consumer side: `.claude/rules/desktop-notifications.md` (*R2*, finding F3).
