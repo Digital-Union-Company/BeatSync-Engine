@@ -234,6 +234,150 @@ TEST_TITLE = APP_NAME + " — test notification"
 TEST_BODY = ("This is what a finished job will look like. No job was started and nothing was "
              "changed.")
 
+#: R3: what a test notification's `tag` STARTS with. A **prefix**, because the rest of it is minted
+#: per click in the browser, and that is a fix rather than a preference.
+#:
+#: Through R2 the test notification carried the single fixed tag ``beatsync-test``. Two
+#: notifications sharing a tag are one notification as far as the Notification API is concerned:
+#: the second **replaces** the first in place. Measured in Chrome on Windows (R3), replacement is
+#: silent — no banner, no sound, only the Action Center entry's text updating — so the owner's
+#: first "Send test notification" produced a real Windows toast and every click afterwards appeared
+#: to do nothing at all. The constructor had returned normally every time.
+#:
+#: A unique tag per deliberate click is the simplest reliable fix, and it is deliberately narrow:
+#: it changes the one notification whose whole purpose is to be *requested again*. A real job's tag
+#: is still ``beatsync-<id>`` from the per-event identity :func:`build` is given, so the
+#: browser-level collapse that sits underneath the client ledger is untouched — see
+#: :data:`TAG_PREFIX`. Keeping the ``beatsync-`` prefix on both is what lets every notification
+#: this application creates still be recognised as one of ours.
+#:
+#: ``renotify`` was considered and rejected: it is specified for
+#: ``ServiceWorkerRegistration.showNotification`` and this feature has no service worker by
+#: accepted scope, and with a unique tag there is nothing left for it to re-alert.
+TEST_TAG_PREFIX = TAG_PREFIX + "test-"
+
+# ---------------------------------------------------------------------------------------------
+# R3: what the panel says back after a diagnostic click.
+#
+# The two diagnostic buttons had the same defect from opposite directions: pressing them produced
+# no visible acknowledgement whatsoever unless something happened to change. "Send test
+# notification" painted nothing and discarded the one fact it had — whether the constructor was
+# even reached — and "Re-check browser status" repainted a line that returns early when the state
+# is unchanged, which is the overwhelmingly common case. An operator pressing either could not
+# distinguish a working button from a dead one.
+#
+# So every click now says something, and what it says is composed from this file. Three rules:
+#
+# * **The success wording describes the REQUEST, never the delivery.** A `new Notification()` that
+#   returns normally proves the browser accepted the call. Whether Windows drew anything is Windows'
+#   decision, and Focus Assist, Do Not Disturb, a per-app setting or policy can each suppress it
+#   silently. "Requested successfully" is the strongest honest claim available here.
+# * **A refusal names the actual obstacle**, because the fix differs: an unasked permission needs
+#   the button below, a denied one needs Chrome Site Settings, and an unsupported API needs neither.
+# * **An unrecognised result is not a success.** :func:`test_feedback_sentence` is total and falls
+#   to the unknown sentence, the same direction of failure every other refusal in this module takes.
+# ---------------------------------------------------------------------------------------------
+
+#: The constructor was reached and returned. NOT "Windows showed it".
+TEST_REQUESTED = "requested"
+
+#: The constructor itself threw. Nothing was sent.
+TEST_ERROR = "error"
+
+#: A result token this module does not recognise.
+TEST_UNKNOWN = "unknown"
+
+#: Every result the test button can report. The three tokens above, plus the three permission
+#: states that mean "nothing was sent". :data:`PERMISSION_GRANTED` is deliberately **absent**: a
+#: granted permission always resolves to :data:`TEST_REQUESTED` or :data:`TEST_ERROR`, so a caller
+#: reporting `granted` has skipped the construction and must not read as a success.
+TEST_RESULTS = (TEST_REQUESTED, TEST_ERROR, TEST_UNKNOWN,
+                PERMISSION_NOT_REQUESTED, PERMISSION_DENIED, PERMISSION_UNSUPPORTED)
+
+TEST_FEEDBACK_SENTENCES = {
+    TEST_REQUESTED: (
+        "Test notification requested successfully. Whether it appears is Windows’ decision — "
+        "Focus Assist, Do Not Disturb or a notification setting can still suppress it."),
+    TEST_ERROR: (
+        "Chrome refused to create the test notification. Nothing was sent, and no BeatSync "
+        "setting was changed."),
+    TEST_UNKNOWN: (
+        "BeatSync could not tell what happened to the test notification. Nothing was changed."),
+    PERMISSION_NOT_REQUESTED: (
+        "Nothing was sent, because Chrome has not been asked yet. Use “Allow notifications in "
+        "Chrome” below first."),
+    PERMISSION_DENIED: (
+        "Nothing was sent, because Chrome is blocking notifications for this address. BeatSync "
+        "cannot change that — reset it in Chrome Site Settings for this page."),
+    PERMISSION_UNSUPPORTED: (
+        "Nothing was sent, because this browser offers no notification API in this page’s "
+        "context."),
+}
+
+
+def test_feedback_sentence(result) -> str:
+    """What to tell the operator after a test-notification click. Total.
+
+    An unrecognised token reads as :data:`TEST_UNKNOWN` rather than as a success, for the same
+    reason :func:`build` answers ``None`` for an outcome it does not know: the one thing a
+    diagnostic must not do is report that something worked when it cannot tell.
+    """
+    if isinstance(result, str) and result in TEST_FEEDBACK_SENTENCES:
+        return TEST_FEEDBACK_SENTENCES[result]
+    return TEST_FEEDBACK_SENTENCES[TEST_UNKNOWN]
+
+
+#: What "Re-check browser status" reports. A template rather than six sentences, because the whole
+#: point of the acknowledgement is that it is shown for an **unchanged** state too, and the state's
+#: own explanation is already on the line above it.
+CHECK_SENTENCE_TEMPLATE = "Re-checked this browser. Chrome reports: {state}."
+
+#: How a feedback line is stamped. The clock is read in the browser — the only place that knows the
+#: operator's local time — so this is a template the client substitutes into.
+#:
+#: The stamp is not decoration: it is what makes a *repeated identical* answer visibly a new answer.
+#: Pressing Re-check twice on a granted permission produces the same sentence both times, which is
+#: exactly the "no visible feedback" complaint, and a changing timestamp resolves it without
+#: inventing a state change that did not happen.
+FEEDBACK_TIME_TEMPLATE = "{time} — {message}"
+
+#: Substitution tokens, named so the client script cannot spell one differently from this file.
+FEEDBACK_TIME_FIELD = "{time}"
+FEEDBACK_MESSAGE_FIELD = "{message}"
+FEEDBACK_STATE_FIELD = "{state}"
+
+
+def check_sentence(state) -> str:
+    """The re-check acknowledgement for a measured permission state. Total.
+
+    An unrecognised state is reported as *unsupported*, exactly as :func:`permission_sentence`
+    resolves it, so the two halves of the panel cannot name the state differently.
+    """
+    resolved = state if isinstance(state, str) and state in PERMISSION_STATES \
+        else PERMISSION_UNSUPPORTED
+    return CHECK_SENTENCE_TEMPLATE.replace(FEEDBACK_STATE_FIELD, resolved)
+
+
+def feedback_line(message, time_text="") -> str:
+    """One composed feedback line: ``"20:14:06 — Re-checked this browser. …"``.
+
+    This is the **reference implementation** of a composition the browser performs, in the same
+    spirit as :func:`decode_envelope`: the client has the clock and does the two substitutions
+    itself, and this exists so the Python side can assert what the browser will produce without a
+    browser. A test pins that the client performs these exact two replacements.
+
+    An unreadable clock yields the bare message rather than an empty or half-stamped line — a
+    diagnostic that lost its timestamp must still say what it measured.
+    """
+    text = message if isinstance(message, str) else ""
+    stamp = time_text.strip() if isinstance(time_text, str) else ""
+    if not text.strip():
+        return ""
+    if not stamp:
+        return text
+    return FEEDBACK_TIME_TEMPLATE.replace(FEEDBACK_TIME_FIELD, stamp) \
+                                 .replace(FEEDBACK_MESSAGE_FIELD, text)
+
 # ---------------------------------------------------------------------------------------------
 # The client-side duplicate ledger, declared here so the numbers are reviewable in Python.
 # ---------------------------------------------------------------------------------------------
@@ -469,7 +613,12 @@ __all__ = [
     "PERMISSION_UNSUPPORTED", "PERMISSION_STATES", "BROWSER_PERMISSION_STATES",
     "PERMISSION_SENTENCES", "permission_sentence",
     "APP_SETTING_SENTENCES", "app_setting_sentence",
-    "TEST_TITLE", "TEST_BODY",
+    "TEST_TITLE", "TEST_BODY", "TEST_TAG_PREFIX",
+    "TEST_REQUESTED", "TEST_ERROR", "TEST_UNKNOWN", "TEST_RESULTS",
+    "TEST_FEEDBACK_SENTENCES", "test_feedback_sentence",
+    "CHECK_SENTENCE_TEMPLATE", "check_sentence",
+    "FEEDBACK_TIME_TEMPLATE", "FEEDBACK_TIME_FIELD", "FEEDBACK_MESSAGE_FIELD",
+    "FEEDBACK_STATE_FIELD", "feedback_line",
     "SEEN_STORAGE_KEY", "SEEN_LIMIT", "ENVELOPE_VERSION", "ENVELOPE_EMPTY",
     "FORBIDDEN_CHARACTERS", "is_safe_text",
     "ID_MIN_LENGTH", "ID_MAX_LENGTH", "is_valid_id",

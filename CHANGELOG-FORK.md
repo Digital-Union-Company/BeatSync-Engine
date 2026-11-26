@@ -20,6 +20,57 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-26 (R17-A R3: the two notification diagnostics were not repeatable or responsive)
+
+The owner granted Chrome's permission, received a **real Windows notification** from their first
+"Send test notification", and then saw nothing from any click afterwards. Two separate defects, both
+in the Settings panel's diagnostics and neither anywhere near a job's terminal path.
+
+* **The test notification carried one fixed tag, so every click after the first replaced its
+  predecessor silently.** It was `beatsync-test`, always, and two notifications sharing a tag are
+  one notification as far as the Notification API is concerned: the second replaces the first in
+  place, with no banner and no sound. The constructor had been returning normally every time. Each
+  deliberate click now mints a fresh tag, `beatsync-test-<clock>-<counter>`, so each is a new
+  notification rather than an edit of the last one. **A real job's tag is untouched** — still
+  `beatsync-<id>` from the per-event identity, so the browser-level collapse that sits underneath
+  the client ledger still guards a genuine duplicate. (`renotify` was considered and rejected: it is
+  specified for `ServiceWorkerRegistration.showNotification`, this feature has no service worker by
+  accepted scope, and with a unique tag there is nothing left for it to re-alert.)
+* **Neither diagnostic button acknowledged a click at all.** "Send test notification" discarded the
+  one fact it had — whether the constructor was even reached — and "Re-check browser status"
+  delegated to a painter that returns early when the permission state has not changed, which is the
+  overwhelmingly common case. Both were indistinguishable from dead buttons. All three diagnostic
+  buttons now write a timestamped line into the panel, and the timestamp is load-bearing rather than
+  decorative: a repeated identical answer is only *visibly* a new answer if something on the line
+  moves.
+
+The success wording describes the **request**, never the delivery: *"Test notification requested
+successfully. Whether it appears is Windows' decision — Focus Assist, Do Not Disturb or a
+notification setting can still suppress it."* A constructor that returned proves only that the
+browser accepted the call. Each refusal names its own obstacle and its own fix, because an unasked
+permission, a denied one, an unsupported API and a constructor that threw need four different
+things from the operator — and an unrecognised result reads as *unknown*, never as a success.
+
+No server call, endpoint, component, `inputs` or `outputs` list was added: the three diagnostic
+registrations are still `fn=None` with empty `inputs` and `outputs`, the acknowledgement is a second
+`div` inside the one component that has no server-side writer, and it ships **empty** so a freshly
+loaded page carries no stale claim about a browser action that never happened.
+
+**Verified in Chrome against the shipped build**, on an isolated instance whose preferences and
+Stage-5 record store were redirected into a task workspace: with the real Notification API and a
+`default` permission, a test click produced the correct refusal line and **no permission prompt**;
+two Re-check clicks four seconds apart produced the same sentence with two different timestamps;
+with a recording stub, three clicks produced **three constructor calls with three distinct tags**
+where the pre-R3 code produced three calls with **one**; the granted, denied, unsupported and
+constructor-threw paths each produced their own sentence; a replayed job envelope still delivered
+nothing and still used `beatsync-<id>`; and a fresh page load produced zero notifications, zero
+permission requests and an empty feedback line.
+
+**Still not claimed:** an OS-visible Windows toast. The Chrome profile holding the owner's grant for
+`http://127.0.0.1:7860` is not the profile the automation drives, and granting one is a human action
+on browser UI — so everything up to and including the constructor call is verified and whether
+Windows drew a toast is not.
+
 ### Fixed — 2026-11-26 (R17-A R2: three outcome-accuracy defects in the notification layer)
 
 R17-A's own rule is *"do not announce success while the result is unknown"*. A focused review of

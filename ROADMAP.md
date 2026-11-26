@@ -1701,7 +1701,46 @@ default.
 
 ---
 
-### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED + R3 DIAGNOSTICS FIXED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+
+> **R3 — the owner's first playtest, 2026-11-26.** The permission was granted and the **first**
+> "Send test notification" produced a **real Windows notification**. Every click after it produced
+> nothing visible, and "Re-check browser status" never acknowledged a press. Both are diagnostics,
+> both are fixed, and neither touched a job:
+>
+> * **The test notification's tag was the fixed `beatsync-test`.** Two notifications sharing a tag
+>   are one notification to the API: the second **replaces** the first in place, silently. The
+>   constructor had returned normally every time, so nothing in the app could tell. Each deliberate
+>   click now mints `beatsync-test-<clock>-<counter>`. **A job's tag is untouched** — still the
+>   stable `beatsync-<id>`, so the browser-level duplicate collapse is unchanged. `renotify` was
+>   considered and rejected (service-worker-only, and a unique tag leaves nothing to re-alert).
+> * **Neither diagnostic acknowledged a click.** `paint()` early-returns when the permission state
+>   is unchanged — correct for the MutationObserver that calls it constantly, and the reason
+>   Re-check looked dead. All three buttons now write a **timestamped** line, and the timestamp is
+>   the point: a repeated identical answer is only visibly a new answer if something moves.
+>
+> The success wording describes the **request** — *"Test notification requested successfully"* plus
+> what can still suppress it — and never the delivery. The four refusals name four different
+> obstacles, because an unasked permission, a denied one, a missing API and a constructor that threw
+> need four different things from the operator; an unrecognised result reads as *unknown*, never as
+> a success. No component, endpoint, `inputs` or `outputs` list was added: the acknowledgement is a
+> second `div` inside the one component with no server-side writer, and it ships empty.
+>
+> **R3's runtime evidence**, same isolation recipe but on **port 7860** — deliberately, because
+> Chrome's permission is per-origin and 7861 can only ever read `default`; nothing was listening and
+> no BeatSync process existed, so nothing was displaced. With the **real** API: the correct refusal
+> line and **no prompt**; two Re-check clicks four seconds apart giving the same sentence with two
+> different timestamps; a fresh load giving zero notifications, zero permission requests and an
+> empty line. With a recording stub through the real buttons: **3 clicks → 3 calls → 3 distinct
+> tags**, where the pre-R3 code replayed in the same tab gave **3 calls → 1 tag**; the permission
+> button calling `requestPermission` exactly once; denied / unsupported / threw each answering
+> distinctly; and a job envelope still delivering 2 of 3, 0 on replay, with `beatsync-<id>` tags and
+> without overwriting the operator's line.
+>
+> **Still unverified:** an OS-visible Windows toast. The Chrome profile holding the grant for
+> `http://127.0.0.1:7860` is not the one the automation drives, and granting a permission is a human
+> action on browser UI — so the constructor call is verified and the toast is an **attended owner
+> step**. Full detail: `.claude/rules/desktop-notifications.md` (*R3*).
 
 > **R2 review and remediation, 2026-11-26.** A focused review of PR #112 found and closed **three
 > outcome-accuracy defects**, all of them in the translation layer — no job's result, progress,

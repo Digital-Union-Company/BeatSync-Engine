@@ -792,7 +792,18 @@ automatically.
     job's result is not.
   * **The panel's whole server-side writer set is `notify_app_state`.** `notify_status` — the live
     browser-permission line — has **no** server writer, because only the page knows the answer, and
-    `notify_envelope` has exactly one, `_notify_drain`.
+    `notify_envelope` has exactly one, `_notify_drain`. **R3 added a second line to that panel and
+    no writer with it:** the diagnostic acknowledgement is another thing only the browser knows, so
+    it is a second `div` *inside* `notify_status`, shipped empty, painted only by a deliberate
+    button press.
+  * **The two diagnostics are repeatable and they answer back (R3).** The test notification's tag
+    was the fixed `beatsync-test`, and two notifications sharing a tag are one notification to the
+    API — the second replaces the first silently, which is why the owner's second click appeared to
+    do nothing. It is now `beatsync-test-<clock>-<n>`, minted per click; a **job's** tag is still
+    the stable `beatsync-<id>`. And `NOTIFY_REFRESH_JS` delegates to a new `recheck()` rather than
+    to `paint()`, which early-returns when the permission state is unchanged. All three diagnostic
+    registrations stay `fn=None` with `inputs=[]` and `outputs=[]`: R3 adds words to a panel, not
+    an endpoint.
   * **Four of the five scripts are one-line delegates and the installer holds every rule.** It is
     the **fourth** authorised `app.load(js=…)` installer; `requestPermission()` has one
     implementation, reachable only from one button. No script contains a network call, a service

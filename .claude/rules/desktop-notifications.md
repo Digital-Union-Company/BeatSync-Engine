@@ -257,6 +257,10 @@ other four are one-line delegates, so no registration can grow a second interpre
   installer and is reachable only through `window.__bsNotify.request()`, which only
   `NOTIFY_REQUEST_JS` — wired to one button — invokes. So a page load, a render and a saved-toggle
   change can none of them produce a prompt. The installer's last act on load is `paint()`.
+- **Six entry points on `window.__bsNotify`, not five, since R3**: `paint`, `state`, `request`,
+  `test`, `recheck`, `dispatch`. The script *count* is unchanged — `NOTIFY_REFRESH_JS` simply
+  delegates to `recheck()` instead of `paint()` — so the four-delegate, one-installer shape and the
+  `fn=None` allowlist in `tests/test_open_output_folder.py` are untouched.
 - **Support is measured, not assumed.** `typeof window.Notification === "function"`, the presence of
   `requestPermission`, and `window.isSecureContext === true`. `http://127.0.0.1:7860` is normally a
   potentially trustworthy loopback origin, but an operator reaching the app by another address is
@@ -365,6 +369,107 @@ the dispatcher's own guarantee about the payload it is handed and should not res
 the other side. One line: `delivered.push(item.id)` beside the `remember`. **Asserted structurally**
 — there is no JavaScript engine in the suite — so it is the live smoke that observes it, and this
 sentence is the record of which of the two that is.
+
+## R3: the two diagnostics had to be repeatable and responsive
+
+The owner granted the permission, got a **real Windows notification** from the first test, and then
+nothing from any click afterwards. Two defects, both in the panel, neither near a job.
+
+**The fixed tag.** `TEST_TAG` was `beatsync-test`, always. Two notifications sharing a tag are one
+notification to the API: the second **replaces** the first in place, silently — no banner, no sound,
+only the Action Center entry's text changing. The constructor returned normally every time, which is
+why nothing in the app could tell. `TEST_TAG_PREFIX` replaces it and the browser appends
+`<Date.now()>-<counter>` per click: the clock makes it unique across reloads, the counter inside one
+millisecond.
+
+```
+test notification   beatsync-test-<clock>-<n>    FRESH per deliberate click   (R3)
+job notification    beatsync-<id>                STABLE per terminal event    (unchanged)
+```
+
+**The job tag is deliberately untouched**, and a test asserts the dispatch entry point mints
+nothing — a job's notification is identified by the terminal event it describes, which is what makes
+the browser-level collapse underneath the client ledger a real duplicate guard rather than a
+coincidence. `renotify` was considered and rejected: it is specified for
+`ServiceWorkerRegistration.showNotification`, this feature has no service worker **by accepted
+scope**, and with a unique tag there is nothing left for it to re-alert. A test scans every script
+for it.
+
+**The silent buttons.** `paint()` returns early when `data-state` is unchanged — correct for the
+MutationObserver that calls it on every DOM mutation, and the reason "Re-check browser status"
+produced *no observable effect whatsoever* in the common case. `say()` is the acknowledgement, it is
+written on **every** diagnostic click, and `paint` is deliberately left exactly as it was:
+
+```
+paint()      idempotent, early-returns, called by the MutationObserver   -- NEVER writes feedback
+say(text)    always writes, stamped with the browser's own clock         -- the acknowledgement
+recheck()    paint() + checked()        <- NOTIFY_REFRESH_JS now delegates here, not to paint
+test()       fresh tag -> fire -> paint() + say(sentence(result))
+request()    requestPermission -> settle -> paint() + checked()
+```
+
+**The timestamp is load-bearing, not decoration.** Pressing Re-check twice on a settled permission
+produces the same sentence both times — which is exactly the complaint — and a changing stamp
+resolves it without inventing a state change that did not happen. `FEEDBACK_TIME_TEMPLATE` and
+`CHECK_SENTENCE_TEMPLATE` are substituted into by the client, and `feedback_line` / `check_sentence`
+are the Python **reference implementations** of those substitutions, in the same spirit as
+`decode_envelope`: there is no JavaScript engine in the suite, so the two replacements the client
+performs are pinned structurally and the composition rule itself is executed in Python.
+
+**`fire()` answers which of five things happened, instead of a bare boolean.** The dispatcher
+ignores the return exactly as before — a job's notification has no panel to report into — and the
+test button needs it, because *"Chrome has not been asked"*, *"Chrome is blocking this address"*,
+*"this browser has no API"* and *"the constructor threw"* need four different things from the
+operator and must not share one sentence. `PERMISSION_GRANTED` is deliberately **not** a key of
+`TEST_FEEDBACK_SENTENCES`: a granted permission always resolves to `requested` or `error`, so a
+caller reporting the state itself has skipped the construction and falls to *unknown* — never to a
+success.
+
+**The success wording describes the REQUEST.** *"Test notification requested successfully. Whether
+it appears is Windows' decision — Focus Assist, Do Not Disturb or a notification setting can still
+suppress it."* A constructor that returned proves the browser accepted the call and nothing more. A
+test bans `was shown`, `was displayed`, `was delivered` and `guaranteed` from that sentence.
+
+**The acknowledgement is a second `div`, not a component.** `notify_status` is the one component in
+this panel with **no** server-side writer, and this is another thing only the browser knows; adding
+a component would have put a new name into a panel whose writer sets are pinned, for a line the
+server can never fill in. It ships **empty** (`data-feedback="none"`), so a freshly loaded page
+carries no stale claim about a browser action that never happened.
+
+**Three wording hazards are tested rather than assumed away**, each measured against this
+repository's own machinery: a `$` in a JavaScript `String.replace` *replacement* is a substitution
+pattern (`$&`, `$'`) and would silently mangle a sentence; a `//` inside a string literal breaks the
+comment stripper every structural scan here runs the scripts through; and a sentence containing a
+placeholder token would be rewritten by the next replacement. A further test asserts that **no
+`__TOKEN__` survives into any shipped script** — a missed substitution is a syntax error that stops
+the whole installer compiling in the browser, and no other assertion in the suite would notice.
+
+### What R3's smoke established
+
+Same isolation recipe as R2 — redirected `PREFS_PATH`, `BEATSYNC_SHARED_CONFIG` into the task
+workspace, `BEATSYNC_DISABLE_QWEN=1`, no render — but on **port 7860**, deliberately: Chrome's
+permission is per-**origin**, so 7861 is a different origin that can only ever read `default`.
+Nothing was listening on 7860–7863 and no BeatSync process existed, so nothing was displaced.
+
+**With the real Notification API** (permission `default`): a test click produced
+`Nothing was sent, because Chrome has not been asked yet…` with a timestamp and **no permission
+prompt**; two Re-check clicks four seconds apart produced the identical sentence with **two
+different timestamps**; a fresh page load produced zero notifications, zero permission requests and
+an empty feedback line.
+
+**With a recording stub**, through the real buttons: three test clicks → **3 constructor calls, 3
+distinct tags**, all `beatsync-test-…`, one title, success feedback, and **zero** `requestPermission`
+calls. The pre-R3 behaviour, replayed in the same tab, → **3 calls, 1 tag**. The permission button
+called `requestPermission` exactly **once** and sent nothing. Denied, unsupported and
+constructor-threw each produced their own sentence. A job envelope carrying one id twice still
+delivered **2 of 3**, a replay delivered **0**, the tags were `beatsync-<id>`, and the job delivery
+did **not** overwrite the operator's acknowledgement line.
+
+**Not verified:** an OS-visible Windows toast. The Chrome profile holding the owner's grant for
+`http://127.0.0.1:7860` is not the one the automation drives (it reads `default` there), granting a
+permission is a human action on browser UI, and the second connected Chrome turned out not to be on
+this machine at all. Everything up to and including the constructor call is verified; whether
+Windows drew anything is not, and must not be claimed.
 
 **The test notification is deliberately NOT gated on the app toggle.** It is the operator's way of
 checking *Chrome*, so gating it on the BeatSync setting would make the one diagnostic in the panel

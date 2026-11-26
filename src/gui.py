@@ -1770,6 +1770,20 @@ CLIPS_GALLERY_JS = r"""
 #: cannot disturb anything Gradio wraps around it.
 NOTIFY_STATUS_ELEMENT_ID = 'bs-notify-permission'
 
+#: [FORK] R17-A R3: the element the three diagnostic buttons write their acknowledgement into.
+#:
+#: A second `div` INSIDE the same `gr.HTML` component rather than a component of its own, and that
+#: is a deliberate structural choice: `notify_status` is the one component in this panel with **no**
+#: server-side writer, and the acknowledgement is another thing only the browser knows. Adding a
+#: component would have meant a new name in a panel whose writer sets are pinned by test, for a line
+#: the server can never fill in. Adding a `div` costs nothing and keeps the rule intact.
+#:
+#: Separate from the permission line above it because they are different facts with different
+#: lifetimes: the permission line states what Chrome allows **now** and is repainted by the
+#: MutationObserver, while this states what the operator's **last click** did and must survive a
+#: repaint that changed nothing.
+NOTIFY_FEEDBACK_ELEMENT_ID = 'bs-notify-feedback'
+
 NOTIFY_JS = r"""
 () => {
   if (window.__bsNotify) { return; }
@@ -1782,8 +1796,18 @@ NOTIFY_JS = r"""
   const ENVELOPE_VERSION = __ENVELOPE_VERSION__;
   const TEST_TITLE = __TEST_TITLE__;
   const TEST_BODY = __TEST_BODY__;
-  const TEST_TAG = __TEST_TAG__;
+  const TEST_TAG_PREFIX = __TEST_TAG_PREFIX__;
   const STATUS_ID = __STATUS_ID__;
+  const FEEDBACK_ID = __FEEDBACK_ID__;
+  const TEST_FEEDBACK = __TEST_FEEDBACK__;
+  const TEST_REQUESTED = __TEST_REQUESTED__;
+  const TEST_ERROR = __TEST_ERROR__;
+  const TEST_UNKNOWN = __TEST_UNKNOWN__;
+  const CHECK_TEMPLATE = __CHECK_TEMPLATE__;
+  const LINE_TEMPLATE = __LINE_TEMPLATE__;
+  const TIME_FIELD = __TIME_FIELD__;
+  const MESSAGE_FIELD = __MESSAGE_FIELD__;
+  const STATE_FIELD = __STATE_FIELD__;
   // Is the API usable AT ALL? Three separate questions, because each has a different answer the
   // operator can act on, and a missing one must never be read as a denial: the constructor, the
   // permission-request entry point, and a secure browsing context. `http://127.0.0.1` is a
@@ -1838,8 +1862,39 @@ NOTIFY_JS = r"""
       window.localStorage.setItem(SEEN_KEY, JSON.stringify(list));
     } catch (e) { /* a full or disabled store costs the guard, never the page */ }
   };
+  // R3: the acknowledgement line. Written on EVERY diagnostic click, including one that measured
+  // no change at all -- which is the whole point. `paint` above returns early when the state is
+  // unchanged, so before R3 pressing "Re-check browser status" on a granted permission produced
+  // literally no visible effect and was indistinguishable from a dead button.
+  //
+  // Every word comes from the pure module; the browser contributes only its own clock, because a
+  // repeated identical answer is only visibly a new answer if something on the line moves. A
+  // missing host element is silent rather than an error: the panel may legitimately not be
+  // rendered yet, and a diagnostic must never be the thing that throws on the page.
+  const clockText = () => {
+    try { return new Date().toLocaleTimeString(); } catch (e) { return ""; }
+  };
+  const say = (message) => {
+    const host = document.getElementById(FEEDBACK_ID);
+    if (!host) { return; }
+    const at = clockText();
+    host.setAttribute("data-feedback", "shown");
+    host.textContent = at
+      ? LINE_TEMPLATE.replace(TIME_FIELD, at).replace(MESSAGE_FIELD, message)
+      : message;
+  };
+  const sentence = (result) => TEST_FEEDBACK[result] || TEST_FEEDBACK[TEST_UNKNOWN];
+  const checked = () => say(CHECK_TEMPLATE.replace(STATE_FIELD, state()));
+  // How many test notifications this page has requested. Only ever used to make a tag unique
+  // WITHIN one millisecond; the clock does the rest, so this is not a ledger and nothing reads it.
+  let tests = 0;
+  // R3: `fire` now answers WHICH of the five things happened rather than a bare boolean. The
+  // dispatcher ignores it exactly as before -- a job's notification has no panel to report into --
+  // and the test button needs it, because "nothing was sent because Chrome has not been asked" and
+  // "the constructor threw" have different fixes and must not share one sentence.
   const fire = (title, body, tag) => {
-    if (state() !== GRANTED) { return false; }
+    const now = state();
+    if (now !== GRANTED) { return now; }
     try {
       const note = new window.Notification(title, {body: body, tag: tag});
       // Focus the page that produced it, and nothing else. No navigation, no tab switch, no
@@ -1849,21 +1904,45 @@ NOTIFY_JS = r"""
         try { window.focus(); } catch (e) { /* a blocked focus is not an error */ }
         try { note.close(); } catch (e) { /* nothing left to close */ }
       };
-      return true;
-    } catch (e) { return false; }
+      return TEST_REQUESTED;
+    } catch (e) { return TEST_ERROR; }
   };
   window.__bsNotify = {
     paint: paint,
     state: state,
     request: () => {
-      if (!usable()) { paint(); return; }
+      // R3: the permission gesture acknowledges itself too. An operator who presses it when the
+      // permission is ALREADY granted gets no browser prompt -- correctly, Chrome asks once -- and
+      // before R3 that produced no visible effect either.
+      const settled = () => { paint(); checked(); };
+      if (!usable()) { settled(); return; }
       try {
         const answer = window.Notification.requestPermission();
-        if (answer && typeof answer.then === "function") { answer.then(paint, paint); }
-        else { paint(); }
-      } catch (e) { paint(); }
+        if (answer && typeof answer.then === "function") { answer.then(settled, settled); }
+        else { settled(); }
+      } catch (e) { settled(); }
     },
-    test: () => { fire(TEST_TITLE, TEST_BODY, TEST_TAG); paint(); },
+    // R3: one FRESH notification per deliberate click, and one sentence about what happened.
+    //
+    // The tag is unique per click. Through R2 it was the single fixed `beatsync-test`, and two
+    // notifications sharing a tag are one notification to the API: the second replaces the first
+    // in place, silently. That is why the owner's first test produced a Windows toast and every
+    // click afterwards appeared to do nothing -- the constructor had returned normally each time.
+    // The clock makes it unique across reloads and the counter inside one millisecond.
+    //
+    // A real job's tag is untouched: it is still `beatsync-<id>` from the per-event identity, so
+    // the browser-level collapse underneath the client ledger still guards a genuine duplicate.
+    test: () => {
+      const tag = TEST_TAG_PREFIX + String(Date.now()) + "-" + String(++tests);
+      const result = fire(TEST_TITLE, TEST_BODY, tag);
+      paint();
+      say(sentence(result));
+    },
+    // R3: "Re-check browser status" repaints AND reports, so an unchanged permission is still a
+    // visible answer. `paint` is deliberately left alone -- the MutationObserver calls it on every
+    // DOM mutation, and writing a timestamped line from there would scroll a settings panel's
+    // diagnostic every time a render emitted a frame.
+    recheck: () => { paint(); checked(); },
     dispatch: (text) => {
       // An empty value is the ordinary case and must do nothing: the component starts empty and
       // the server writes an empty envelope whenever a click produced no terminal event, so "no
@@ -1906,8 +1985,18 @@ NOTIFY_JS = r"""
    .replace('__ENVELOPE_VERSION__', json.dumps(fork_notify.ENVELOPE_VERSION)) \
    .replace('__TEST_TITLE__', json.dumps(fork_notify.TEST_TITLE)) \
    .replace('__TEST_BODY__', json.dumps(fork_notify.TEST_BODY)) \
-   .replace('__TEST_TAG__', json.dumps(fork_notify.TAG_PREFIX + 'test')) \
-   .replace('__STATUS_ID__', json.dumps(NOTIFY_STATUS_ELEMENT_ID))
+   .replace('__TEST_TAG_PREFIX__', json.dumps(fork_notify.TEST_TAG_PREFIX)) \
+   .replace('__STATUS_ID__', json.dumps(NOTIFY_STATUS_ELEMENT_ID)) \
+   .replace('__FEEDBACK_ID__', json.dumps(NOTIFY_FEEDBACK_ELEMENT_ID)) \
+   .replace('__TEST_FEEDBACK__', json.dumps(fork_notify.TEST_FEEDBACK_SENTENCES)) \
+   .replace('__TEST_REQUESTED__', json.dumps(fork_notify.TEST_REQUESTED)) \
+   .replace('__TEST_ERROR__', json.dumps(fork_notify.TEST_ERROR)) \
+   .replace('__TEST_UNKNOWN__', json.dumps(fork_notify.TEST_UNKNOWN)) \
+   .replace('__CHECK_TEMPLATE__', json.dumps(fork_notify.CHECK_SENTENCE_TEMPLATE)) \
+   .replace('__LINE_TEMPLATE__', json.dumps(fork_notify.FEEDBACK_TIME_TEMPLATE)) \
+   .replace('__TIME_FIELD__', json.dumps(fork_notify.FEEDBACK_TIME_FIELD)) \
+   .replace('__MESSAGE_FIELD__', json.dumps(fork_notify.FEEDBACK_MESSAGE_FIELD)) \
+   .replace('__STATE_FIELD__', json.dumps(fork_notify.FEEDBACK_STATE_FIELD))
 
 #: The hidden envelope component's `.change` handler. One line, delegating to the installer, so
 #: there is exactly one copy of the dispatch rules and this registration cannot grow a second
@@ -1924,7 +2013,8 @@ NOTIFY_REQUEST_JS = r"""
 """
 
 #: "Send test notification". Sends one notification and nothing else: it starts no job, reads no
-#: folder and writes no setting.
+#: folder and writes no setting. Since R3 each click requests a FRESH notification -- a unique tag,
+#: minted in the installer -- and reports what happened into the panel's feedback line.
 NOTIFY_TEST_JS = r"""
 () => { if (window.__bsNotify) { window.__bsNotify.test(); } }
 """
@@ -1932,8 +2022,13 @@ NOTIFY_TEST_JS = r"""
 #: "Re-check browser status". Chrome's per-origin permission is changed in Chrome Site Settings,
 #: which BeatSync neither sees nor controls, so the operator needs a way to ask again without
 #: reloading the page.
+#:
+#: Since R3 this delegates to `recheck()` rather than to `paint()`. `paint()` returns early when
+#: the state has not changed -- correct for the MutationObserver that calls it on every DOM
+#: mutation, and the reason this button used to produce no visible effect at all in the common case
+#: where the answer was the same as last time.
 NOTIFY_REFRESH_JS = r"""
-() => { if (window.__bsNotify) { window.__bsNotify.paint(); } }
+() => { if (window.__bsNotify) { window.__bsNotify.recheck(); } }
 """
 
 
@@ -6121,9 +6216,16 @@ def _notify_status_panel_html() -> str:
     moment the operator changes Chrome Site Settings. The installer replaces this text with the
     live answer; if the script never runs, the operator reads that the check did not happen rather
     than a confident lie.
+
+    **R3 adds a second, EMPTY div for the diagnostic acknowledgement**, and empty is the whole
+    contract: it is filled only by a deliberate button press, so a page that has just loaded shows
+    no stale "Test notification requested successfully" from a previous session, and the server --
+    which cannot know what a browser did -- never puts a word in it. Two divs rather than two
+    components for the reason recorded at :data:`NOTIFY_FEEDBACK_ELEMENT_ID`.
     """
     return (f'<div id="{NOTIFY_STATUS_ELEMENT_ID}" data-state="checking">'
-            f'{html_lib.escape(INFO_NOTIFY_STATUS_PENDING)}</div>')
+            f'{html_lib.escape(INFO_NOTIFY_STATUS_PENDING)}</div>'
+            f'<div id="{NOTIFY_FEEDBACK_ELEMENT_ID}" data-feedback="none"></div>')
 
 
 def process_video_guarded(audio_file: str,
@@ -16229,13 +16331,16 @@ def create_ui() -> gr.Blocks:
                 #
                 # Deliberately a plain Group rather than a collapsible panel, and for the same
                 # reason the remembered folders are: a setting that is in force must not be hidden
-                # behind a shut drawer. Five components, and the division of labour between them is
+                # behind a shut drawer. Six components, and the division of labour between them is
                 # the whole honesty argument of this panel:
                 #
                 #   notify_enabled      the APP setting. Server-side truth, saved on change.
                 #   notify_app_state    what that setting means, written by the server only.
-                #   notify_status       what the BROWSER says, written by the page only.
-                #   the two buttons     the one permission gesture, and one test notification.
+                #   notify_status       what the BROWSER says, written by the page only. Since R3
+                #                       it carries two divs: the live permission state, and the
+                #                       acknowledgement of the operator's last diagnostic click.
+                #   the three buttons   the one permission gesture, one test notification, and one
+                #                       re-read of a permission BeatSync cannot see change.
                 #
                 # The two state lines are separate components on purpose. They answer different
                 # questions with different authorities -- "BeatSync is set not to notify" and

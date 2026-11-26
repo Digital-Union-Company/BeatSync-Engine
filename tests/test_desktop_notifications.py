@@ -26,6 +26,7 @@ import ast
 import itertools
 import json
 import os
+import re
 import threading
 import types
 import uuid
@@ -423,7 +424,10 @@ def test_the_notification_option_is_not_a_folder_and_never_reaches_the_folder_st
 _WANTED_ASSIGNS = ("_NOTIFY_LOCK", "_NOTIFY_PENDING", "NOTIFY_SESSION_CAP", "NOTIFY_QUEUE_CAP",
                    "_NOTIFY_RENDER_OUTCOMES", "_CUT_BATCH_RUN_OUTCOMES", "_CUT_BATCH_RAN_TO_END",
                    "_PREP_NOTIFY_JOBS", "_PREP_ANALYSIS_NOTIFY_OUTCOMES",
-                   "NOTIFY_STATUS_ELEMENT_ID")
+                   "NOTIFY_STATUS_ELEMENT_ID",
+                   # [FORK] R17-A R3: the diagnostic acknowledgement line's element id, which
+                   # `_notify_status_panel_html` now renders a second, empty div for.
+                   "NOTIFY_FEEDBACK_ELEMENT_ID")
 
 _WANTED_FUNCTIONS = ("_notify_session_key", "_notifications_enabled", "_notify_publish",
                      "_notify_drain", "_notify_render", "_notify_render_batch", "_notify_cut",
@@ -742,6 +746,26 @@ def test_the_browser_status_placeholder_states_no_permission_state(tmp_path):
     assert 'data-state="checking"' in html
     for state in dn.PERMISSION_STATES:
         assert state not in html, state
+
+
+def test_the_diagnostic_feedback_line_ships_empty_and_the_server_never_fills_it(tmp_path):
+    """[FORK] R17-A R3. The acknowledgement states what the operator's LAST CLICK did, so a page
+    that has just loaded must show nothing at all -- a server-rendered "Test notification
+    requested successfully" would be a claim about a browser action that never happened, and a
+    *stale* one from a previous session at that.
+
+    It is a second div inside the one component with no server-side writer, so the whole of the
+    "the page owns this line" contract carries over unchanged.
+    """
+    ns = _notify_namespace(tmp_path)
+    html = ns["_notify_status_panel_html"]()
+    feedback_id = ns["NOTIFY_FEEDBACK_ELEMENT_ID"]
+    assert feedback_id != ns["NOTIFY_STATUS_ELEMENT_ID"], "two lines, two ids"
+    assert f'<div id="{feedback_id}" data-feedback="none"></div>' in html, html
+    # Not one word of the acknowledgement vocabulary is server-rendered.
+    for sentence in dn.TEST_FEEDBACK_SENTENCES.values():
+        assert sentence not in html
+    assert "Re-checked" not in html
 
 
 # --- the outcome translators ------------------------------------------------------------------
@@ -1568,10 +1592,52 @@ def _script(name: str) -> str:
     # Carry the `.replace(...)` tail that substitutes the wording in, if there is one.
     tail_end = source.index("\n\n", end)
     tail = source[end + 3:tail_end]
-    namespace = {"json": json, "fork_notify": dn,
-                 "NOTIFY_STATUS_ELEMENT_ID": "bs-notify-permission"}
+    namespace = {"json": json, "fork_notify": dn, **_element_ids()}
     exec(rendered + tail, namespace)        # noqa: S102 - the shipped assignment under test
     return namespace[name]
+
+
+#: [FORK] R17-A R3: the two element ids the installer is given. Taken from `gui.py`'s own
+#: assignments rather than written out here: the whole point of substituting them in is that the
+#: script and the panel address the same element, and a literal copy in this file is exactly the
+#: second definition that would let them drift apart silently.
+_ELEMENT_ID_ASSIGNS = ("NOTIFY_STATUS_ELEMENT_ID", "NOTIFY_FEEDBACK_ELEMENT_ID")
+
+
+def _element_ids() -> dict:
+    tree = _tree(_GUI)
+    nodes = [node for node in tree.body
+             if isinstance(node, ast.Assign)
+             and getattr(node.targets[0], "id", "") in _ELEMENT_ID_ASSIGNS]
+    namespace: dict = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]),      # noqa: S102 - two string literals
+                 _GUI, "exec"), namespace)
+    missing = set(_ELEMENT_ID_ASSIGNS) - set(namespace)
+    assert not missing, f"missing from gui.py: {missing}"
+    return {name: namespace[name] for name in _ELEMENT_ID_ASSIGNS}
+
+
+def _entry_point_body(name: str) -> str:
+    """One property of the installer's `window.__bsNotify` object, comment tails stripped.
+
+    **Brace-balanced rather than line-based**, and that is the point: R3 made `test` and `request`
+    multi-statement, and the `[:index("\\n")]` slice this replaced would have silently shrunk to
+    the key's first line and gone on passing while asserting about almost nothing.
+    """
+    installer = _executable(_script("NOTIFY_JS"))
+    start = installer.index(f"\n    {name}: ")
+    depth, opened = 0, False
+    for offset in range(start, len(installer)):
+        character = installer[offset]
+        if character == "{":
+            depth, opened = depth + 1, True
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return installer[start:offset + 1]
+        elif character == "," and depth == 0 and not opened:
+            return installer[start:offset]
+    raise AssertionError(f"{name} is not a balanced entry point of window.__bsNotify")
 
 
 def _executable(script: str) -> str:
@@ -1688,10 +1754,8 @@ def test_the_test_notification_is_reachable_with_the_app_toggle_off(tmp_path):
     """
     delegate = _executable(_script("NOTIFY_TEST_JS"))
     assert "__bsNotify.test()" in delegate
-    installer = _executable(_script("NOTIFY_JS"))
-    test_body = installer[installer.index("test: ("):]
-    test_body = test_body[:test_body.index("\n")]
-    assert "fire(TEST_TITLE, TEST_BODY, TEST_TAG)" in test_body
+    test_body = _entry_point_body("test")
+    assert "fire(TEST_TITLE, TEST_BODY, tag)" in test_body
     for forbidden in ("desktop_notifications", "ENABLED_ON", "enabled", "_option"):
         assert forbidden not in test_body, forbidden
 
@@ -1737,6 +1801,11 @@ def test_every_word_the_page_shows_comes_from_the_pure_module():
     assert json.dumps(dn.TEST_BODY) in installer
     for state in dn.BROWSER_PERMISSION_STATES:
         assert json.dumps(state) in installer
+    # [FORK] R17-A R3: the acknowledgement vocabulary is substituted in whole, as one JSON object,
+    # so a sentence cannot be edited in `gui.py` without the pure module agreeing.
+    assert json.dumps(dn.TEST_FEEDBACK_SENTENCES) in installer
+    assert json.dumps(dn.CHECK_SENTENCE_TEMPLATE) in installer
+    assert json.dumps(dn.FEEDBACK_TIME_TEMPLATE) in installer
 
 
 def test_the_three_delegates_are_one_line_each_and_hold_no_policy():
@@ -1831,3 +1900,281 @@ def test_the_settings_panel_lists_every_authorised_event_source():
 
     for phrase in ("render", "Variant Lab", "Raw Cutter", "Audio Cutter", "Library"):
         assert phrase in INFO_NOTIFY_SECTION, phrase
+
+
+# =============================================================================================
+# 6. [FORK] R17-A R3: the two diagnostic controls
+#
+# The owner granted Chrome's permission, received a real Windows notification from the first
+# "Send test notification", and then saw nothing from any click afterwards. Two separate defects,
+# both in the diagnostics and neither anywhere near a job:
+#
+#   * the test notification carried ONE FIXED TAG, and a second notification sharing a tag
+#     REPLACES the first in place -- silently, with no banner and no sound;
+#   * neither diagnostic button acknowledged a click at all. `paint()` returns early when the
+#     permission state has not changed, which is the common case, so "Re-check browser status" was
+#     indistinguishable from a dead button.
+#
+# Nothing here touches a job's terminal path, its outcome, its identity or the client ledger.
+# =============================================================================================
+
+# --- the tag --------------------------------------------------------------------------------
+
+def test_a_test_notification_carries_a_PREFIX_and_a_job_notification_a_STABLE_tag():
+    """The fix is deliberately narrow: it changes the one notification whose entire purpose is to
+    be requested *again*, and leaves the per-event tag that guards a genuine duplicate alone."""
+    assert dn.TEST_TAG_PREFIX.startswith(dn.TAG_PREFIX), "both stay recognisably ours"
+    assert dn.TEST_TAG_PREFIX != dn.TAG_PREFIX
+    assert dn.TEST_TAG_PREFIX.endswith("-"), "a prefix, so the per-click token appends cleanly"
+
+    # A real job's tag is untouched: the per-event identity, and nothing minted per click.
+    record = dn.build(dn.JOB_RENDER, dn.OUTCOME_SUCCESS, notification_id=_ID)
+    assert record["tag"] == dn.TAG_PREFIX + _ID
+    assert not record["tag"].startswith(dn.TEST_TAG_PREFIX)
+    assert "test" not in record["tag"]
+
+
+def test_the_old_single_fixed_test_tag_is_gone_from_both_halves():
+    """The reproduction: `beatsync-test` as a complete tag is what made every click after the
+    first one silently replace its predecessor instead of alerting."""
+    assert not hasattr(dn, "TEST_TAG"), "a complete fixed test tag must not exist again"
+    installer = _executable(_script("NOTIFY_JS"))
+    assert "const TEST_TAG =" not in installer
+    assert "TEST_TAG," not in installer, "no constant tag may be passed to the constructor"
+
+
+def test_every_deliberate_test_click_mints_a_fresh_tag():
+    """Unique across reloads (the clock) and within one millisecond (the counter)."""
+    body = _entry_point_body("test")
+    assert "TEST_TAG_PREFIX + String(Date.now())" in body
+    assert "String(++tests)" in body
+    # ...and the freshly minted tag is the one that reaches the constructor.
+    assert "fire(TEST_TITLE, TEST_BODY, tag)" in body
+
+    installer = _executable(_script("NOTIFY_JS"))
+    assert installer.count("let tests = 0;") == 1, "one counter, minted in the installer"
+
+
+def test_the_job_dispatch_path_keeps_the_per_event_tag_and_mints_nothing():
+    """R3's tag change must not reach a job. A job's notification is identified by the terminal
+    event it describes, which is what makes the browser-level collapse a real duplicate guard."""
+    body = _entry_point_body("dispatch")
+    assert "String(item.tag || item.id)" in body
+    for forbidden in ("TEST_TAG_PREFIX", "Date.now", "++tests", "say("):
+        assert forbidden not in body, forbidden
+
+
+def test_renotify_was_not_reached_for_instead():
+    """It is specified for `ServiceWorkerRegistration.showNotification`, this feature has no
+    service worker by accepted scope, and with a unique tag there is nothing to re-alert."""
+    for name in _SCRIPT_NAMES:
+        assert "renotify" not in _script(name), name
+
+
+# --- what the panel says back ----------------------------------------------------------------
+
+def test_every_test_result_has_exactly_one_sentence():
+    assert set(dn.TEST_FEEDBACK_SENTENCES) == set(dn.TEST_RESULTS)
+    assert len(set(dn.TEST_FEEDBACK_SENTENCES.values())) == len(dn.TEST_RESULTS), \
+        "two results sharing a sentence would be two obstacles with one fix"
+    # A granted permission always resolves to `requested` or `error`, so reporting the state
+    # itself means the construction was skipped -- which must not read as a success.
+    assert dn.PERMISSION_GRANTED not in dn.TEST_FEEDBACK_SENTENCES
+
+
+@pytest.mark.parametrize("junk", [None, "", "  ", "granted", "GRANTED", 7, 0, True, False,
+                                  object(), [], {}, b"requested", "requested "])
+def test_an_unrecognised_test_result_is_never_a_success(junk):
+    """The same direction of failure every other refusal in this module takes."""
+    assert dn.test_feedback_sentence(junk) == dn.TEST_FEEDBACK_SENTENCES[dn.TEST_UNKNOWN]
+    assert "requested successfully" not in dn.test_feedback_sentence(junk)
+
+
+def test_the_success_wording_describes_the_REQUEST_and_never_the_delivery():
+    """A constructor that returned proves the browser accepted the call. Whether Windows drew
+    anything is Windows' decision, and the one thing this sentence may not do is claim it did."""
+    sentence = dn.test_feedback_sentence(dn.TEST_REQUESTED)
+    assert sentence.startswith("Test notification requested successfully."), sentence
+    for claim in ("was shown", "was displayed", "has been shown", "was delivered", "you will see",
+                  "guaranteed", "Windows showed"):
+        assert claim not in sentence, claim
+    # ...and it names at least one of the things that can still suppress it.
+    assert "Focus Assist" in sentence and "Windows" in sentence
+
+
+@pytest.mark.parametrize("result,phrase", [
+    (dn.PERMISSION_NOT_REQUESTED, "Allow notifications in Chrome"),
+    (dn.PERMISSION_DENIED, "Chrome Site Settings"),
+    (dn.PERMISSION_UNSUPPORTED, "no notification API"),
+])
+def test_each_refusal_names_the_obstacle_and_its_actual_fix(result, phrase):
+    """Three different obstacles with three different fixes; one shared sentence would send the
+    operator to the wrong place in two cases out of three."""
+    sentence = dn.test_feedback_sentence(result)
+    assert phrase in sentence, sentence
+    assert "Nothing was sent" in sentence, sentence
+
+
+def test_a_refusal_never_claims_beatsync_changed_a_chrome_permission():
+    for result in (dn.PERMISSION_DENIED, dn.PERMISSION_UNSUPPORTED, dn.TEST_ERROR):
+        sentence = dn.test_feedback_sentence(result)
+        for claim in ("BeatSync has changed", "we changed", "reset for you", "unblocked"):
+            assert claim not in sentence
+    assert "cannot change that" in dn.test_feedback_sentence(dn.PERMISSION_DENIED)
+
+
+@pytest.mark.parametrize("state", dn.PERMISSION_STATES)
+def test_the_recheck_sentence_names_the_measured_state(state):
+    sentence = dn.check_sentence(state)
+    assert state in sentence
+    assert sentence.startswith("Re-checked"), sentence
+    assert dn.FEEDBACK_STATE_FIELD not in sentence, "the placeholder must be substituted"
+
+
+@pytest.mark.parametrize("junk", [None, "", "yes", "default", 7, True, object(), []])
+def test_an_unrecognised_permission_state_rechecks_as_unsupported(junk):
+    """Exactly how `permission_sentence` resolves it, so the two halves of the panel cannot name
+    one state differently."""
+    assert dn.check_sentence(junk) == dn.check_sentence(dn.PERMISSION_UNSUPPORTED)
+    assert dn.PERMISSION_UNSUPPORTED in dn.check_sentence(junk)
+
+
+def test_a_feedback_line_is_stamped_so_a_repeated_answer_is_visibly_a_new_answer():
+    """The acknowledgement is shown for an UNCHANGED state too, which is the whole fix -- so the
+    only moving part on an identical line is the time."""
+    first = dn.feedback_line("Re-checked this browser.", "20:14:06")
+    second = dn.feedback_line("Re-checked this browser.", "20:14:09")
+    assert first != second
+    assert "20:14:06" in first and "Re-checked this browser." in first
+    assert dn.FEEDBACK_TIME_FIELD not in first and dn.FEEDBACK_MESSAGE_FIELD not in first
+
+
+@pytest.mark.parametrize("clock", ["", "   ", None, 7, object(), []])
+def test_a_clock_that_cannot_be_read_still_leaves_the_measurement(clock):
+    """A diagnostic that lost its timestamp must still say what it measured, rather than going
+    blank or showing a half-substituted template."""
+    assert dn.feedback_line("Re-checked this browser.", clock) == "Re-checked this browser."
+
+
+@pytest.mark.parametrize("message", ["", "   ", None, 7, object(), [], {}])
+def test_an_empty_feedback_message_composes_to_nothing_rather_than_a_bare_timestamp(message):
+    assert dn.feedback_line(message, "20:14:06") == ""
+
+
+def test_no_feedback_wording_can_disturb_the_substitution_that_carries_it():
+    """Three real hazards, each measured against this repository's own machinery rather than
+    assumed away:
+
+    * a `$` in a JavaScript `String.replace` REPLACEMENT is a substitution pattern (`$&`, `$'`),
+      so a sentence containing one would be silently mangled on its way to the panel;
+    * a `//` inside a string literal breaks the comment stripper every structural scan in this
+      file runs the scripts through -- stated as an invariant in `_executable`'s own docstring;
+    * a sentence containing a placeholder token would be rewritten by the next replacement.
+    """
+    wording = (list(dn.TEST_FEEDBACK_SENTENCES.values())
+               + [dn.CHECK_SENTENCE_TEMPLATE, dn.FEEDBACK_TIME_TEMPLATE, dn.TEST_TITLE,
+                  dn.TEST_BODY]
+               + list(dn.PERMISSION_SENTENCES.values()))
+    for text in wording:
+        assert "$" not in text, text
+        assert "//" not in json.dumps(text), text
+    for text in dn.TEST_FEEDBACK_SENTENCES.values():
+        assert dn.FEEDBACK_TIME_FIELD not in text
+        assert dn.FEEDBACK_MESSAGE_FIELD not in text
+    assert dn.FEEDBACK_STATE_FIELD in dn.CHECK_SENTENCE_TEMPLATE
+    assert dn.FEEDBACK_TIME_FIELD in dn.FEEDBACK_TIME_TEMPLATE
+    assert dn.FEEDBACK_MESSAGE_FIELD in dn.FEEDBACK_TIME_TEMPLATE
+
+
+# --- the client half, structurally ------------------------------------------------------------
+
+def test_every_diagnostic_click_writes_the_acknowledgement_line():
+    """"Visible feedback after every diagnostic button click" -- all three of them, including the
+    permission gesture, which produces no Chrome prompt at all once permission is granted."""
+    assert "say(sentence(result))" in _entry_point_body("test")
+    assert "checked()" in _entry_point_body("recheck")
+    assert "checked()" in _entry_point_body("request")
+
+
+def test_the_mutation_observer_does_NOT_write_the_acknowledgement_line():
+    """It fires on every DOM mutation, and a render emitting frames must not scroll a timestamped
+    diagnostic underneath the operator. `paint` is left exactly as it was."""
+    installer = _executable(_script("NOTIFY_JS"))
+    paint = installer[installer.index("const paint = () =>"):installer.index("const seen = ()")]
+    for forbidden in ("say(", "checked(", "Date.now", "toLocaleTimeString", "FEEDBACK_ID"):
+        assert forbidden not in paint, forbidden
+    assert "new MutationObserver(paint)" in installer, "still the painter, not the reporter"
+
+
+def test_the_recheck_button_no_longer_delegates_to_the_early_returning_painter():
+    """`paint()` returns when `data-state` is unchanged, which is why pressing this button on a
+    settled permission used to do nothing observable whatsoever."""
+    delegate = _executable(_script("NOTIFY_REFRESH_JS")).strip()
+    assert "__bsNotify.recheck()" in delegate
+    assert "paint()" not in delegate
+    # The early return is still there, because the observer depends on it.
+    installer = _executable(_script("NOTIFY_JS"))
+    assert 'if (host.getAttribute("data-state") === now) { return; }' in installer
+
+
+def test_the_constructor_outcome_is_REPORTED_rather_than_reduced_to_a_boolean():
+    """"Nothing was sent because Chrome has not been asked" and "the constructor threw" have
+    different fixes and must not collapse into one sentence."""
+    installer = _executable(_script("NOTIFY_JS"))
+    fire = installer[installer.index("const fire = ("):installer.index("window.__bsNotify = {")]
+    assert "if (now !== GRANTED) { return now; }" in fire, "the obstacle is named"
+    assert "return TEST_REQUESTED;" in fire
+    assert "return TEST_ERROR;" in fire
+    assert "return false" not in fire and "return true" not in fire
+
+
+def test_the_client_composes_a_feedback_line_the_way_the_pure_module_does():
+    """`feedback_line` is the reference implementation of a composition the browser performs,
+    exactly as `decode_envelope` is for the dispatcher. These are the two substitutions it makes,
+    pinned so the two halves cannot drift -- there is no JavaScript engine in this suite."""
+    installer = _executable(_script("NOTIFY_JS"))
+    assert "LINE_TEMPLATE.replace(TIME_FIELD, at).replace(MESSAGE_FIELD, message)" in installer
+    assert "CHECK_TEMPLATE.replace(STATE_FIELD, state())" in installer
+
+
+def test_the_acknowledgement_writer_cannot_throw_on_the_page():
+    """The Settings panel is rendered lazily, so the host element legitimately may not exist --
+    and a diagnostic must never be the thing that takes a page down."""
+    installer = _executable(_script("NOTIFY_JS"))
+    say = installer[installer.index("const say = ("):installer.index("const sentence = (")]
+    assert "if (!host) { return; }" in say
+    clock = installer[installer.index("const clockText = ("):installer.index("const say = (")]
+    assert "try {" in clock and "catch (e) { return \"\"; }" in clock
+    # An unrecognised result falls back rather than reading `undefined` onto the panel.
+    assert "TEST_FEEDBACK[result] || TEST_FEEDBACK[TEST_UNKNOWN]" in installer
+
+
+def test_the_diagnostics_still_call_no_server_function_and_write_no_setting():
+    """R3 adds words to a panel, not an endpoint. The three diagnostic registrations stay
+    `fn=None` with empty `inputs` and `outputs`, so nothing server-side can gate or observe one."""
+    tree = _tree(_GUI)
+    for registration in ("notify_permission_btn.click", "notify_test_btn.click",
+                         "notify_refresh_btn.click"):
+        call = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and ast.unparse(node.func) == registration)
+        kwargs = _kwargs(call)
+        assert kwargs["fn"] == "None", registration
+        assert kwargs["inputs"] == "[]" and kwargs["outputs"] == "[]", registration
+    for name in _SCRIPT_NAMES:
+        script = _executable(_script(name))
+        for forbidden in ("preferences", "localStorage.setItem(\"beatsyncNotifyEnabled",
+                          "ENABLED_ON", "ENABLED_OFF"):
+            assert forbidden not in script, (name, forbidden)
+
+
+@pytest.mark.parametrize("name", _SCRIPT_NAMES)
+def test_no_substitution_placeholder_survives_into_a_shipped_script(name):
+    """A `__TOKEN__` left behind is a JavaScript syntax error that no structural assertion in this
+    file would otherwise notice -- it would simply stop the whole installer compiling in the
+    browser, which is how `NOTIFY_JS` fails silently and completely.
+
+    `__bsNotify` is the deliberate exception: it is the installed object's own name.
+    """
+    leftovers = [token for token in re.findall(r"__[A-Z][A-Z0-9_]*__", _script(name))]
+    assert leftovers == [], leftovers
