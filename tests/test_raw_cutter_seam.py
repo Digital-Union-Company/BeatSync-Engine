@@ -802,7 +802,21 @@ def test_only_this_operations_own_staging_file_is_ever_removed(export_tree):
     for forbidden in ("rmtree", "os.rmdir", "glob", "listdir", "os.walk"):
         assert forbidden not in discard, forbidden
     rendered = _code_only(export_tree)
-    assert "shutil" not in rendered
+    # [FORK] R4-D: `shutil` is no longer banned outright, because `measure_free_space` needs
+    # `shutil.disk_usage` -- and a blanket name ban was never what this assertion was protecting.
+    # What it protects is that the adapter owns no bulk or recursive filesystem operation, so that
+    # is now asserted directly, member by member, AND `disk_usage` is pinned as the only `shutil`
+    # call in the file. That is strictly stronger in the dimension that matters: the old check
+    # would have passed a hand-rolled recursive delete written with `os` alone, and this one
+    # already refuses `rmtree`, `os.walk`, `glob` and `listdir` by name below.
+    for forbidden in ("shutil.rmtree", "shutil.move", "shutil.copy", "shutil.copytree",
+                      "shutil.copyfile", "shutil.copy2", "shutil.unpack_archive"):
+        assert forbidden not in rendered, forbidden
+    shutil_calls = {line.split("shutil.", 1)[1].split("(")[0]
+                    for line in rendered.splitlines() if "shutil." in line}
+    assert shutil_calls == {"disk_usage"}, shutil_calls
+    for forbidden in ("rmtree", "os.walk", "glob("):
+        assert forbidden not in rendered, forbidden
     assert "_discard_partial" not in rendered, "the destination-deleting helper must be gone"
 
     export = _code_only(_func(export_tree, "export_segments"))

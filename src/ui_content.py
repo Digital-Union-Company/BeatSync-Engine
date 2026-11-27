@@ -1523,6 +1523,13 @@ CUT_BATCH_CANCEL_REQUESTED_TEXT = (
 )
 CUT_BATCH_DONE_STATUS = "Batch finished. See the summary below."
 CUT_BATCH_CANCELLED_STATUS = "Batch cancelled. Finished clips were kept — see the summary below."
+#: [FORK] Digital-Union (R4-D): a batch that stopped because the output drive filled up. It must
+#: never reach `CUT_BATCH_DONE_STATUS` — the run did not finish, and the sources after the one it
+#: stopped on were never attempted.
+CUT_BATCH_STORAGE_FULL_STATUS = (
+    "Batch stopped — the output drive ran out of space. Finished clips were kept; later source "
+    "videos were not attempted. See the summary below."
+)
 
 # [FORK] Digital-Union (Raw Cutter progress P1): the live progress panel.
 #
@@ -1573,6 +1580,12 @@ CUT_BATCH_RECORD_LOST_TITLE = "Batch finished — record NOT saved"
 #: A batch that was refused before it ever reached finalisation has no terminal class, and the
 #: panel says exactly that rather than inventing one.
 CUT_BATCH_NOT_RUN_TITLE = "Batch did not run"
+#: [FORK] Digital-Union (R4-D): the output drive filled up, so the job stopped scheduling work.
+#: Deliberately its OWN title rather than `CUT_BATCH_FAILED_TITLE` / `CUT_CUT_FAILED_TITLE`: the
+#: tool did not fail, and the 2026-11-16 incident is what it costs an operator to be told it did.
+#: The word is "drive", never "video" -- the footage was never the problem.
+CUT_BATCH_STORAGE_FULL_TITLE = "Batch stopped — output drive full"
+CUT_CUT_STORAGE_FULL_TITLE = "Cutting stopped — output drive full"
 CUT_SETTINGS_CHANGED_TEXT = (
     "A planning setting changed, so the previous plan no longer describes this source. "
     "Press Analyze / Preview again before cutting."

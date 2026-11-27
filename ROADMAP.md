@@ -377,6 +377,81 @@ new `tests/test_raw_cutter_naming.py`. The 88 added tests cover the job-wide sou
 batch through the real handler and an executable negative control in which the superseded
 per-index rule fails the ordering requirement.
 
+#### R4-D — Disk-full protection for Raw Cutter exports · **SOURCE COMPLETE AND TESTED — NOT MERGED, NOT INSTALLED, NOT OWNER ACCEPTED**
+
+> **Supersedes the documentation proposal in PR #106** (head `df115cba`), which added the accepted
+> scope to this file and nothing else. That branch is **obsolete and is not to be merged
+> separately**: the scope text it proposed is reproduced and extended here, in the same commit as
+> the implementation, so the roadmap and the code cannot disagree about what was built.
+
+**Owner incident, 2026-11-16.** A Folder Batch attempted 15 sources; 5 completed, 1 was partial and
+9 failed. FFmpeg repeatedly returned `-28 (No space left on device)`; 580 of 1,137 planned clips
+(8.2 GB) were reported written, then the final `batch_manifest.json` could not be saved with
+`Errno 28`. The trace supports output storage exhaustion, **not a finding of corrupt source
+video**. Private source names and local filesystem paths are deliberately omitted from this public
+roadmap.
+
+**Reproduced before anything was written**, on pristine `71403afa`, by injecting FFmpeg's own
+disk-full stderr at clip 3 of a 6-clip plan and running the real exporter: **6 export attempts, 4
+identical failures, no stop**. The tool had no way to say *the drive is full*, so it said *this
+video failed* once per remaining clip.
+
+**What was implemented.**
+
+- **A capacity preflight on the REAL destination volume.** `realpath` first, so a junction or a
+  symlinked output folder is measured where the bytes actually land; a folder that does not exist
+  yet is measured at its nearest existing ancestor, so a doomed batch is refused **without first
+  creating the folder it would have written into**. The folder batch is refused before admission —
+  before the mutex, before any probe, before any scene detection, which is the "before spending
+  minutes analysing it" the scope asks for. Single Video is refused before the encode but **after**
+  its analysis, because `_on_cut_analyze` does not know the output folder; that limitation is
+  recorded rather than worked around.
+- **One floor, and a qualified estimate.** Below `disk_guard.MIN_FREE_EXPORT_BYTES` (64 MiB)
+  nothing is attempted. A job whose largest planned clip cannot fit is refused too. A *total*
+  estimate that does not fit is a **warning, never a refusal** — it comes from the source's own
+  bitrate and is not reliable enough to cancel a job the operator asked for. Every headroom figure
+  carries the sentence that it was measured just now and is not a guarantee.
+- **An immediate, classified stop.** FFmpeg's own disk-full wording and a real `ENOSPC`/Windows
+  disk-full `OSError` raise `StorageExhausted`; the exporter stops scheduling, and the batch stops
+  scheduling further **sources**. An **ordinary** encoder failure is untouched and still carries on
+  to the next clip — measured, as the negative control, against the real binary. The markers are
+  whole sentence fragments on purpose: FFmpeg quotes paths in its stderr, so a short marker could
+  misdiagnose a folder named `disk full` and stop a healthy run.
+- **Its own outcome and its own terminal class.** `OUTCOME_STORAGE_FULL` and
+  `TERMINAL_STORAGE_FULL`, deliberately distinct from `export_failed` and from "an unexpected
+  error" — which is the conflation that made nine sources read as nine broken videos. The source
+  it stopped on is **partial** if it published anything, later sources are **not attempted**, and
+  the headline, the panel, the handoff record, the manifest and the one notification are five
+  renderings of that single class. A storage stop can never be announced as a success.
+- **Completed results are safe.** No clip, cache, output or source file is ever deleted to recover
+  space — there is no automatic recovery in R4-D at all. Staging, atomic no-overwrite publication
+  and post-encode validation are unchanged, **Review these clips** still offers the clips that
+  really exist, and a later attempt still gets a fresh output folder.
+- **Recoverable progress.** A bounded in-progress checkpoint (at most 50 writes per batch, however
+  many sources) reuses the existing manifest payload builder with `in_progress=True` and lands on
+  its **own** filename, so the authoritative record never holds an incomplete document and the
+  final write's no-replace rename cannot collide with it. A checkpoint carries `complete: false`
+  and a non-terminal status, so it cannot be mistaken for a finished run; it is discarded when the
+  final write succeeds and **kept** when it fails. One checkpoint failure is final — no retry.
+- **A lost record says so in plain words.** The final write's failure message now names a full
+  drive instead of quoting `[Errno 28]`, which was the one sentence in the incident report nobody
+  could act on.
+
+**Verification.** `tests/test_raw_cutter_disk_full.py` (68 cases: the pure policy, plus the real
+adapter reached by AST extraction with its real `shutil.disk_usage`, real staging writes and real
+no-replace rename) plus 29 handler cases added to `tests/test_raw_cutter_batch.py` and
+`tests/test_cut_handoff.py`. **No drive is ever filled**: the condition is injected as FFmpeg's own
+stderr or as a real `OSError(ENOSPC)`. Measured non-vacuity against pristine `71403afa`: 45 of 68,
+and 20 of the 29 handler cases, fail there; every case that passes is a named scope invariant or
+regression pin. A real-FFmpeg smoke on synthetic media verifies published clips by **FFprobe and a
+full decode**, never by exit code, and confirms the attempt counts against real argv. An isolated
+served-GUI smoke confirms the app constructs and serves with the new module wired, that a healthy
+drive is **not** refused, and that an unwritable one is refused without creating a run folder and
+with Cut Video left available — and it found two real defects while doing so (see the changelog).
+
+**Status:** source complete, tested and pushed for review. Not merged, not installed, not owner
+accepted, and no release date is implied.
+
 #### Remaining R4 ideas · **PLANNED, NOT IMPLEMENTED**
 
 - **Cancellation during an active FFmpeg segment**, rather than only between clips.
@@ -2301,6 +2376,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
+| **R4-D** — Raw Cutter disk-full protection and partial-run manifest | **SOURCE COMPLETE AND TESTED · NOT MERGED, NOT INSTALLED, NOT OWNER ACCEPTED** (owner incident 2026-11-16; scope accepted 2026-11-17; implemented 2026-11-27). Capacity preflight on the resolved output volume, fail-fast on FFmpeg's disk-full wording and on `ENOSPC`, its own `OUTCOME_STORAGE_FULL` / `TERMINAL_STORAGE_FULL` rather than `export_failed`, already-published clips preserved with **no** automatic recovery, bounded per-source checkpoints on their own filename, truthful missing-manifest reporting, and a real-FFmpeg smoke verified by decode. **Supersedes PR #106**, whose documentation-only branch is obsolete and must not be merged separately. No other priority changes |
 
 ### Current priority order (product-owner decision)
 

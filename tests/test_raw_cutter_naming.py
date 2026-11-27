@@ -35,10 +35,12 @@ import ast
 import dataclasses
 import hashlib
 import os
+import shutil
 import subprocess
 
 import pytest
 
+from beatsync_fork import disk_guard
 from beatsync_fork import raw_cutter as rc
 from beatsync_fork import raw_cutter_batch as batch
 
@@ -1003,9 +1005,13 @@ def exporter():
     ones the product builds.
     """
     tree = _tree(_EXPORT)
+    # [FORK] R4-D: `StorageExhausted` and `measure_free_space` are the two names the export loop
+    # gained, and both are extracted REAL -- `measure_free_space` runs its actual
+    # `shutil.disk_usage` against `tmp_path`, so these cases exercise the live capacity re-check on
+    # a volume with ordinary free space rather than a stub that always says "plenty".
     wanted = ("SegmentResult", "export_segments", "_discard_staging", "_validate_output",
-              "build_segment_command", "CutterCancelled", "CutterJob",
-              "EXPORT_TIMEOUT_SECONDS", "PROBE_TIMEOUT_SECONDS")
+              "build_segment_command", "CutterCancelled", "CutterJob", "StorageExhausted",
+              "measure_free_space", "EXPORT_TIMEOUT_SECONDS", "PROBE_TIMEOUT_SECONDS")
     nodes = [n for n in tree.body
              if (isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted)
              or (isinstance(n, ast.Assign) and len(n.targets) == 1
@@ -1045,6 +1051,10 @@ def exporter():
         "fork_cutter": rc, "FFMPEG_PATH": "ffmpeg", "FFPROBE_PATH": "ffprobe", "MAX_THREADS": 4,
         "_run_media_command": run_media,
         "_short_ffmpeg_error": lambda stderr, max_chars=400: (stderr or "")[-max_chars:],
+        # [FORK] R4-D: the REAL policy module and the REAL `shutil`, so the capacity floor, the
+        # error classification and the one `disk_usage` call are the shipped ones. Stubbing either
+        # would make these cases assert about a model of the guard instead of the guard.
+        "shutil": shutil, "fork_disk": disk_guard,
         "__annotations__": {},
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), _EXPORT, "exec"),   # noqa: S102

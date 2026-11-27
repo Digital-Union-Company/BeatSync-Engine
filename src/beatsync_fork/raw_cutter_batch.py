@@ -63,6 +63,15 @@ OUTCOME_EXPORT_FAILED = "export_failed"
 OUTCOME_CANCELLED = "cancelled"
 #: Never started, because the operator cancelled first.
 OUTCOME_NOT_ATTEMPTED = "not_attempted"
+#: [FORK] R4-D: the output drive ran out of space while this source was being exported, and no
+#: clip of it survived. **Deliberately distinct from `OUTCOME_EXPORT_FAILED`**, which is this
+#: module's word for "the encoder could not produce these clips" — a statement about the footage or
+#: the encoder. The owner's 2026-11-16 incident is exactly what happens when the two share one
+#: label: nine sources were reported as export failures, so the report read as nine broken videos
+#: when the only broken thing was the volume. A source that DID put clips on disk before the drive
+#: filled is `OUTCOME_PARTIAL`, not this: it produced results, and the vocabulary already has the
+#: honest word for that.
+OUTCOME_STORAGE_FULL = "output_storage_full"
 #: [FORK] R2 (F-3): the batch hit an UNEXPECTED fault while this source was being processed, and
 #: no clip evidence survived to classify it more precisely. Distinct from every outcome above
 #: because those all describe a decision the tool made about the footage; this one describes the
@@ -83,14 +92,21 @@ OUTCOME_LABELS: dict[str, str] = {
     OUTCOME_CANCELLED: "cancelled mid-export",
     OUTCOME_NOT_ATTEMPTED: "not attempted",
     OUTCOME_UNEXPECTED_ERROR: "stopped by an unexpected error",
+    # [FORK] R4-D: the wording names the DRIVE, never the video. That is the whole point of the
+    # outcome existing separately from `export_failed`.
+    OUTCOME_STORAGE_FULL: "stopped - output drive full",
 }
 
 #: Outcomes that mean the operator has usable new clips from that source.
 _PRODUCED_CLIPS = frozenset({OUTCOME_COMPLETED, OUTCOME_PARTIAL, OUTCOME_CANCELLED})
 
 #: Outcomes that are failures of the tool or the file, as opposed to a truthful "nothing here".
+#: [FORK] R4-D: `OUTCOME_STORAGE_FULL` joins this set. A source that produced nothing because the
+#: drive filled is a source the operator did not get clips from, so the headline count must include
+#: it — the distinction R4-D draws is in the *reason* given, not in whether it counts as a loss.
 _FAILED = frozenset({OUTCOME_UNREADABLE, OUTCOME_DETECTION_FAILED, OUTCOME_PLAN_FAILED,
-                     OUTCOME_PARTIAL, OUTCOME_EXPORT_FAILED, OUTCOME_UNEXPECTED_ERROR})
+                     OUTCOME_PARTIAL, OUTCOME_EXPORT_FAILED, OUTCOME_UNEXPECTED_ERROR,
+                     OUTCOME_STORAGE_FULL})
 
 # ---------------------------------------------------------------------------------------------
 # [FORK] R2 (F-2): how the WHOLE batch ended
@@ -111,18 +127,77 @@ TERMINAL_COMPLETED_WITH_FAILURES = "completed_with_failures"
 TERMINAL_CANCELLED = "cancelled"
 #: The batch stopped on an unexpected error. NOT a cancellation and never reported as one.
 TERMINAL_FAILED = "failed"
+#: [FORK] R4-D: the batch stopped scheduling because the output drive filled up. A **fifth** class,
+#: not a flavour of `TERMINAL_FAILED`: the tool did not break, it correctly detected a condition it
+#: cannot work around, and reporting that through the class that means "an unexpected error" is the
+#: same conflation `OUTCOME_STORAGE_FULL` exists to undo one level down. It is also not a
+#: cancellation — nobody pressed anything — which is why it cannot ride on the `cancelled` flag.
+TERMINAL_STORAGE_FULL = "stopped_output_storage_full"
+#: [FORK] R4-D: a run that is still going. The ONLY status a bounded per-source checkpoint may
+#: carry, and the reason an incomplete record cannot be mistaken for a finished one: it is not a
+#: terminal class at all, it never appears in a final write, and it travels beside
+#: ``"complete": false`` in the same payload. See :func:`manifest_payload`.
+TERMINAL_IN_PROGRESS = "in_progress"
+
+#: [FORK] R4-D: at most this many bounded checkpoint writes per batch, however many sources it has.
+#: The checkpoint exists so a run that dies with a full volume still has a record; it is not a
+#: journal, and a 6,000-source batch must not pay 6,000 serialisations of a growing document for it.
+CHECKPOINT_MAX_WRITES = 50
+
+
+def checkpoint_every(total: Any) -> int:
+    """[FORK] R4-D: write a checkpoint after every Nth source. Never zero, never a clock.
+
+    Deterministic in the source count alone, so the checkpoint cadence of a given batch is a fact
+    about that batch rather than about how fast the machine happened to be. Small batches
+    checkpoint after every source; a large one is thinned so the total stays within
+    :data:`CHECKPOINT_MAX_WRITES`.
+    """
+    try:
+        count = int(total)
+    except (TypeError, ValueError):
+        return 1
+    if count <= CHECKPOINT_MAX_WRITES:
+        return 1
+    return -(-count // CHECKPOINT_MAX_WRITES)      # ceil, without importing math
+
+
+def should_checkpoint(position: Any, total: Any) -> bool:
+    """[FORK] R4-D: is this 1-based source position a checkpoint boundary?
+
+    The LAST source deliberately does not get one of its own. Every terminal path finalises, and
+    the final write carries the same information with ``"complete": true``; a checkpoint one
+    statement before it would be a second write of a document that is about to be superseded.
+    """
+    try:
+        index = int(position)
+        count = int(total)
+    except (TypeError, ValueError):
+        return False
+    if index < 1 or index >= count:
+        return False
+    return index % checkpoint_every(count) == 0
 
 
 def terminal_status(items: Sequence[BatchItem], discovered: int, cancelled: bool,
-                    fatal_error: str = "") -> str:
+                    fatal_error: str = "", *, storage_full: bool = False) -> str:
     """Classify how the whole run ended. One rule, used by the report AND the manifest.
 
     Order is the point: a fatal error outranks a cancellation flag, because a batch that crashed
     after the operator pressed Cancel still crashed, and calling that a clean cancellation is the
     exact misreport R2 exists to remove.
+
+    [FORK] R4-D: `storage_full` is keyword-only and defaults to ``False``, so every pre-R4-D call
+    site keeps its exact answer. It sits **below** `fatal_error` and **above** `cancelled`, and both
+    halves of that are deliberate. A batch that crashed after the drive filled still crashed, so the
+    crash is reported. But a drive that filled is what *stopped the scheduling*, and a Cancel pressed
+    in response to watching it stop is the operator reacting to the stop rather than causing it — so
+    reporting that as a clean cancellation would hide the only fact worth acting on.
     """
     if str(fatal_error or "").strip():
         return TERMINAL_FAILED
+    if storage_full:
+        return TERMINAL_STORAGE_FULL
     if cancelled:
         return TERMINAL_CANCELLED
     if summarise(items, discovered).failed:
@@ -142,6 +217,17 @@ PHASE_MANIFEST = "writing the batch record"
 
 MANIFEST_SCHEMA = "beatsync-raw-cutter-batch-1"
 MANIFEST_FILENAME = "batch_manifest.json"
+#: [FORK] R4-D: where a bounded in-progress checkpoint is written. **A different filename from
+#: the authoritative record, and that is the mechanism rather than a convention.** Two properties
+#: fall out of it that nothing else had to be written to obtain:
+#:
+#: * the authoritative name never holds an incomplete document, so a reader that only knows
+#:   `MANIFEST_FILENAME` cannot be shown a partial run as a finished one; and
+#: * `write_batch_manifest`'s **no-replace** publication survives untouched — had the checkpoint
+#:   been written to the real name, the final write's `os.rename` would have hit the checkpoint and
+#:   failed with `FileExistsError`, so every checkpointed batch would have ended with its own
+#:   record reported as lost.
+MANIFEST_CHECKPOINT_FILENAME = "batch_manifest.partial.json"
 
 BATCH_DIRECTORY_PREFIX = "RawCutter_Batch_"
 
@@ -481,7 +567,8 @@ def progress_text(position: int, total: int, basename: str, phase: str,
 def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSettings,
                  batch_directory: str, elapsed_seconds: float, cancelled: bool,
                  input_root: str = "", max_listed: int = 40, *,
-                 fatal_error: str = "", manifest_error: str = "") -> str:
+                 fatal_error: str = "", manifest_error: str = "",
+                 storage_full: bool = False, storage_detail: str = "") -> str:
     """The end-of-batch report. Honest after failure and after cancellation.
 
     It never calls a partial source complete, never presents unattempted sources as clean, and
@@ -497,11 +584,18 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
     * that the manifest had been saved (R1 finding F-4) -- the sentence was unconditional, and
       was composed BEFORE the write had even been attempted. The caller now measures the write
       and passes the result in, so the claim reports rather than predicts.
+
+    [FORK] R4-D: `storage_full` and `storage_detail` are keyword-only and default to empty for the
+    same reason -- every pre-R4-D call site keeps its exact output. They exist because the one
+    thing the incident's report never said was *the drive is full*: the headline blamed the run, the
+    per-source lines blamed the footage, and the operator's own measurement of the volume was
+    nowhere on the screen.
     """
     totals = summarise(items, discovered)
-    status = terminal_status(items, discovered, cancelled, fatal_error)
+    status = terminal_status(items, discovered, cancelled, fatal_error, storage_full=storage_full)
     headline, icon = {
         TERMINAL_FAILED: ("Batch stopped on an unexpected error", "❌"),
+        TERMINAL_STORAGE_FULL: ("Batch stopped - the output drive is full", "🛑"),
         TERMINAL_CANCELLED: ("Batch cancelled", "⏹️"),
         TERMINAL_COMPLETED_WITH_FAILURES: ("Batch finished with failures", "⚠️"),
         TERMINAL_COMPLETED: ("Batch finished", "✅"),
@@ -517,6 +611,23 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
             "written are still on disk, and your source files were not modified.",
             "",
         ])
+    elif status == TERMINAL_STORAGE_FULL:
+        # [FORK] R4-D: the three sentences the 2026-11-16 report was missing -- the cause is the
+        # VOLUME and not the footage, what was written is still there, and the retry goes
+        # somewhere new. Nothing here is conditional on a count: a batch that stopped on its first
+        # clip needs the same three facts as one that stopped on its thousandth.
+        lines.extend([
+            "The batch stopped scheduling work because the output drive ran out of space. This is "
+            "not a problem with your source videos, and nothing was deleted to make room.",
+            "Clips that were already written are still on disk, and your source files were not "
+            "modified. Sources after the one it stopped on were not attempted.",
+            "Free some space, then start the batch again - it will write into a new output folder "
+            "and will not touch this one.",
+            "",
+        ])
+        detail = " ".join(str(storage_detail or "").split())
+        if detail:
+            lines.extend([detail, ""])
     lines.extend([
         f"Discovered       {totals.discovered} video(s)" + (f" under {input_root}"
                                                             if input_root else ""),
@@ -573,7 +684,12 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
                      f"output folder.")
     lines.append("Your source files were not modified. Skipped footage is intentional - the Raw "
                  "Cutter keeps clean continuous shots and leaves the rest.")
-    if not cancelled and totals.no_clips and not totals.clips_written:
+    # [FORK] R4-D: `storage_full` suppresses this advice, and that is a correctness fix rather than
+    # tidiness. A batch stopped by a full drive can easily end with sources that reported no usable
+    # shots and no clips on disk, which is exactly this condition -- and telling the operator to
+    # lower their minimum clip length would send them to change a setting that had nothing to do
+    # with it. The settings were fine; the volume was not.
+    if not cancelled and not storage_full and totals.no_clips and not totals.clips_written:
         lines.append("Nothing was long enough to export at these settings. Lower the minimum clip "
                      "length, or lower the sensitivity so fewer scene changes are detected.")
     return "\n".join(lines)
@@ -582,7 +698,8 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
 def manifest_payload(items: Sequence[BatchItem], discovered: int, settings: BatchSettings,
                      batch_directory: str, input_root: str, started_at: str, finished_at: str,
                      elapsed_seconds: float, cancelled: bool, *,
-                     fatal_error: str = "") -> dict:
+                     fatal_error: str = "", storage_full: bool = False,
+                     in_progress: bool = False) -> dict:
     """The machine-readable record, as a plain dict of primitives.
 
     A dict rather than serialised text so this module needs no ``json`` import and the adapter owns
@@ -602,13 +719,36 @@ def manifest_payload(items: Sequence[BatchItem], discovered: int, settings: Batc
     maps original identity to synthetic identity without the exported names carrying it, which is
     the whole requirement -- and the new flag tells a reader which mode produced the row rather
     than leaving them to infer it from the shape of a folder name.
+
+    [FORK] R4-D: `storage_full` and `in_progress` are ADDED and nothing is removed or redefined, so
+    the schema name is unchanged and an existing reader is unaffected. `in_progress` is what makes a
+    bounded checkpoint safe to publish:
+
+    * ``"complete"`` is a new top-level boolean -- ``False`` for a checkpoint, ``True`` for a final
+      write -- so "did this run finish?" has one field to answer it rather than needing a reader to
+      interpret a status vocabulary; and
+    * `terminal_status` becomes :data:`TERMINAL_IN_PROGRESS`, which is **not** one of the five
+      terminal classes, so a reader that switches on that field cannot land on a finished-looking
+      branch either.
+
+    A checkpoint also never claims a terminal cause: `cancelled`, `fatal_error` and `storage_full`
+    are forced empty on that path, because a run that is still going has not been cancelled, has
+    not crashed and has not yet met a full volume -- and carrying a caller's in-flight flags into a
+    partial record is how a checkpoint would begin asserting an outcome it cannot know.
     """
     totals = summarise(items, discovered)
+    running = bool(in_progress)
     return {
         "schema": MANIFEST_SCHEMA,
-        "cancelled": bool(cancelled),
-        "terminal_status": terminal_status(items, discovered, cancelled, fatal_error),
-        "fatal_error": str(fatal_error or ""),
+        # [FORK] R4-D: the one field a reader needs for "is this a finished run?".
+        "complete": not running,
+        "cancelled": False if running else bool(cancelled),
+        "terminal_status": (TERMINAL_IN_PROGRESS if running else terminal_status(
+            items, discovered, cancelled, fatal_error, storage_full=storage_full)),
+        "fatal_error": "" if running else str(fatal_error or ""),
+        # [FORK] R4-D: recorded beside the terminal class so a reader can tell a batch stopped by a
+        # full volume from one that merely had failures, without string-matching a headline.
+        "output_storage_full": False if running else bool(storage_full),
         "started_at": str(started_at),
         "finished_at": str(finished_at),
         "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
@@ -687,10 +827,12 @@ def cutter_supported_suffixes() -> tuple[str, ...]:
 
 __all__ = [
     "BATCH_DIRECTORY_PREFIX",
+    "CHECKPOINT_MAX_WRITES",
     "BatchError",
     "BatchItem",
     "BatchSettings",
     "BatchTotals",
+    "MANIFEST_CHECKPOINT_FILENAME",
     "MANIFEST_FILENAME",
     "MANIFEST_SCHEMA",
     "OUTCOME_CANCELLED",
@@ -702,6 +844,7 @@ __all__ = [
     "OUTCOME_NO_CLIPS",
     "OUTCOME_PARTIAL",
     "OUTCOME_PLAN_FAILED",
+    "OUTCOME_STORAGE_FULL",
     "OUTCOME_UNEXPECTED_ERROR",
     "OUTCOME_UNREADABLE",
     "PHASE_DETECT",
@@ -712,7 +855,10 @@ __all__ = [
     "TERMINAL_COMPLETED",
     "TERMINAL_COMPLETED_WITH_FAILURES",
     "TERMINAL_FAILED",
+    "TERMINAL_IN_PROGRESS",
+    "TERMINAL_STORAGE_FULL",
     "batch_directory_name",
+    "checkpoint_every",
     "cutter_supported_suffixes",
     "discovery_text",
     "manifest_payload",
@@ -720,6 +866,7 @@ __all__ = [
     "plan_item_directories",
     "progress_text",
     "safe_component",
+    "should_checkpoint",
     "summarise",
     "summary_text",
     "terminal_status",

@@ -328,6 +328,12 @@ from starlette.middleware import Middleware
 # Stdlib-only like its sibling, so it imports here at module scope; only the FFmpeg adapter is
 # deferred into the handlers.
 from beatsync_fork import raw_cutter_batch as fork_cutter_batch
+# [FORK] Digital-Union (Raw Cutter R4-D): what a full output volume MEANS — the error
+# classification, the one free-space floor, the qualified estimate and every sentence the operator
+# reads about it. Stdlib-only and deliberately measurement-free: the single `shutil.disk_usage` is
+# in `raw_cutter_export`, so the whole policy is testable with no disk to fill. Imported at module
+# scope only for the preflight refusal this module composes; the adapter stays deferred.
+from beatsync_fork import disk_guard as fork_disk
 import audio_mixdown
 # [FORK] Digital-Union (FUN R10 Repeat Music): the two halves of "play the song N times". The pure
 # one owns the control, the repeated geometry and the whole timeline extension; the runtime one owns
@@ -5988,7 +5994,8 @@ def _notify_render_batch(request, outcome) -> None:
         not_attempted=not_attempted or None)
 
 
-def _notify_cut(request, *, written=None, failed=None, cancelled=False, crashed=False) -> None:
+def _notify_cut(request, *, written=None, failed=None, cancelled=False, crashed=False,
+                storage_full=False) -> None:
     """One notification for a finished single-video Raw Cutter job.
 
     Keyword flags rather than an outcome token at the call site, for the same structural reason
@@ -6000,8 +6007,18 @@ def _notify_cut(request, *, written=None, failed=None, cancelled=False, crashed=
     nevertheless left clips on disk is PARTIAL rather than a failure, which is exactly how the
     handoff record classifies it; the two readings agree because both are derived from the same
     `completed` list.
+
+    [FORK] Digital-Union (Raw Cutter R4-D): `storage_full` is a fourth flag on the same footing,
+    and it is checked **before** `cancelled` for the reason the batch classifier orders them the
+    same way -- a drive that filled is what stopped the job, and an operator pressing Cancel while
+    watching it stop did not cause the stop. It can resolve to PARTIAL or to FAILED and **never to
+    SUCCESS**, which is structural rather than guarded: there is no success branch on this path. A
+    stop is not a finished cut, however many clips reached disk first.
     """
-    if cancelled:
+    if storage_full:
+        outcome = (fork_notify.OUTCOME_PARTIAL if fork_notify.total_count(written) > 0
+                   else fork_notify.OUTCOME_FAILED)
+    elif cancelled:
         outcome = fork_notify.OUTCOME_CANCELLED
     elif crashed:
         # [FORK] Digital-Union (R17-A R2): the count is read through the pure module's total
@@ -6087,6 +6104,21 @@ def _notify_cut_batch(request, terminal, *, completed=None, failed=None,
     """
     if terminal in _CUT_BATCH_RUN_OUTCOMES:
         outcome = _CUT_BATCH_RUN_OUTCOMES[terminal]
+    elif terminal == fork_cutter_batch.TERMINAL_STORAGE_FULL:
+        # [FORK] Digital-Union (Raw Cutter R4-D): a THIRD branch, because this class is neither a
+        # flat translation nor a run that reached the end of its list. It is not flat: a batch that
+        # filled the drive after twelve good sources is a genuinely partial result, while one that
+        # filled it before the first is a failure, and only the counts can tell those apart. And it
+        # is not `_CUT_BATCH_RAN_TO_END`: that fold can answer SUCCESS, which a run that stopped
+        # part-way through its frozen list must never be announced as. So the SUCCESS answer is
+        # **absent by construction** here rather than filtered out afterwards.
+        #
+        # The three counts folded on the "this went right" side are the same three
+        # `_CUT_BATCH_RAN_TO_END` folds, for the same R17-A R2 F1 reasons -- `no_clips` is a real
+        # answer about footage and `partial` put clips on disk.
+        outcome = (fork_notify.OUTCOME_PARTIAL
+                   if fork_notify.total_count(completed, no_clips, partial) > 0
+                   else fork_notify.OUTCOME_FAILED)
     elif terminal in _CUT_BATCH_RAN_TO_END:
         outcome = fork_notify.outcome_from_counts(
             fork_notify.total_count(completed, no_clips, partial), failed)
@@ -8264,6 +8296,29 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
         yield refuse(CUT_STALE_PLAN_TEXT, keep_plan=False)
         return
 
+    # [FORK] Digital-Union (Raw Cutter R4-D): the capacity preflight.
+    #
+    # Here, BEFORE the mutex and before `prepare_run_directory`, which is three separate
+    # deliberate choices. A refusal holds nothing and creates no directory -- the discipline every
+    # other refusal on this path already follows -- and in particular it does not leave an empty
+    # run folder behind to be mistaken for an attempted job. The measurement resolves the nearest
+    # existing ancestor of the operator's output text, so a folder that does not exist yet is
+    # judged on the volume it will really land on, junctions included.
+    #
+    # The plan is KEPT (`keep_plan` defaults true): the analysis is still perfectly valid, so an
+    # operator who frees some space can press Cut Video again without re-analysing their source.
+    #
+    # Honest limitation, recorded rather than worked around: in Single Video mode the expensive
+    # scene detection already ran, in `_on_cut_analyze`, which does not know the output folder --
+    # its `inputs` are pinned by `tests/test_raw_cutter_seam.py` and widening them to reach one
+    # more widget is a bigger change than this feature is. So here the preflight saves the ENCODE,
+    # not the analysis. The folder batch, where the incident happened and where the minutes are
+    # spent, is refused before any of its work.
+    capacity = cutter_export.capacity_for_export(output_folder, source=probe.source, plan=plan)
+    if not capacity.ok:
+        yield refuse(f"❌ {capacity.refusal}")
+        return
+
     if not _RENDER_LOCK.acquire(blocking=False):
         # Names the real holder, exactly as the three sibling guards do. A refused click performs
         # no work, creates no directory and leaves no state.
@@ -8305,7 +8360,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
         encoder = 'h264_nvenc' if NVENC_AVAILABLE else 'libx264'
         header = (f"✂️ Cutting {plan.count} clip(s) into:\n{run_directory}\n\n"
                   f"Encoder: {encoder}. Audio: "
-                  f"{'removed' if remove_audio else 'kept'}.")
+                  f"{'removed' if remove_audio else 'kept'}."
+                  # [FORK] R4-D: the measured free space and the qualified estimate, from the
+                  # verdict composed above. The qualifier is part of the note by construction --
+                  # `disk_guard` appends it -- so no call site can show a headroom figure without
+                  # also saying it is a measurement and not a guarantee.
+                  + (f"\n\n{capacity.note}" if capacity.note else ''))
         # [FORK] R11: the handoff is cleared the moment real work starts, so the Review button
         # cannot keep offering the previous run's directory while this one is cutting.
         yield (header, _cut_progress_html(
@@ -8488,6 +8548,50 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             activity=_cut_activity_final(
                 clock, fork_activity.PHASE_CANCELLED, fork_activity.STATUS_STOPPING,
                 source=name, clip_done=len(written), clip_total=plan.count,
+                ffmpeg=False))) + _cut_handoff(handoff) + idle_plan
+    except cutter_export.StorageExhausted as exc:
+        # [FORK] Digital-Union (Raw Cutter R4-D): named BEFORE the generic handler, for exactly the
+        # reason `CutterCancelled` is -- it is an ordinary `Exception`, so a generic clause listed
+        # first would report a correctly diagnosed full drive as "Cutting failed", which is the
+        # misreport this feature exists to remove.
+        #
+        # `completed` is the truth here, and for the same reason it is on the cancellation path
+        # above: the exception propagated out of `export_segments` before it could return, so its
+        # list never reached this frame and the callback's list is the only evidence.
+        kept = [r for r in completed if r.ok]
+        lost = [r for r in completed if not r.ok]
+        lines = [f"🛑 {CUT_CUT_STORAGE_FULL_TITLE}", ""]
+        lines.append(fork_disk.exhaustion_text(
+            getattr(exc, 'free_bytes', None), clips_written=len(kept),
+            detail=getattr(exc, 'detail', ''), volume=''))
+        lines.append("")
+        lines.append(f"{len(kept)} of {plan.count} clip(s) were written"
+                     + (f" into:\n{run_directory}" if run_directory else "."))
+        if kept:
+            lines.append("Total written: "
+                         f"{fork_cutter.format_size(sum(r.size_bytes for r in kept))}")
+        if lost:
+            lines.append(f"{len(lost)} clip(s) did not complete.")
+        # The clips that DID reach disk are reviewable. A full drive is a reason to stop writing,
+        # never a reason to withhold footage the operator already has -- the same trade the lost
+        # manifest gets. The record says PARTIAL because the job did not finish.
+        handoff = fork_handoff.build(
+            run_directory, mode=fork_handoff.MODE_SINGLE, clips=len(kept),
+            outcome=fork_handoff.OUTCOME_PARTIAL)
+        offer = fork_handoff.offer_text(handoff, LABEL_CUT_OPEN_LIBRARY)
+        if offer:
+            lines.append("")
+            lines.append(offer)
+        # ONE notification, and it can never be a success: PARTIAL when clips reached disk,
+        # FAILED when none did. Derived from the same `completed` list the report and the handoff
+        # record above are, so the three readings agree by construction.
+        _notify_cut(request, written=len(kept), failed=len(lost), storage_full=True)
+        yield ("\n".join(lines), _cut_progress_html(
+            CUT_CUT_STORAGE_FULL_TITLE, f'{len(kept)} of {plan.count} clip(s) kept.',
+            done=len(kept), total=plan.count, tone='failed',
+            activity=_cut_activity_final(
+                clock, fork_activity.PHASE_PARTIAL, fork_activity.STATUS_FAILED,
+                source=name, clip_done=len(kept), clip_total=plan.count,
                 ffmpeg=False))) + _cut_handoff(handoff) + idle_plan
     except Exception as exc:
         # Total: a cut that raised must report rather than vanish behind Gradio's generic error.
@@ -8672,6 +8776,22 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     sources = found.paths
     total = len(sources)
 
+    # [FORK] Digital-Union (Raw Cutter R4-D): the capacity preflight, and THIS is the one the
+    # accepted scope is really about -- "refuse an obviously unwritable job before spending minutes
+    # analysing it". It sits inside the pre-mutex validation block, after the roots are resolved and
+    # the list is frozen but before admission, so a refused batch holds nothing and -- unlike a
+    # check placed after `prepare_batch_directory` -- leaves no empty `RawCutter_Batch_<ts>` folder
+    # behind to be mistaken for an attempted run.
+    #
+    # `output_root` is already `realpath`-resolved by `resolve_batch_roots`, so the volume measured
+    # is the one the clips will really land on even when the output folder is a junction. No source
+    # has been probed yet, so there is no estimate to compare against: this is the floor check
+    # alone, which is the only one that can honestly refuse before any footage has been looked at.
+    capacity = cutter_export.capacity_for_export(output_root)
+    if not capacity.ok:
+        yield f"❌ {capacity.refusal}", ''
+        return
+
     if not _RENDER_LOCK.acquire(blocking=False):
         yield _cut_busy_message(), ''
         return
@@ -8711,6 +8831,15 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     batch_directory = ''
     cancelled = False
     finalised = False
+    # [FORK] Digital-Union (Raw Cutter R4-D): the run-level storage stop, and the one checkpoint
+    # switch. `storage_full` is what reaches `terminal_status`, so the headline, the manifest, the
+    # activity panel, the handoff record and the notification are all five keyed off this single
+    # fact rather than off five readings of a message. `checkpointing` is turned off for good by
+    # the first checkpoint failure: a full volume does not empty itself while a batch waits, and
+    # one failed write per remaining source is the unbounded retry R4-D forbids.
+    storage_full = False
+    storage_detail = ''
+    checkpointing = True
 
     def publish(**extra):
         """[FORK] Digital-Union (P19-R4, finding F-1): write the sink from RECORDED outcomes.
@@ -8804,7 +8933,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         started = bool(batch_directory)
         if started:
             sink['terminal'] = fork_cutter_batch.terminal_status(
-                items, total, is_cancelled, fatal_error=fatal)
+                items, total, is_cancelled, fatal_error=fatal, storage_full=storage_full)
             # [FORK] Digital-Union (Raw Cutter R11): the batch's OWN output directory, published
             # at the one point that already knows whether the run obtained one. The wrapper needs
             # the exact directory and must never reconstruct it from the output-root widget or
@@ -8844,7 +8973,17 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     items, total, settings, batch_directory, found.root,
                     started_at.isoformat(timespec='seconds'),
                     datetime.datetime.now().isoformat(timespec='seconds'),
-                    time.perf_counter() - clock_started, is_cancelled, fatal_error=fatal))
+                    time.perf_counter() - clock_started, is_cancelled, fatal_error=fatal,
+                    # [FORK] R4-D: the same fact the terminal class above was derived from, so the
+                    # record carries the cause as a field rather than leaving a reader to infer it.
+                    storage_full=storage_full))
+            # [FORK] R4-D: the checkpoint existed so that a run which never reached this write
+            # would still have a record. This write reaching disk is exactly the condition that
+            # makes it redundant -- and a FAILED write is exactly the condition that makes it the
+            # only record there is, so it is kept on that path. Removing our own superseded file,
+            # never anything else.
+            if not sink['manifest_error']:
+                cutter_export.discard_batch_checkpoint(batch_directory)
             return sink['manifest_error']
         except Exception as exc:                      # noqa: BLE001 - see the docstring
             import traceback
@@ -8887,7 +9026,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                                                 batch_directory)
 
             def record(outcome, **extra):
-                nonlocal recorded
+                nonlocal recorded, checkpointing
                 items.append(fork_cutter_batch.BatchItem(
                     index=position, source_path=source_path, relative_parts=parts,
                     outcome=outcome, seconds=round(time.perf_counter() - file_clock, 3), **extra))
@@ -8896,6 +9035,30 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                 # is the moment a source is genuinely finished -- including the last one, which
                 # has no further `progress(...)` call to carry it.
                 publish()
+                # [FORK] Digital-Union (Raw Cutter R4-D): the bounded per-source checkpoint, and
+                # this is the one moment worth writing one -- a source has just finished and its
+                # outcome is known, which is precisely the state the final write would otherwise be
+                # the only record of. It is here rather than at the end of the loop body because
+                # the loop body `continue`s from six different places, and every one of them goes
+                # through `record` first.
+                #
+                # Reuses the EXISTING payload builder with `in_progress=True`; no second
+                # coordinator, no second schema, no second set of totals. The cadence is the pure
+                # `should_checkpoint`, so a 6,000-source batch pays at most
+                # `CHECKPOINT_MAX_WRITES` serialisations rather than 6,000, and the LAST source
+                # deliberately gets none because finalisation follows it immediately.
+                if not checkpointing or not batch_directory:
+                    return
+                if not fork_cutter_batch.should_checkpoint(position, total):
+                    return
+                if cutter_export.write_batch_checkpoint(
+                        batch_directory,
+                        fork_cutter_batch.manifest_payload(
+                            items, total, settings, batch_directory, found.root,
+                            started_at.isoformat(timespec='seconds'), '',
+                            time.perf_counter() - clock_started, False, in_progress=True)):
+                    # One failure is final. See `checkpointing`'s declaration.
+                    checkpointing = False
 
             # [FORK] R2 (F-3): a source the loop has OPENED always leaves a record, even when the
             # fault is one nothing here anticipated. Without this the record was simply never
@@ -8950,6 +9113,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                 lengths = {segment.index: segment.duration for segment in plan.segments}
                 written: List[Any] = []
                 stopped = False
+                storage_stop = False
                 fatal_export = None
                 try:
                     cutter_export.export_segments(
@@ -8968,6 +9132,27 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     # of what reached disk.
                     stopped = True
                     cancelled = True
+                except cutter_export.StorageExhausted as exc:
+                    # [FORK] Digital-Union (Raw Cutter R4-D): named BEFORE the generic clause for
+                    # the same reason `CutterCancelled` is -- it is an ordinary `Exception`, and a
+                    # generic clause first would classify a correctly handled full drive as
+                    # `OUTCOME_UNEXPECTED_ERROR` and headline the run "stopped on an unexpected
+                    # error". The tool did not break.
+                    #
+                    # `written` is the truth on this path too: the exception discarded
+                    # `export_segments`' return value, so the callback's list is the only record of
+                    # what reached disk. Not re-raised, unlike `fatal_export` -- this is a stop the
+                    # batch knows how to report, so it records the source, breaks out of the loop
+                    # and lets the backfill mark every later source `not_attempted`.
+                    storage_stop = True
+                    storage_full = True
+                    # `volume` is deliberately left empty: the summary already names the output
+                    # folder on its own line, and repeating a long batch path inside this sentence
+                    # buys nothing.
+                    storage_detail = fork_disk.exhaustion_text(
+                        getattr(exc, 'free_bytes', None),
+                        clips_written=sum(1 for r in written if r.ok),
+                        detail=getattr(exc, 'detail', ''))
                 except Exception as exc:                  # noqa: BLE001 - re-raised below
                     # [FORK] R2 (F-3): `written` is the truth here for exactly the same reason,
                     # and an unexpected fault is precisely when it matters most. The clips it
@@ -8984,6 +9169,15 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     # Every planned clip fired `on_complete` validated, so the source really did
                     # finish -- even if the adapter then raised on its way out.
                     outcome = fork_cutter_batch.OUTCOME_COMPLETED
+                elif storage_stop:
+                    # [FORK] Digital-Union (Raw Cutter R4-D): the accepted scope's own rule -- mark
+                    # the current source PARTIAL if any verified clips were published, and only the
+                    # distinct storage outcome when none were. It sits BELOW the complete check on
+                    # purpose: a source whose every planned clip reached disk is complete whatever
+                    # stopped the batch afterwards, and `export_segments` raising a storage stop
+                    # before the loop's next clip is exactly how that can happen.
+                    outcome = (fork_cutter_batch.OUTCOME_PARTIAL if good
+                               else fork_cutter_batch.OUTCOME_STORAGE_FULL)
                 elif good:
                     outcome = fork_cutter_batch.OUTCOME_PARTIAL
                 elif fatal_export is not None:
@@ -8996,6 +9190,12 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                 if fatal_export is not None:
                     detail = (f"{type(fatal_export).__name__}: {fatal_export}"
                               + (f"; {detail}" if detail else ''))
+                elif storage_stop:
+                    # The drive first, FFmpeg's own words after it -- the same ordering
+                    # `disk_guard.clip_failure_text` uses one layer down, so a manifest reader sees
+                    # the diagnosis and still has the evidence.
+                    detail = (fork_disk.CLIP_STORAGE_FULL_REASON
+                              + (f" {detail}" if detail else ''))
                 record(outcome,
                        clips_planned=plan.count,
                        clips_written=len(good),
@@ -9007,8 +9207,34 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     raise fatal_export
                 if stopped:
                     break
+                # [FORK] Digital-Union (Raw Cutter R4-D): STOP SCHEDULING. The source is recorded,
+                # so the manifest knows what happened to it, and the `not_attempted` backfill in
+                # `finalise` then marks every later source honestly -- rather than the batch
+                # walking the rest of the frozen list and producing one identical failure per
+                # source, which is what the owner's 15-source run did for nine of them.
+                if storage_stop:
+                    break
             except cutter_export.CutterCancelled:
                 raise
+            except cutter_export.StorageExhausted as exc:
+                # [FORK] Digital-Union (Raw Cutter R4-D): named BEFORE the generic clause here too.
+                # This is the path a full volume takes when it is met OUTSIDE the export -- today
+                # that means `prepare_item_directory`, where even a directory entry has nowhere to
+                # go. Without this clause the generic clause below would record the source as
+                # `unexpected_error` and re-raise, which headlines a diagnosed stop as a crash.
+                #
+                # Recorded (unless the export already recorded it) and then BROKEN out of, never
+                # re-raised: the batch knows how to report this, and the backfill marks every later
+                # source `not_attempted`.
+                storage_full = True
+                storage_detail = fork_disk.exhaustion_text(
+                    getattr(exc, 'free_bytes', None),
+                    clips_written=getattr(exc, 'clips_written', 0),
+                    detail=getattr(exc, 'detail', ''))
+                if not recorded:
+                    record(fork_cutter_batch.OUTCOME_STORAGE_FULL,
+                           error=fork_disk.CLIP_STORAGE_FULL_REASON)
+                break
             except Exception as exc:                      # noqa: BLE001 - re-raised immediately
                 # A fault anywhere else in this source's processing (probe, detection, planning,
                 # directory preparation). No clip evidence exists, so the honest record is that
@@ -9025,8 +9251,15 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         elapsed = time.perf_counter() - clock_started
         summary = fork_cutter_batch.summary_text(
             items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
-            manifest_error=manifest_error)
-        yield (CUT_BATCH_CANCELLED_STATUS if cancelled else CUT_BATCH_DONE_STATUS), summary
+            manifest_error=manifest_error,
+            # [FORK] R4-D: the same two values the terminal class was derived from.
+            storage_full=storage_full, storage_detail=storage_detail)
+        # [FORK] R4-D: a storage stop is NOT a finished batch, so it may not reach the normal-end
+        # status line. It is checked before `cancelled` here for the same reason
+        # `terminal_status` orders them that way: the drive filling is what stopped the run.
+        yield (CUT_BATCH_STORAGE_FULL_STATUS if storage_full
+               else CUT_BATCH_CANCELLED_STATUS if cancelled
+               else CUT_BATCH_DONE_STATUS), summary
 
     except cutter_export.CutterCancelled:
         # Named BEFORE the generic handler, for the same reason `_on_cut_run` does it:
@@ -9039,7 +9272,8 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         elapsed = time.perf_counter() - clock_started
         yield CUT_BATCH_CANCELLED_STATUS, fork_cutter_batch.summary_text(
             items, total, settings, batch_directory, elapsed, True, input_root=found.root,
-            manifest_error=manifest_error)
+            manifest_error=manifest_error,
+            storage_full=storage_full, storage_detail=storage_detail)
     except Exception as exc:
         # Total: a batch that raised must report rather than vanish behind Gradio's generic error,
         # and it must still say what it had already written.
@@ -9056,7 +9290,8 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         elapsed = time.perf_counter() - clock_started
         partial = fork_cutter_batch.summary_text(
             items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
-            fatal_error=fatal, manifest_error=manifest_error)
+            fatal_error=fatal, manifest_error=manifest_error,
+            storage_full=storage_full, storage_detail=storage_detail)
         yield (f"❌ The batch stopped on an unexpected error.\n  {fatal}"), partial
     finally:
         # [FORK] R2: the terminal paths above already finalised, each one before its own yield.
@@ -9094,6 +9329,11 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
 _CUT_BATCH_ACTIVITY = {
     fork_cutter_batch.TERMINAL_FAILED:
         (fork_activity.PHASE_FAILED, fork_activity.STATUS_FAILED),
+    # [FORK] R4-D: PARTIAL rather than FAILED, and no new phase vocabulary. The run stopped
+    # part-way having done real work, which is what PHASE_PARTIAL already means; inventing a
+    # storage phase would add a fifth label to a vocabulary four renderings have to agree on.
+    fork_cutter_batch.TERMINAL_STORAGE_FULL:
+        (fork_activity.PHASE_PARTIAL, fork_activity.STATUS_FAILED),
     fork_cutter_batch.TERMINAL_CANCELLED:
         (fork_activity.PHASE_CANCELLED, fork_activity.STATUS_STOPPING),
     fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES:
@@ -9113,6 +9353,10 @@ _CUT_BATCH_ACTIVITY = {
 #: therefore to no handoff, rather than being defaulted to something printable here.
 _CUT_BATCH_HANDOFF = {
     fork_cutter_batch.TERMINAL_FAILED: fork_handoff.OUTCOME_PARTIAL,
+    # [FORK] R4-D: `partial`, for the same reason `TERMINAL_FAILED` is -- the batch did not finish,
+    # and whatever clips reached disk before it stopped are still worth reviewing. A full drive is a
+    # reason to stop writing, never a reason to withhold footage the operator already has.
+    fork_cutter_batch.TERMINAL_STORAGE_FULL: fork_handoff.OUTCOME_PARTIAL,
     fork_cutter_batch.TERMINAL_CANCELLED: fork_handoff.OUTCOME_CANCELLED,
     fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: fork_handoff.OUTCOME_PARTIAL,
     fork_cutter_batch.TERMINAL_COMPLETED: fork_handoff.OUTCOME_COMPLETED,
@@ -9202,6 +9446,10 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     # deliberately published with no terminal class. Neither ran, so neither gets a verdict.
     tone, title = {
         fork_cutter_batch.TERMINAL_FAILED: ('failed', CUT_BATCH_FAILED_TITLE),
+        # [FORK] R4-D: its own headline. `CUT_BATCH_FAILED_TITLE` would say "Batch stopped" with no
+        # cause, which is what the operator already saw on 2026-11-16, and the tone is 'failed'
+        # rather than 'stopping' because 'stopping' is this panel's cancellation colour.
+        fork_cutter_batch.TERMINAL_STORAGE_FULL: ('failed', CUT_BATCH_STORAGE_FULL_TITLE),
         fork_cutter_batch.TERMINAL_CANCELLED: ('stopping', CUT_BATCH_CANCELLED_TITLE),
         fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: ('failed', CUT_BATCH_PARTIAL_TITLE),
         fork_cutter_batch.TERMINAL_COMPLETED: ('done', CUT_BATCH_DONE_TITLE),

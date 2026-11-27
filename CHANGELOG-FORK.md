@@ -20,6 +20,126 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added / Fixed — 2026-11-27 (Raw Cutter R4-D: the output drive filling up is now a diagnosis, not fifteen hundred broken videos)
+
+**The incident this is for, 2026-11-16.** A Folder Batch attempted 15 sources; 5 completed, 1 was
+partial, **9 were reported as failures as though their footage were broken**. FFmpeg returned
+`-28 (No space left on device)` over and over; 580 of 1,137 planned clips (8.2 GB) were written,
+and then `batch_manifest.json` itself could not be saved — with `[Errno 28]` as the whole of the
+explanation the operator got. Nothing in the trace supported a finding of corrupt source video.
+The tool had no way to say *the drive is full*, so it said *this video failed*, once per remaining
+clip.
+
+**Reproduced before anything was written.** On pristine `71403afa`, with FFmpeg's real disk-full
+stderr injected at clip 3 of a 6-clip plan and the real exporter running: **6 export attempts, 4
+identical failures, no stop.** After the fix: **3 attempts** — the third being the one that
+diagnosed it — and a `StorageExhausted` stop. An ordinary encoder failure still attempts all 6 on
+both trees, which is the distinction the whole feature turns on.
+
+**New pure module `src/beatsync_fork/disk_guard.py`.** It decides; it never acts. It opens no file,
+starts no process, reads no clock and — notably for a module about free space — **calls no
+`shutil.disk_usage`**: the one measurement lives in `raw_cutter_export`, which is what keeps every
+branch of the policy testable with no disk to fill. It owns the error classification, the single
+floor, the qualified estimate and every sentence the operator reads.
+
+**What changed, and the reason each choice is the way it is:**
+
+- **The capacity preflight measures the RESOLVED volume.** `realpath` first, so an `output\` that
+  is a junction onto a larger drive — a legitimate, measured-working setup here — is measured where
+  the bytes actually land. A destination that does not exist yet is measured at its nearest
+  existing ancestor, which is what lets a doomed batch be refused **without first creating the
+  folder it would have written into**. An unreadable volume answers *unknown*, never zero: refusing
+  on absent evidence would stop jobs that are fine.
+- **The folder batch is refused pre-admission** — before the mutex, before any probe, before any
+  scene detection. Single Video is refused before the encode but **after** its analysis, because
+  `_on_cut_analyze` does not know the output folder and widening its pinned `inputs` is a bigger
+  change than this feature is. That limitation is recorded rather than worked around.
+- **One floor, and the trade-off is stated rather than hidden.** Below `MIN_FREE_EXPORT_BYTES`
+  (64 MiB) nothing is attempted, so a clip that *might* have fitted into less is refused with a
+  measured reason instead of attempted. That is the better failure: an MP4 is not finished until
+  its trailer and `moov` atom are written *after* the last packet, and a clip whose tail is lost
+  still exists, still has non-zero size and still probes as having a video stream — exactly the
+  damage `_validate_output` is least able to see.
+- **A total estimate that does not fit is a WARNING, never a refusal.** It comes from the source's
+  own bitrate, and the clips are re-encoded, so it is neither a floor nor a ceiling. Every headroom
+  figure the operator is shown carries the sentence that it was measured just now and is not a
+  guarantee — composed into the note by the module, so no call site can show the number without it.
+- **The stop is classified from POSITIVE evidence only** — FFmpeg's own disk-full wording, or an
+  `OSError` the OS marked `ENOSPC` (or the two Windows disk-full `winerror` codes, for an error
+  built from a raw Win32 code without the errno translation). Never from a return code, a missing
+  file or an empty output, because all three are also what an ordinary encoder failure looks like.
+  The stderr markers are **whole sentence fragments**: FFmpeg quotes its input and output paths, so
+  a marker short enough to occur inside a folder name (`disk full`, `no space`, `enospc`) could
+  stop a healthy batch and report a wrong cause. A miss costs one more clip attempt; a false
+  positive costs the operator a run and a wrong diagnosis.
+- **Its own outcome and its own terminal class.** `OUTCOME_STORAGE_FULL` and
+  `TERMINAL_STORAGE_FULL` are deliberately distinct from `export_failed` (which means "the encoder
+  could not produce these clips" — a statement about the footage) and from "an unexpected error"
+  (the tool breaking). That conflation is precisely what made the incident read as nine broken
+  videos. The source it stopped on is **partial** if it published anything; later sources are
+  **not attempted**; and the headline, the progress panel, the activity read-out, the handoff
+  record, the manifest and the one notification are six renderings of that one class. A storage
+  stop can resolve to PARTIAL or FAILED and **never to SUCCESS** — structurally, since no success
+  branch exists on that path.
+- **`storage_full` outranks `cancelled` and is outranked by a crash.** A batch that crashed after
+  the drive filled still crashed. But a Cancel pressed while watching the run stop is the operator
+  reacting to the stop rather than causing it, and reporting that as a clean cancellation would
+  hide the only fact worth acting on.
+- **Completed results are safe, and there is no automatic recovery at all.** Nothing deletes a
+  clip, a cache, an output or a source file to free space. Staging, the atomic no-overwrite
+  publication and post-encode validation are unchanged; **Review these clips** still offers the
+  clips that really exist, because a full drive is a reason to stop writing and never a reason to
+  withhold footage the operator already has; and a later attempt still gets a fresh output folder.
+- **Bounded recoverable progress.** A per-source checkpoint reuses the existing manifest payload
+  builder with `in_progress=True` — no second coordinator, no second schema, no second set of
+  totals — capped at 50 writes per batch however many sources it has, and skipped for the last
+  source, which finalisation follows immediately. It lands on its **own** filename
+  (`batch_manifest.partial.json`), and that is the mechanism rather than a convention: the
+  authoritative name never holds an incomplete document, **and** the final write's no-replace
+  `os.rename` cannot collide with it. Had the checkpoint used the real name, every checkpointed
+  batch would have ended by reporting its own record as lost. A checkpoint carries
+  `complete: false` and a non-terminal `in_progress` status, and forces `cancelled`, `fatal_error`
+  and `output_storage_full` empty, so it can never assert an outcome nobody measured. It is
+  discarded when the final write succeeds and **kept** when it fails — which is the case it exists
+  for. One checkpoint failure is final: a full volume does not empty itself while a batch waits.
+- **A lost record says so in plain words.** The final write's failure now names a full drive
+  instead of quoting `[Errno 28]`.
+- **`prepare_item_directory` RAISES on a full volume** rather than returning an error string.
+  Everything else there still returns `(path, error)`, so no existing refusal changed shape. The
+  asymmetry is the point: an error string is a statement about *this source*, and the caller rightly
+  carries on to the next — which for a full drive means carrying on to fail identically on every
+  remaining one.
+**Two defects of its own, both found by its own verification rather than guessed at:**
+
+- **`measure_free_space` tested for an empty path too late.** `os.path.abspath("")` returns the
+  **current working directory**, which for this application is its own install folder, so a blank
+  destination would have been measured on the wrong volume and could have admitted a job that
+  should have been refused. The emptiness test moved ahead of `abspath` — the same trap
+  `_normalize_folder_text` was written for.
+- **`evaluate`'s floor was captured at definition time.** Written as
+  `floor: int = MIN_FREE_EXPORT_BYTES`, it made the preflight and the exporter's between-clip gate
+  two readers of one constant that could disagree, because the gate reads the module attribute at
+  call time. Found by the GUI smoke: raising the floor to inject an unwritable volume changed the
+  gate's answer and left the preflight on the old value, so the job was **admitted and then
+  stopped three clips later** instead of being refused. Now `floor=None` resolving inside the
+  body, with a test that pins call-time resolution.
+
+**Verification.** `tests/test_raw_cutter_disk_full.py` (68 cases) plus 29 handler cases added to
+`tests/test_raw_cutter_batch.py` and `tests/test_cut_handoff.py`. The real adapter is reached by
+AST extraction with its real `shutil.disk_usage`, real staging writes and real no-replace rename;
+**no drive is ever filled**, the condition is injected as FFmpeg's own stderr or as a real
+`OSError(ENOSPC)`. Non-vacuity measured against pristine `71403afa`: 45 of 68 and 20 of 29 fail
+there, and every case that passes is a named scope invariant or regression pin. A real-FFmpeg smoke
+on synthetic media verifies published clips by **FFprobe plus a full decode** — never by exit code,
+which this repository has been bitten by before — and confirms the attempt counts (3 vs 6) against
+real argv. An isolated served-GUI smoke on a real `gradio` instance confirms the app constructs and
+serves, that a healthy drive is not refused, that the headroom line carries its qualifier, and that
+an unwritable drive is refused with no run folder created and Cut Video still available.
+
+No parameter was removed or redefined, the manifest schema name is unchanged, `SegmentResult`
+gained one field with a default, and `terminal_status` / `summary_text` / `manifest_payload` each
+gained keyword-only arguments defaulting to the pre-R4-D answer.
+
 ### Fixed — 2026-11-27 (Settings Preference Consistency R2: a stale page load could revert a newer choice, and Save defaults carried the policy)
 
 R1 (below) closed the *immediate* programmatic echo with an equality guard on each option handler.
