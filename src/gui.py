@@ -6208,6 +6208,42 @@ def _notify_settings_on_load():
     return gr.update(value=enabled), fork_notify.app_setting_sentence(enabled)
 
 
+def _settings_on_load():
+    """Every saved Settings value a once-per-process `create_ui()` would otherwise freeze.
+
+    [FORK] Digital-Union (Settings Preference Consistency R1, F1). R17-A established that a
+    component built with `value=<a saved setting>` is baked into the config every browser session
+    is served, because `create_ui()` runs once per process while the setting stays live. It fixed
+    that for the notification checkbox. **The collision-policy radio has exactly the same defect
+    and was left with it**: measured on `2097822a` against real `gradio==6.19.0`, with `suffix`
+    saved and in force, a fresh browser session was served the construction-time `skip` -- the
+    radio said files would be skipped while both sorters were suffixing. The owner reported that
+    symptom; this is its cause.
+
+    So this is the one server-side page-load reader for the whole panel, and it is deliberately a
+    **composition of the existing readers** rather than a second place settings are interpreted:
+    `_notify_settings_on_load()` for the notification pair, `_collision_policy()` for the policy.
+    Both are total and both read in-memory dictionaries -- no filesystem, no network, no poll --
+    and nothing here writes anything.
+
+    Returning the policy inside a `gr.update` rather than bare, like the checkbox beside it, so a
+    radio whose stored value is corrupt is corrected to the resolved default rather than to a
+    choice that is not in its `choices` list.
+
+    **It is safe against the `.change` that this write triggers**: `_on_collision_policy_change`
+    and `_on_notifications_enabled_change` both return early when the resolved value is the one
+    already in force, so a page load performs no preference write and raises no saved-setting
+    toast. That guard is a precondition of this function, not an incidental tidiness -- see
+    `_on_collision_policy_change`.
+
+    One registration rather than two, and `app.load` rather than a callable `value=`, for the two
+    reasons recorded on `_notify_settings_on_load`: the authorised `app.load` count is fixed, and
+    a callable `value=` leaves an uncancellable progress overlay on the pinned Gradio.
+    """
+    notify_toggle, notify_sentence = _notify_settings_on_load()
+    return notify_toggle, notify_sentence, gr.update(value=_collision_policy())
+
+
 def _notify_status_panel_html() -> str:
     """The browser-status line's SERVER-RENDERED placeholder.
 
@@ -9814,8 +9850,33 @@ def _on_collision_policy_change(policy):
     `_on_open_output_folder_click` established and for the same reason: writing `pref_status` here
     would add a third writer to that panel and let changing a radio overwrite the result of a Save
     the operator is still reading.
+
+    **A write that changes nothing writes nothing** (Settings Preference Consistency R1, F1). This
+    is the guard `_on_notifications_enabled_change` already carries, arrived at for the same
+    measured reason: Gradio's `.change` fires for a *function update* as well as for a user
+    gesture, and this radio has two legitimate programmatic writers -- `_settings_on_load`, which
+    corrects it for every new browser session, and Reset defaults, which returns it to the
+    default. Without this guard all three of the following were real, and the first two were
+    measured on `2097822a` before the fix:
+
+    * Reset defaults produced a **second** save and a **second** "Saved…" toast on top of its own,
+      because the radio value it returns re-enters here;
+    * a reset that **failed** returned the default policy, which then re-entered here and genuinely
+      **persisted** it -- so a reset reported as failed silently performed part of itself, and
+      announced a save the operator never asked for;
+    * adding the page-load correction below would have made **every new browser session** rewrite
+      `preferences.json` and raise a saved-setting toast for a tab that had only just opened.
+
+    The comparison is on the **resolved** policies rather than on the raw widget value, exactly as
+    the notification guard compares resolved booleans: `resolve_policy` is total, so a hand-edited
+    or corrupt stored value reads as the safe default and a programmatic echo of that default is
+    not rewritten into the file. `.change` is deliberately **kept** rather than swapped for
+    `.input` -- Reset writes this radio and the stored value must follow it, which is the reason
+    recorded at the registration.
     """
     resolved = fork_collision.resolve_policy(policy)
+    if resolved == _collision_policy():
+        return
     _FOLDER_OPTIONS[fork_prefs.COLLISION_POLICY] = resolved
     # [FORK] R17-A: the WHOLE option set, not just this key. `save_preferences` replaces the file
     # and fills any option key the caller omits with its built-in DEFAULT, so passing the single
@@ -11791,20 +11852,46 @@ def _on_reset_folder_prefs():
     untouched, so the pair reports the state that is genuinely still in force instead of the
     cleared state the operator was told could not be saved.
 
-    (The nine folder boxes and the collision radio are returned cleared on that failure path too,
-    which they were before this change and which is not accurate -- nothing was cleared. It is a
-    pre-existing R8 reporting inaccuracy in a different subsystem, it makes no claim about what the
-    application will *do*, and it is deliberately left for a separate decision rather than widened
-    into this one.)
+    [FORK] Digital-Union (Settings Preference Consistency R1, F2) — **and that separate decision
+    has now been taken.** R17-A R2 left this note here:
+
+        "The nine folder boxes and the collision radio are returned cleared on that failure path
+        too, which they were before this change and which is not accurate -- nothing was cleared."
+
+    It was not only inaccurate. Measured on `2097822a`, the misreported radio value is a
+    *programmatic component write*, so Gradio's `.change` handed it straight back to
+    `_on_collision_policy_change`, which had no no-op guard and **persisted the default policy** --
+    a reset the operator was told had failed silently performed part of itself and announced a save
+    nobody asked for. So the inaccuracy had a durable cost, not merely a cosmetic one.
+
+    Both halves are closed. The guard lives in `_on_collision_policy_change`, where the write
+    happens; and this path now returns **what is actually still in force** -- each folder box from
+    `_pref`, the policy from `_collision_policy()`, the notification pair from
+    `_notify_settings_on_load()`. All four are the same readers the panel is *constructed* from, so
+    a failed reset repaints the panel it already had instead of inventing a cleared one.
+
+    The nine `_pref` calls are written out rather than looped or star-unpacked because every return
+    on this handler must stay a FLAT tuple of one value per output -- `tests/test_audio_preview_tab.py`
+    counts the tuple's elements structurally and Gradio matches `outputs` by position. Their order
+    is `user_prefs.DESTINATION_KEYS`, which is the registration's order; that correspondence is
+    asserted rather than assumed.
     """
     failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences(),
                                           fork_prefs.empty_options())
     if failure:
         # Read BEFORE the in-memory update below is reached, which on this path it never is -- so
-        # the pair describes the setting that is genuinely still in force.
+        # every one of these describes the setting that is genuinely still in force.
         notify_toggle, notify_sentence = _notify_settings_on_load()
-        return ('', '', '', '', '', '', '', '', '',
-                fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
+        return (_pref(fork_prefs.CLIPS_LIBRARY),
+                _pref(fork_prefs.CLIPS_REJECTED),
+                _pref(fork_prefs.RAW_CUTTER_OUTPUT),
+                _pref(fork_prefs.AUDIO_LIBRARY),
+                _pref(fork_prefs.AUDIO_DISCARDED),
+                _pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
+                _pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                _pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                _pref(fork_prefs.RENDER_OUTPUT),
+                _collision_policy(),
                 notify_toggle, notify_sentence, f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
     _FOLDER_OPTIONS.update(fork_prefs.empty_options())
@@ -11816,7 +11903,13 @@ def _on_reset_folder_prefs():
     # [FORK] R8 Owner Fixes (P2): composed like every other status write, so a reset cannot leave
     # a warning behind that describes the settings it has just cleared.
     return ('', '', '', '', '', '', '', '', '',
-            fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
+            # [FORK] Digital-Union (Settings Preference Consistency R1, F2): through
+            # `_collision_policy()` rather than the defaults table directly, so BOTH returns on
+            # this handler read the policy from the one reader the panel and the sorters use. The
+            # value is identical -- `_FOLDER_OPTIONS` was reset to the defaults on the line above
+            # -- so this changes nothing about a successful reset and removes the second place the
+            # answer could drift.
+            _collision_policy(),
             notify_toggle, notify_sentence,
             _folder_prefs_status("✅ Defaults cleared. No folder or file was deleted."))
 
@@ -16332,6 +16425,12 @@ def create_ui() -> gr.Blocks:
                     pref_collision = gr.Radio(
                         choices=[(CHOICE_COLLISION_SKIP, fork_collision.SKIP),
                                  (CHOICE_COLLISION_SUFFIX, fork_collision.SUFFIX)],
+                        # [FORK] Digital-Union (Settings Preference Consistency R1, F1): this
+                        # `value=` is evaluated ONCE, when `create_ui()` builds the tree, so it is
+                        # correct only for the process's first page load -- `_settings_on_load`
+                        # re-reads it for every browser session. It is deliberately kept rather
+                        # than dropped: it makes the first paint right without waiting for a load
+                        # event, which is the same division R17-A's checkbox uses.
                         value=fork_collision.resolve_policy(
                             _option(fork_prefs.COLLISION_POLICY)),
                         label=LABEL_COLLISION_SECTION,
@@ -17936,14 +18035,27 @@ def create_ui() -> gr.Blocks:
         # [FORK] Digital-Union (R17-A): the ONE server-side load registration in this file, and
         # the only `app.load` that is not a JavaScript installer.
         #
-        # It exists because `create_ui()` runs once per process while the toggle is a live
-        # setting: without it, a browser session opened after the toggle changed is served the
-        # value as it stood at startup, and the panel states the opposite of what the app will do.
-        # `inputs=None` and two outputs, both of them this panel's own; it reads one in-memory
-        # dictionary and writes nothing. `show_progress='hidden'` is load-bearing rather than
-        # cosmetic -- see `_notify_settings_on_load` for the measured overlay it suppresses.
-        app.load(fn=_notify_settings_on_load, inputs=None,
-                 outputs=[notify_enabled, notify_app_state], show_progress='hidden')
+        # It exists because `create_ui()` runs once per process while these are live settings:
+        # without it, a browser session opened after one of them changed is served the value as it
+        # stood at startup, and the panel states the opposite of what the app will do.
+        # `inputs=None` and every output is this panel's own; it reads in-memory dictionaries and
+        # writes nothing. `show_progress='hidden'` is load-bearing rather than cosmetic -- see
+        # `_notify_settings_on_load` for the measured overlay it suppresses.
+        #
+        # [FORK] Digital-Union (Settings Preference Consistency R1, F1): THE COLLISION RADIO IS
+        # NOW CORRECTED HERE TOO, and the registration stays single. R17-A fixed this defect for
+        # the notification checkbox and left the radio two components away carrying it, so a fresh
+        # browser session could read "Skip and report it" over a saved and in-force `suffix`
+        # (reproduced against real `gradio==6.19.0` on `2097822a`). `_settings_on_load` composes
+        # the two existing readers; it is NOT a second app.load, because the authorised count is
+        # fixed at five and "exactly one server-side load" is itself an asserted contract.
+        #
+        # This write is what makes `_on_collision_policy_change`'s no-op guard a precondition
+        # rather than a nicety: `.change` fires for a function update, so without the guard every
+        # page load would rewrite `preferences.json` and toast a save nobody asked for.
+        app.load(fn=_settings_on_load, inputs=None,
+                 outputs=[notify_enabled, notify_app_state, pref_collision],
+                 show_progress='hidden')
 
     return app
 

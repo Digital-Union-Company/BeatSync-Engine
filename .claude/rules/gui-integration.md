@@ -821,6 +821,62 @@ automatically.
     sites now pass the complete set.
 
   Full contract: `.claude/rules/desktop-notifications.md`.
+- **Settings preference consistency: the saved preference, the in-memory setting and the value on
+  screen are one answer, read through one reader each** (Settings Preference Consistency R1). Two
+  defects were measured on `main` at `2097822a` and closed; the rules they produced bind every
+  future saved option in this panel.
+  * **A component built with `value=<a saved setting>` is a per-PROCESS value, not a per-session
+    one.** `create_ui()` runs once, so that expression is evaluated once and baked into the config
+    every later browser session is served. R17-A found this for `notify_enabled` and fixed it; the
+    collision radio two components away had it too and kept it — with `suffix` saved and in force, a
+    fresh session was served the construction-time `skip`, so the radio said files would be skipped
+    while both sorters were suffixing. **Any new saved option in this panel must be added to
+    `_settings_on_load`**, or it ships with the same defect.
+  * **`_settings_on_load` is the one server-side `app.load`, and it stays one.** F1 was fixed by
+    widening the existing registration, never by adding a second: `app.load(` is pinned at **five**
+    and "exactly one non-JavaScript `app.load`" is an asserted contract. It is a **composition of
+    the existing readers** — `_notify_settings_on_load()`, `_collision_policy()` — and resolves
+    nothing itself, because a second interpretation of a setting is a second place for it to drift.
+    `_notify_settings_on_load` keeps its two-value shape; Reset defaults unpacks it.
+    `show_progress='hidden'` is load-bearing for the measured reason recorded in the notifications
+    rule.
+  * **The `value=` is deliberately KEPT alongside it.** It makes the first paint right without
+    waiting for a load event; the load event makes every later session right. Dropping it would
+    leave the radio blank until the round trip returned.
+  * **Every programmatic writer needs the "a write that changes nothing writes nothing" guard, in
+    the handler where the write happens.** `.change` fires for a function update as well as a
+    gesture, and these components now have two programmatic writers — the page-load reader and
+    Reset. `_on_notifications_enabled_change` had the guard since R2;
+    `_on_collision_policy_change` did **not**, and three things followed, all measured: Reset
+    produced a second save and a second toast on top of its own; a **failed** Reset returned the
+    default policy, which re-entered the handler and **genuinely persisted it**, so a reset reported
+    as failed silently performed part of itself and announced a save nobody asked for; and the
+    widened `app.load` would have made every new browser session rewrite `preferences.json`. The
+    guard compares **resolved** values through the setting's own reader — never the raw widget value
+    and never the defaults table.
+  * **A failed write may not be reported as a successful one.** R2 left a note that Reset's failure
+    path returned nine blank folder boxes and the default radio "which is not accurate — nothing was
+    cleared", deliberately deferred. It is now closed: the failure path repaints from **the same
+    readers the panel is constructed from** — `_pref` per box, `_collision_policy()`,
+    `_notify_settings_on_load()` — so a failed reset shows the settings that are still in force
+    rather than inventing a cleared panel, and the operator is not left retyping nine paths that
+    were never lost.
+  * **Both of Reset's returns stay FLAT tuples of one value per output**, with no `*`-unpack and no
+    nesting: Gradio matches `outputs` by position and two suites count the tuple's elements
+    structurally. The nine `_pref` calls are in `user_prefs.DESTINATION_KEYS` order, which is the
+    registration's order, and that correspondence is **asserted** rather than trusted — swapping two
+    would hand the operator each other's folders.
+  * **What is deliberately NOT claimed.** A stale tab that the operator *presses Save defaults on*
+    still submits the values on its screen, which is a gesture rather than a silent revert and is
+    outside this contract. The two **silent** revert routes — a page load, and Reset's own echo —
+    are the ones closed.
+  * **No new preferences subsystem.** Same file, same `beatsync-folder-preferences-1` schema, same
+    two `OPTION_KEYS`, same nine `DESTINATION_KEYS`; a test asserts each.
+
+  Verified by `tests/test_settings_pref_consistency.py`, which executes the shipped bodies against
+  the real store (**18 of its 28 fail against pristine `2097822a`**; the 10 that pass are scope
+  invariants and R17-A behaviours it pins against regression), plus a real-`gradio` before/after
+  recorded in the task evidence.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -847,6 +903,7 @@ automatically.
 | the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) — **+ `.claude/rules/prep-activity.md`** if you touch either frames generator, `_activity_frames`, `_prep_phase` or `_run_prep_in_worker`'s event wait |
 | the in-flight **activity** for Scan / Analyze / Verify / Sample, `_activity_frames`, `_verify_sources_frames`, `_sample_decode_frames`, `_prep_phase` or `prep_activity.py` (UX-PREP-ACTIVITY) | `.claude/rules/prep-activity.md` **+** `.claude/rules/source-verification.md` (the mutex, the pin and the staleness rule it must not disturb) **+** `.claude/rules/progress-events.md` (the generator-lifetime rule the join rests on, and the ETA ban it restates) |
 | Settings → **Video Analysis Cache**, the shared cache folder, the Import button, or Cache Management's analysis category | `.claude/rules/shared-analysis-cache.md` **+** `.claude/rules/stage5-cache-identity.md` (the directory is deliberately not part of identity) |
+| `_settings_on_load`, the one server-side `app.load`, `pref_collision` / `_on_collision_policy_change`, `_on_reset_folder_prefs`, or **any new saved option in the Settings panel** | the *Settings preference consistency* bullet above **+** `.claude/rules/desktop-notifications.md` (the sibling option shares both the page-load reader and the no-op-guard rule) — and `tests/test_settings_pref_consistency.py`, which executes the shipped handlers against the real store rather than asserting about them. A new option is not finished until it is in `_settings_on_load` **and** its writer carries the no-op guard |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |
 | Settings → **Desktop notifications**, `notify_envelope`, `_notify_publish` / `_notify_drain`, any `_notify_*` translator, or any of the five `NOTIFY_*_JS` scripts (R17-A) | `.claude/rules/desktop-notifications.md` **+** the subsystem rule of whichever job you are touching the terminal point of — the outcome must stay a *translation* of that subsystem's own typed class, never a derivation from its status text |
 | render modes, encoder branches, frame lock | `.claude/rules/pipeline-core.md` |

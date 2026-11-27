@@ -151,9 +151,20 @@ to deliver out of context.
 config every later session receives. Measured: with the toggle ON and the gate delivering, a tab
 opened afterwards rendered the checkbox unchecked and the sentence "Desktop notifications are OFF".
 A panel whose whole job is to state what the application will do must not be the thing that is
-wrong about it. `_notify_settings_on_load` is therefore the **one** `app.load` in `gui.py` that is
-not a JavaScript installer: `inputs=None`, two outputs, both its own, one in-memory dictionary
-read, nothing written.
+wrong about it. That `app.load` is therefore the **one** in `gui.py` that is not a JavaScript
+installer: `inputs=None`, outputs that are all its own panel's, in-memory dictionary reads only,
+nothing written.
+
+> **Since Settings Preference Consistency R1 the registered function is `_settings_on_load`, not
+> `_notify_settings_on_load`.** The collision-policy radio two components away had the identical
+> defect and was left with it — measured against real `gradio==6.19.0` on `2097822a`, a fresh
+> session was served the construction-time `skip` while `suffix` was saved and in force. It was
+> fixed by **widening this registration**, because the authorised `app.load(` count is pinned at
+> five and "exactly one server-side load" is itself an asserted contract. `_settings_on_load`
+> composes the existing readers — `_notify_settings_on_load()` for the pair here,
+> `_collision_policy()` for the policy — and `_notify_settings_on_load` keeps its two-value shape
+> because Reset defaults unpacks it. Full contract: `.claude/rules/gui-integration.md`
+> (*Settings preference consistency*).
 
 A callable `value=` was tried first and **rejected on measurement**: it re-evaluates per session
 as wanted, but the implicit load dependency it creates on the pinned `gradio==6.19.0` leaves a
@@ -191,6 +202,14 @@ too), and swapping the operator's own toggle onto an event this repository has n
 the pinned `gradio==6.19.0` would be a worse trade than a three-line guard. The comparison is on
 the resolved booleans, so a hand-edited value — which `is_enabled` reads as off — is not rewritten
 by an echo of the off state it already means.
+
+> **The collision radio needed the same guard and did not have one.** The sentence above says the
+> radio "uses `.change` for exactly this reason", which was true of the *listener* and not of the
+> *guard*: `_on_collision_policy_change` had none, so Reset's own echo produced a second save and a
+> second toast, and a **failed** Reset echoed the default policy back and genuinely persisted it.
+> Settings Preference Consistency R1 added the matching guard, comparing resolved policies through
+> `_collision_policy()`. It is also what makes the widened `app.load` above safe: without it, every
+> new browser session would rewrite `preferences.json` and toast a save nobody asked for.
 
 ## Content: no caller may supply text
 

@@ -34,6 +34,7 @@ from collections import OrderedDict
 
 import pytest
 
+from beatsync_fork import collision as fork_collision
 from beatsync_fork import desktop_notify as dn
 from beatsync_fork import library_prep as fork_prep
 from beatsync_fork import prep_activity as fork_prep_activity
@@ -436,7 +437,13 @@ _WANTED_FUNCTIONS = ("_notify_session_key", "_notifications_enabled", "_notify_p
                      "_on_notifications_enabled_change",
                      # [FORK] R17-A R2 (F2): Reset defaults is now a writer of the notification
                      # checkbox and the sentence beside it, so the suite executes the real body.
-                     "_on_reset_folder_prefs")
+                     "_on_reset_folder_prefs",
+                     # [FORK] Digital-Union (Settings Preference Consistency R1): the page-load
+                     # reader is now settings-wide and composes `_notify_settings_on_load`, and
+                     # Reset's failure path reads the policy that is still in force through
+                     # `_collision_policy`. Both are extracted so the shipped bodies still run
+                     # here rather than being stubbed.
+                     "_settings_on_load", "_collision_policy")
 
 
 class _Request:
@@ -473,6 +480,10 @@ def _notify_namespace(tmp_path, *, enabled=True):
 
     options = {prefs.COLLISION_POLICY: "skip",
                prefs.DESKTOP_NOTIFICATIONS: dn.option_value(enabled)}
+    # [FORK] Digital-Union (Settings Preference Consistency R1, F2): a real folder dictionary
+    # rather than a literal, because Reset's failure path now reads it back through `_pref` and a
+    # test that cannot tell a preserved value from a blank one would pass against the defect.
+    folders = prefs.empty_preferences()
     toasts: list = []
     namespace: dict = {
         "threading": threading,
@@ -481,6 +492,9 @@ def _notify_namespace(tmp_path, *, enabled=True):
         "html_lib": __import__("html"),
         "fork_notify": dn,
         "fork_prefs": prefs,
+        # [FORK] Digital-Union (Settings Preference Consistency R1): the real policy module, so
+        # `_collision_policy` resolves exactly as it does in the app.
+        "fork_collision": fork_collision,
         "fork_cutter_batch": fork_cutter_batch,
         "fork_prep": fork_prep,
         "fork_prep_activity": fork_prep_activity,
@@ -489,9 +503,13 @@ def _notify_namespace(tmp_path, *, enabled=True):
         "STATUS_NOTIFY_SAVED_ON": "saved on",
         "STATUS_NOTIFY_SAVED_OFF": "saved off",
         "PREFS_PATH": str(tmp_path / "preferences.json"),
-        "_FOLDER_PREFS": prefs.empty_preferences(),
+        "_FOLDER_PREFS": folders,
         "_FOLDER_OPTIONS": options,
         "_option": lambda key: options.get(key, prefs.OPTION_DEFAULTS.get(key, "")),
+        # [FORK] Digital-Union (Settings Preference Consistency R1, F2): the same reader the nine
+        # Settings boxes are CONSTRUCTED from, so what a failed reset repaints can be compared
+        # against what the panel would have shown.
+        "_pref": lambda key: folders.get(key, ""),
         # [FORK] R17-A R2 (F2): `_on_reset_folder_prefs` composes its status line through this.
         # Stubbed to the identity, because what the status *says* is R8's contract and this suite
         # asserts only about the two notification outputs beside it.
@@ -506,6 +524,7 @@ def _notify_namespace(tmp_path, *, enabled=True):
                  _GUI, "exec"), namespace)      # noqa: S102 - the body under test
     namespace["_toasts"] = toasts
     namespace["_options"] = options
+    namespace["_folders"] = folders
     return namespace
 
 
@@ -1845,10 +1864,17 @@ def test_all_four_client_registrations_declare_no_server_function():
 
 def test_the_only_non_javascript_app_load_is_the_settings_reread():
     """`create_ui()` runs once per process, so a value baked at construction time is served to
-    every later browser session. One server-side load corrects the toggle per session, reads one
-    in-memory dictionary, writes only this panel's own two components, and carries
+    every later browser session. One server-side load corrects the saved settings per session,
+    reads only in-memory dictionaries, writes only this panel's own components, and carries
     `show_progress='hidden'` -- which is load-bearing: the callable-`value=` form tried first
-    leaves a progress overlay on the pinned gradio that never clears."""
+    leaves a progress overlay on the pinned gradio that never clears.
+
+    [FORK] Digital-Union (Settings Preference Consistency R1, F1): the registered function is now
+    `_settings_on_load`, which is settings-wide rather than notification-specific, and the
+    collision radio is in its `outputs`. **The count stays one** -- that is the part of this
+    contract that matters, and the reason F1 was fixed by widening this registration rather than
+    adding a second one.
+    """
     tree = _tree(_GUI)
     loads = [node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and ast.unparse(node.func) == "app.load"]
@@ -1856,14 +1882,21 @@ def test_the_only_non_javascript_app_load_is_the_settings_reread():
                    if not any(keyword.arg == "js" for keyword in node.keywords)]
     assert len(server_side) == 1, f"{len(server_side)} server-side app.load registrations"
     kwargs = _kwargs(server_side[0])
-    assert kwargs["fn"] == "_notify_settings_on_load"
+    assert kwargs["fn"] == "_settings_on_load"
     assert kwargs["inputs"] == "None"
-    assert kwargs["outputs"] == "[notify_enabled, notify_app_state]"
+    assert kwargs["outputs"] == "[notify_enabled, notify_app_state, pref_collision]"
     assert kwargs["show_progress"] == "'hidden'"
 
-    body = ast.unparse(_func(tree, "_notify_settings_on_load"))
-    for forbidden in ("open(", "os.", "json", "save_preferences", "subprocess", "requests"):
-        assert forbidden not in body, forbidden
+    # Both the composed reader and the notification reader it delegates to stay inert.
+    for name in ("_settings_on_load", "_notify_settings_on_load"):
+        body = ast.unparse(_func(tree, name))
+        for forbidden in ("open(", "os.", "json", "save_preferences", "subprocess", "requests"):
+            assert forbidden not in body, (name, forbidden)
+
+    # It composes the existing readers rather than interpreting a setting a second time.
+    composed = ast.unparse(_func(tree, "_settings_on_load"))
+    assert "_notify_settings_on_load()" in composed
+    assert "_collision_policy()" in composed
 
 
 def test_the_settings_panel_reread_reports_the_live_setting(tmp_path):
