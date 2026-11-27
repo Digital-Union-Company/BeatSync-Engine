@@ -1730,7 +1730,20 @@ default.
 
 ---
 
-### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A IMPLEMENTED + R2 REVIEWED + R3 DIAGNOSTICS FIXED + R4 VARIANT-BATCH PRODUCER FIXED (source, awaiting owner playtest); R17-B STILL RESEARCH ONLY**
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **R17-A MERGED, INSTALLED, GUI SMOKE PASS AND OWNER ACCEPTED (PR #112, production release `2194325e`); R17-B STILL RESEARCH ONLY**
+
+> **Release status, 2026-11-27 — authoritative for R17-A.** R17-A, including its R2 review
+> remediation, R3 diagnostics fix and R4 Variant-Lab producer fix, is **MERGED** (PR #112, head
+> `b8bc3895`, merged 2026-11-26 into `main` as the ordinary two-parent merge commit
+> **`2194325e`**), **INSTALLED** as the current verified production release, **GUI SMOKE PASS**, and
+> **OWNER ACCEPTED**. The dated `R4` / `R3` / `R2` / `Status, 2026-11-26` blocks below are preserved
+> as the historical record of what was measured and what was true on their own dates — including
+> their then-correct statements that nothing was yet merged or installed — and are **superseded by
+> this entry** for the question of R17-A's current status.
+>
+> **R17-B is unchanged by this release and remains research only.** No service worker, Push server,
+> daemon, background poller or browser extension was added, and R17-A having shipped authorises
+> none.
 
 > **R4 — the attended JOB playtest, 2026-11-26.** The owner accepted all six R3 diagnostic checks,
 > including three real Windows notifications, and the job families were then measured for real. Six
@@ -2280,7 +2293,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R14** — Media Library **Refresh & Maintenance** | **PLANNED.** A read-only inventory first (media count, duplicate filenames, cache records present / missing / on unreachable drives, cache location and reusable record count, reclaimable space), then optional confirmed cleanup with a dry-run preview and **reversible quarantine** preferred, then optional filename normalisation. Extends the existing `cache_admin.py` rather than adding a second engine. Two hard rules: **a missing file and an unreachable drive are different verdicts**, and the Stage-5 cache is keyed by **absolute path** with **path-derived candidate ids**, so a rename invalidates the signature, every candidate id and the payload's stored `video_file` — mass renaming or cache migration is not to be implemented until every identity reference can be proven safely updatable. Never clear the shared cache because a source is temporarily unavailable |
 | **R15** — Audio Cutter V2: Folder Batch and one Audio Review | **ACCEPTED ROADMAP SCOPE · R15-C MERGED AND INSTALLED (owner acceptance pending), R15-B NOT STARTED, R15-A CANCELLED BY OWNER 2026-11-27** (owner ideas 2026-11-03, scope accepted 2026-11-12). **R15-A — processing every audio stream of a video independently — is cancelled and removed from the active roadmap; it was never implemented, so nothing was removed from the product, and the cancelled scope is recorded once in the R15-A entry above purely to prevent accidental reintroduction.** R7.2 accepts single video files with audio and cuts only `a:0`, which is now the intended final behaviour; **R15-B adds a mixed audio/video Folder Batch over exactly that behaviour — one input, one result, no per-track fan-out — and carries no R15-A dependency.** **R15-C — removing the duplicate Cutter review surface in favour of the existing Media Library → Audio Review handoff — is MERGED (PRs #103, #104, #105) and INSTALLED, with owner acceptance still pending.** It was verified by offline seam tests, the real handoff chain, a real-Gradio build of the whole Blocks tree (513 components against the parent's 546) and, after the F-3/F-4 cycle, a served-page GUI smoke on an isolated sandbox. **Three independent reviews found five findings: F-1 and F-2 (a `gr.State` repaint is not a retirement; the retired page stayed servable), F-3 and F-4 (a generation beside the mint, and a read that cannot gate a mutation — both moved real files), and F-5 (the page turn was fenced on the owner epoch, which a turn reads *after* the retirement it should see, so a stale `Next`/`Previous` republished the folder just left as a live page and a Confirm on it moved files).** All five are closed inside the existing `ClipRegistry` — `revoke_owner`, `claim_page`, a per-owner page epoch and `new_session(expected_page=…)` — with no new coordinator, lock or thread. Preferred bounded sequence **C → B**, one approved task per stage. The batch stage's shared-scanner NTFS junction dependency is **satisfied** — PR #88 merged 2026-11-03 (`e6a7c0cd`). Accepting the scope authorises no further source work; **R15-B is unstarted and R15-A is cancelled** |
 | **R16** — Music Playlist Mode for Video Render | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner ideas 2026-11-03, scope accepted 2026-11-12). Ordered multiple songs with Move Up/Down, Shuffle and Sort by Name; one continuous soundtrack for beat/shot planning and rendering; visible order is frozen, no silent reshuffle. Existing single-track and R10 Repeat Music remain unchanged by default; playlist-repeat interaction is a future explicit decision |
-| **R17** — Chrome / Windows notifications on long-job completion | **ACCEPTED ROADMAP SCOPE · NOT IMPLEMENTED** (owner idea 2026-11-04, scope accepted 2026-11-12). Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional R17-B research (service worker / Push), NOT promised for V1 — **no service worker, Push server, daemon, background poller or extension is authorised**. Accepting the scope authorises no source work and no deploy |
+| **R17** — Chrome / Windows notifications on long-job completion | **R17-A MERGED, INSTALLED, GUI SMOKE PASS AND OWNER ACCEPTED · R17-B STILL RESEARCH ONLY** (owner idea 2026-11-04, scope accepted 2026-11-12). **R17-A shipped in PR #112** (head `b8bc3895`, merged 2026-11-26 as **`2194325e`**, the current verified production release), carrying the R2 review remediation, the R3 diagnostics fix and the R4 Variant-Lab producer fix. Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional **R17-B research** (service worker / Push), still NOT promised and still unstarted — **no service worker, Push server, daemon, background poller or extension is authorised**, and R17-A having shipped authorises none. What remains unverified at runtime is listed in the R17 section above: an OS-visible Windows toast (granting Chrome's per-origin permission is a human action the automation cannot reach) and a genuinely backgrounded tab |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **UX follow-ups** — zero-Keep all-Discard, Browse alignment, Prepare & Verify activity | **ALL THREE SOURCE IMPLEMENTED** in draft PRs **#108** (`3de9ea7d`), **#109** (`e396e4d`, review finding corrected), **#110** (`dda8bd43`). **COMBINED SOURCE PASS** (11,066 passed / 28 skipped), **FOCUSED REVIEW PASS** (865 passed / 1 skipped), **ISOLATED GUI SMOKE PASS** (synthetic media; unpublished `ee92521d`), **500PX VIEWPORT VERIFIED** on 10/12 rows (2 inferred). **NOT MERGED / INSTALLED / OWNER-ACCEPTED**. Product priority order unchanged |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
@@ -2364,13 +2377,17 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 > **Accepted backlog (proposed 2026-11-03 to 2026-11-04, scope accepted by the owner 2026-11-12;
 > not inserted into the numbered owner priority):** **R15** Audio Cutter V2 (review consolidation →
 > Folder Batch), **R16** Music Playlist Mode, and **R17** opt-in Chrome/Windows
-> notifications for completed long jobs are recorded above as **ACCEPTED ROADMAP SCOPE · NOT
-> IMPLEMENTED**, with one exception as of 2026-11-13: **R15-C is implemented, merged (PRs #103,
-> #104, #105) and installed** — owner acceptance still pending. R15-B, R16 and R17 are
-> unstarted. **R15-A — all audio tracks from one video — was CANCELLED BY THE OWNER on 2026-11-27
-> and is no longer an active or deferred target; R15-B remains planned and is independent of it.**
-> (R17's status here is unchanged by that decision and is stated authoritatively in its own section
-> above, which this entry does not restate.)
+> notifications for completed long jobs were recorded above as **ACCEPTED ROADMAP SCOPE · NOT
+> IMPLEMENTED**, with **two exceptions** since: **R15-C is implemented, merged (PRs #103, #104,
+> #105) and installed** as of 2026-11-13 — owner acceptance still pending — and **R17-A is MERGED,
+> INSTALLED, GUI SMOKE PASS and OWNER ACCEPTED** as of 2026-11-26, shipped in **PR #112** and
+> installed as production release **`2194325e`**. **R15-B and R16 remain unstarted, and R17-B
+> remains research only** — no service worker, Push server, daemon, background poller or extension
+> is authorised, and R17-A having shipped authorises none. **R15-A — all audio tracks from one
+> video — was CANCELLED BY THE OWNER on 2026-11-27 and is no longer an active or deferred target;
+> R15-B remains planned and is independent of it.**
+> (R17-A's shipped status is stated authoritatively in its own section above, which this entry
+> summarises rather than restates; the R15-A cancellation does not affect it.)
 > Accepting the scope settles what the product is meant to become; it **does not
 > authorise unrestricted implementation of any of them**, and each stage is built only under its own
 > separately scoped, separately approved task. They do not displace R14 work or the already recorded
