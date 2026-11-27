@@ -26,6 +26,17 @@ server-side `app.load`, widened from notifications to settings-wide), a
 the same readers the panel is constructed from. **No new preferences subsystem, no new option key,
 no new schema and no second `app.load`.**
 
+**R2 then closed what those guards could not reach** (the section at the end of this file). An
+equality guard cancels an *immediate* echo; it compares the arriving value against what is stored
+at the moment it arrives, so a *delayed* echo — a page-load or Reset snapshot taken before another
+session's deliberate change and delivered after it — found the two genuinely different and wrote
+the stale value. Four orderings reproduced on the R1 candidate `97a056b9`, two of them reverting a
+setting the operator had just chosen in another tab, and a fourth in which pressing **Save
+defaults** in an old tab reverted a policy that tab never touched. The fix is at the
+**registration**: both option controls moved from `.change` to `.input` (user-only, measured in a
+real browser on the pinned `gradio==6.19.0`), and the collision radio is no longer an input to
+Save defaults. The guards are kept as an inner check; the listener is the protection.
+
 The tier here is the repository's established one for `gui.py`: the shipped function bodies are
 AST-extracted and *executed* against a synthesised namespace with the real `user_prefs`,
 `collision` and `desktop_notify` modules and a real temporary preferences file. Nothing about the
@@ -81,7 +92,10 @@ def _func(tree: ast.AST, name: str) -> ast.FunctionDef:
 _WANTED = ("_pref", "_option", "_collision_policy", "_notifications_enabled",
            "_notify_settings_on_load",
            "_on_collision_policy_change", "_on_notifications_enabled_change",
-           "_on_reset_folder_prefs")
+           "_on_reset_folder_prefs",
+           # [FORK] R2 (L4): Save defaults is now asserted to leave the options alone, so the
+           # shipped body runs here too rather than being described second-hand.
+           "_on_save_folder_prefs")
 _OPTIONAL = ("_settings_on_load",)
 
 #: Nine real destinations, one per Settings folder box, in `DESTINATION_KEYS` order -- which is
@@ -571,6 +585,185 @@ def test_the_change_handler_guard_compares_resolved_policies(tmp_path):
     guard = body.index("if resolved == _collision_policy():")
     write = body.index("_FOLDER_OPTIONS[fork_prefs.COLLISION_POLICY] = resolved")
     assert guard < write, "the guard must sit before the write it protects"
+
+
+# =============================================================================================
+# R2 -- the delayed programmatic update, and the stale Save defaults
+#
+# R1's equality guards close an IMMEDIATE echo. They cannot close a DELAYED one: the guard
+# compares the arriving value against what is stored at the moment it arrives, so when another
+# session changed the setting in between, the two genuinely differ and the stale value wins.
+# Measured on the R1 candidate `97a056b9` in all four orderings below.
+#
+# The fix is at the REGISTRATION, not in the handler: `.input` fires only for a user gesture, so
+# a programmatic write is never delivered. These tests therefore assert about *delivery* -- which
+# listener is wired -- and not only about handler arithmetic. A test that called the handler
+# directly with a stale value would report a defect on a tree that does not have one, because the
+# handler is right to write whatever a user hands it.
+# =============================================================================================
+
+def _listener_for(component: str):
+    """Which listener a component's option handler is wired to: 'input', 'change' or None."""
+    for node in ast.walk(_tree()):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            rendered = ast.unparse(node.func)
+            if rendered in (f"{component}.input", f"{component}.change"):
+                return rendered.rsplit(".", 1)[1]
+    return None
+
+
+def _save_inputs() -> list[str]:
+    call = next(node for node in ast.walk(_tree())
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and ast.unparse(node.func) == "pref_save_btn.click")
+    listed = next(keyword.value for keyword in call.keywords if keyword.arg == "inputs")
+    return [ast.unparse(element) for element in listed.elts]
+
+
+@pytest.mark.parametrize("component", ["pref_collision", "notify_enabled"])
+def test_both_option_controls_are_user_only(component):
+    """`.input`, never `.change`.
+
+    This is the whole R2 fix for the delayed echo, and it is a structural property rather than an
+    arithmetic one. Measured on the pinned `gradio==6.19.0` in a real browser: an `app.load` write
+    fired `change` and **not** `input`; a button write (what Reset does) fired `change` and
+    **not** `input`; a click fired both. So `.input` admits every real gesture and no programmatic
+    write.
+
+    Neither programmatic writer ever needed these handlers -- Reset persists `empty_options()`
+    itself, and `_settings_on_load` only paints what is already stored -- so nothing is lost by
+    not delivering to them.
+    """
+    assert _listener_for(component) == "input", (
+        f"{component} is wired to .{_listener_for(component)}; a programmatic page-load or Reset "
+        f"write would re-enter its handler and could overwrite a newer explicit choice")
+
+
+def test_a_delayed_page_load_echo_cannot_revert_a_newer_collision_choice(tmp_path):
+    """L1. Session A loads, session B chooses, A's snapshot arrives late.
+
+    The assertion is that the late value is **not deliverable**, which is what makes the ordering
+    harmless. The handler is then checked to be unchanged in its real job.
+    """
+    ns = _Namespace(tmp_path, policy=fork_collision.SKIP)
+    a_snapshot = ns.loaded_radio()                       # 1. A's page load computes `skip`
+    ns["_on_collision_policy_change"](fork_collision.SUFFIX)   # 2. B deliberately picks `suffix`
+    assert ns.saved_policy() == fork_collision.SUFFIX
+    before = ns.raw()
+    ns.toasts.clear()
+
+    assert _listener_for("pref_collision") == "input", (
+        f"A's stale snapshot {a_snapshot!r} would be delivered and would overwrite "
+        f"{ns.saved_policy()!r}")
+
+    # Nothing was delivered, so nothing moved.
+    assert ns.raw() == before
+    assert ns.saved_policy() == fork_collision.SUFFIX
+    assert ns.toasts == []
+
+
+def test_a_delayed_page_load_echo_cannot_revert_a_newer_notification_choice(tmp_path):
+    """L2, the same ordering on the sibling option."""
+    ns = _Namespace(tmp_path, notifications="off")
+    toggle, _sentence, _radio = ns["_settings_on_load"]()
+    a_snapshot = toggle[1]["value"]                      # A's page load computes False
+    ns["_on_notifications_enabled_change"](True)         # B switches them ON
+    assert ns.saved_notifications() == fork_notify.ENABLED_ON
+    before = ns.raw()
+    ns.toasts.clear()
+
+    assert _listener_for("notify_enabled") == "input", (
+        f"A's stale snapshot {a_snapshot!r} would be delivered and would switch notifications "
+        f"back off")
+
+    assert ns.raw() == before
+    assert ns.saved_notifications() == fork_notify.ENABLED_ON
+    assert ns.toasts == []
+
+
+def test_a_delayed_reset_echo_cannot_revert_a_newer_collision_choice(tmp_path):
+    """L3. Reset's own programmatic write, delivered after a later deliberate choice.
+
+    Reset persists the cleared options itself, so its echo was never load-bearing -- which is why
+    removing the delivery path costs nothing and the reset below still lands.
+    """
+    ns = _Namespace(tmp_path, policy=fork_collision.SUFFIX)
+    returned = ns["_on_reset_folder_prefs"]()
+    assert returned[-1].startswith("✅")
+    assert ns.saved_policy() == prefs.OPTION_DEFAULTS[prefs.COLLISION_POLICY], \
+        "the reset itself must still persist the cleared options without any echo"
+
+    ns["_on_collision_policy_change"](fork_collision.SUFFIX)   # B chooses again afterwards
+    assert ns.saved_policy() == fork_collision.SUFFIX
+    before = ns.raw()
+    ns.toasts.clear()
+
+    assert _listener_for("pref_collision") == "input", (
+        f"Reset's returned radio {returned[9]!r} would be delivered and would revert "
+        f"{ns.saved_policy()!r}")
+
+    assert ns.raw() == before
+    assert ns.saved_policy() == fork_collision.SUFFIX
+    assert ns.toasts == []
+
+
+def test_saving_folder_defaults_does_not_submit_or_write_the_collision_policy():
+    """L4. Folder saving and the immediately-persisted policy control are independent.
+
+    Measured on `97a056b9`: an older tab whose operator edited one folder and pressed Save
+    defaults submitted that tab's stale radio too, and silently reverted a policy chosen
+    elsewhere -- reported as an unqualified success.
+    """
+    wired = _save_inputs()
+    assert "pref_collision" not in wired, (
+        "Save defaults submits the collision radio, so a stale tab can revert a policy it never "
+        "touched")
+    assert "notify_enabled" not in wired, "the notification toggle persists on its own too"
+    assert len(wired) == 14
+
+
+def test_a_stale_tab_saving_folders_keeps_the_newer_policy_and_still_saves_the_folder(tmp_path):
+    """The same ordering executed against the shipped handler, with the argument list DERIVED
+    from the registration rather than hardcoded -- so this test follows the wiring instead of
+    asserting a second opinion about it."""
+    ns = _Namespace(tmp_path, policy=fork_collision.SKIP, notifications="on")
+    ns["_on_collision_policy_change"](fork_collision.SUFFIX)       # B picks suffix elsewhere
+    assert ns.saved_policy() == fork_collision.SUFFIX
+
+    submitted = [r"J:\A New Library", _REAL_FOLDERS[prefs.CLIPS_REJECTED],
+                 _REAL_FOLDERS[prefs.RAW_CUTTER_OUTPUT], "", "", "",
+                 _REAL_FOLDERS[prefs.AUDIO_LIBRARY], _REAL_FOLDERS[prefs.AUDIO_DISCARDED],
+                 _REAL_FOLDERS[prefs.AUDIO_CUTTER_OUTPUT], "", "",
+                 _REAL_FOLDERS[prefs.AUDIO_PREVIEW_LIBRARY],
+                 _REAL_FOLDERS[prefs.AUDIO_PREVIEW_DISCARDED],
+                 _REAL_FOLDERS[prefs.RENDER_OUTPUT]]
+    assert len(submitted) == len(_save_inputs())
+
+    status = ns["_on_save_folder_prefs"](*submitted)
+
+    assert str(status).startswith("✅")
+    assert ns.saved_folders()[prefs.CLIPS_LIBRARY] == r"J:\A New Library", "the save must work"
+    assert ns.saved_policy() == fork_collision.SUFFIX, "saving folders reverted the policy"
+    assert ns.saved_notifications() == "on", "saving folders disturbed the notification option"
+
+
+def test_an_explicit_user_change_still_persists_on_both_controls(tmp_path):
+    """The guard and the listener swap must not make either control deaf. This is the behaviour
+    everything above exists to protect, so it is asserted rather than assumed."""
+    ns = _Namespace(tmp_path, policy=fork_collision.SKIP, notifications="off")
+
+    ns["_on_collision_policy_change"](fork_collision.SUFFIX)
+    assert ns.saved_policy() == fork_collision.SUFFIX
+    assert ns["_collision_policy"]() == fork_collision.SUFFIX
+    assert ns.toasts[-1] == ("info", "saved: suffix")
+
+    ns["_on_notifications_enabled_change"](True)
+    assert ns.saved_notifications() == fork_notify.ENABLED_ON
+    assert ns["_notifications_enabled"]() is True
+    assert ns.toasts[-1] == ("info", "saved: notifications on")
+
+    # ...and the two still do not overwrite one another.
+    assert ns.saved_policy() == fork_collision.SUFFIX
 
 
 def test_the_saved_file_keeps_both_options_and_the_documented_shape(tmp_path):

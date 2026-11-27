@@ -5891,11 +5891,18 @@ def _on_notifications_enabled_change(enabled):
 
     The comparison is on the resolved booleans rather than on the stored string, so a hand-edited
     or corrupt value -- which `is_enabled` reads as off, the direction this setting must fail in --
-    is not rewritten by a programmatic echo of the off state it already means. `.change` is
-    deliberately **kept** rather than swapped for `.input`: the collision-policy radio two
-    registrations away uses `.change` for exactly this reason (Reset writes it too), and a
-    listener swap would have put the operator's own toggle on an event this repository has not
-    measured against the pinned `gradio==6.19.0`.
+    is not rewritten by an echo of the off state it already means.
+
+    **The listener swap R2 said it had not measured has now been measured** (Settings Preference
+    Consistency R2, L2). This registration is `.input`, not `.change`. The guard above closed the
+    *immediate* echo; it could not close a *delayed* one, because it compares the arriving value
+    against what is stored at the moment it arrives -- so a page load taken before another tab
+    switched notifications ON wrote `off` back over it, reproduced on `97a056b9`. On the pinned
+    `gradio==6.19.0`, measured in a real browser: an `app.load` write and a button write each
+    fired `change` and **not** `input`, while a click fired both. Neither programmatic writer ever
+    needed this handler -- Reset persists `empty_options()` itself and the page-load reader only
+    paints what is stored -- so the swap removes the echo instead of racing it. The guard stays as
+    an inner check on redundant user-driven writes.
     """
     resolved = fork_notify.option_value(enabled)
     on = fork_notify.is_enabled(resolved)
@@ -6230,10 +6237,12 @@ def _settings_on_load():
     radio whose stored value is corrupt is corrected to the resolved default rather than to a
     choice that is not in its `choices` list.
 
-    **It is safe against the `.change` that this write triggers**: `_on_collision_policy_change`
-    and `_on_notifications_enabled_change` both return early when the resolved value is the one
-    already in force, so a page load performs no preference write and raises no saved-setting
-    toast. That guard is a precondition of this function, not an incidental tidiness -- see
+    **The write this performs reaches no handler at all** (R2). Both option controls are
+    registered on `.input`, which fires only for a user gesture, so a page load persists nothing
+    and raises no saved-setting toast *structurally* rather than by winning a comparison. R1 relied
+    on an equality guard here, which held only while nothing changed in between: a load snapshot
+    delivered after another session's deliberate change wrote the stale value back over it. The
+    guards remain as an inner check; the listener is the protection. See
     `_on_collision_policy_change`.
 
     One registration rather than two, and `app.load` rather than a callable `value=`, for the two
@@ -9851,28 +9860,31 @@ def _on_collision_policy_change(policy):
     would add a third writer to that panel and let changing a radio overwrite the result of a Save
     the operator is still reading.
 
-    **A write that changes nothing writes nothing** (Settings Preference Consistency R1, F1). This
-    is the guard `_on_notifications_enabled_change` already carries, arrived at for the same
-    measured reason: Gradio's `.change` fires for a *function update* as well as for a user
-    gesture, and this radio has two legitimate programmatic writers -- `_settings_on_load`, which
-    corrects it for every new browser session, and Reset defaults, which returns it to the
-    default. Without this guard all three of the following were real, and the first two were
-    measured on `2097822a` before the fix:
+    **Only a user gesture reaches this handler** (Settings Preference Consistency R2, L1/L3). The
+    registration is `pref_collision.input`, not `.change`. R1 reached for an equality guard
+    instead, on the reasoning that `.change` fires for a *function update* as well as a gesture and
+    this radio has two programmatic writers -- `_settings_on_load` and Reset defaults. That guard
+    closed the **immediate** echo and could not close a **delayed** one: it compares the arriving
+    value against what is stored *now*, so when another session changed the setting in between,
+    the two genuinely differed and the stale value was written. Measured on `97a056b9`, a page
+    load taken before another tab chose `suffix` wrote `skip` back over it, with a cheerful
+    "Saved" toast; a Reset echo did the same.
 
-    * Reset defaults produced a **second** save and a **second** "Saved…" toast on top of its own,
-      because the radio value it returns re-enters here;
-    * a reset that **failed** returned the default policy, which then re-entered here and genuinely
-      **persisted** it -- so a reset reported as failed silently performed part of itself, and
-      announced a save the operator never asked for;
-    * adding the page-load correction below would have made **every new browser session** rewrite
-      `preferences.json` and raise a saved-setting toast for a tab that had only just opened.
+    Neither programmatic writer ever needed this handler: Reset persists the whole option set
+    itself, and the page-load reader only paints what is already stored. So the listener swap
+    removes the echo entirely rather than racing it. The browser measurement behind it is recorded
+    at the registration.
 
-    The comparison is on the **resolved** policies rather than on the raw widget value, exactly as
-    the notification guard compares resolved booleans: `resolve_policy` is total, so a hand-edited
-    or corrupt stored value reads as the safe default and a programmatic echo of that default is
-    not rewritten into the file. `.change` is deliberately **kept** rather than swapped for
-    `.input` -- Reset writes this radio and the stored value must follow it, which is the reason
-    recorded at the registration.
+    **The equality check below is kept, and is now an inner guard rather than the protection.**
+    It no longer defends against programmatic echoes -- the listener does -- but it still makes a
+    redundant *user-driven* write a no-op, and it keeps the handler correct if a future
+    programmatic writer is ever wired here. The comparison is on the **resolved** policies rather
+    than on the raw widget value, exactly as the notification guard compares resolved booleans:
+    `resolve_policy` is total, so a hand-edited or corrupt stored value reads as the safe default.
+
+    A **separate** R2 finding, fixed at the Save defaults registration rather than here: this
+    radio is no longer an input to `pref_save_btn.click`, so saving folder defaults from a stale
+    tab can no longer revert a policy that tab never touched.
     """
     resolved = fork_collision.resolve_policy(policy)
     if resolved == _collision_policy():
@@ -16671,7 +16683,22 @@ def create_ui() -> gr.Blocks:
                     audio_preview_folder, pref_audio_preview_library,
                     pref_audio_preview_discarded,
                     # [FORK] R8: appended after those, for the same reason again.
-                    pref_render_output, pref_collision],
+                    pref_render_output],
+            # [FORK] Digital-Union (Settings Preference Consistency R2, L4): `pref_collision` is
+            # deliberately NOT an input here any more, and this button no longer writes the
+            # collision policy at all.
+            #
+            # Folder defaults are saved by an explicit press; the collision policy persists the
+            # moment it is picked. Mixing them meant Save defaults submitted whatever the radio
+            # happened to show in THAT tab -- so an older tab whose operator edited one folder and
+            # pressed Save silently reverted a policy chosen in another tab and never touched
+            # here. Measured on `97a056b9`: the folder saved correctly and `suffix` became `skip`,
+            # reported as an unqualified success.
+            #
+            # `_on_save_folder_prefs` keeps the parameter with its `None` default, which already
+            # means "leave the options exactly as they are" -- the pre-R8 contract, now the only
+            # one. So this removes a write rather than adding a behaviour, nothing clears the
+            # policy, and the handler's signature is unchanged for its other callers.
             outputs=[pref_status],
         )
         pref_reset_btn.click(
@@ -16698,9 +16725,25 @@ def create_ui() -> gr.Blocks:
 
         # [FORK] R8 UX Refresh: the collision policy applies and persists the moment it is picked.
         # `outputs=[]` is exact and load-bearing -- feedback is a toast so this cannot become a
-        # third writer of `pref_status`. `.change()` rather than `.input()` because the Reset
-        # button writes this radio programmatically and the stored value must follow it.
-        pref_collision.change(
+        # third writer of `pref_status`.
+        #
+        # [FORK] Digital-Union (Settings Preference Consistency R2, L1/L3): `.input()`, NOT
+        # `.change()`, and this is the structural fix for the delayed-echo lost update. The old
+        # comment here said `.change` was required "because the Reset button writes this radio
+        # programmatically and the stored value must follow it" -- that was simply wrong. Reset
+        # persists the whole option set itself through `empty_options()`, and `_settings_on_load`
+        # only paints what is already stored, so NO programmatic writer has ever needed this
+        # handler to run. It running was pure cost, and R1's equality guard could only cancel the
+        # cost when nothing had changed in between. When something had, the stale echo won:
+        # measured on `97a056b9`, a page load taken before another tab chose `suffix` wrote `skip`
+        # back over it, and a Reset echo did the same.
+        #
+        # `.input` fires only on a user gesture. Measured on the pinned `gradio==6.19.0` in a real
+        # browser rather than assumed, which is the evidence R17-A said it lacked: an `app.load`
+        # write fired `change` and not `input`; a button write (what Reset does) fired `change` and
+        # not `input`; a click on the radio fired BOTH. So the swap removes every programmatic
+        # entry to this handler and keeps every real one.
+        pref_collision.input(
             fn=_on_collision_policy_change,
             inputs=[pref_collision],
             outputs=[],
@@ -16724,7 +16767,11 @@ def create_ui() -> gr.Blocks:
         #
         # `concurrency_limit=None` throughout, for the measured S2-A R3 reason every other
         # non-render registration here carries.
-        notify_enabled.change(
+        # [FORK] Digital-Union (Settings Preference Consistency R2, L2): `.input()` for the same
+        # measured reason as the collision radio above -- see that registration for the browser
+        # measurement. This toggle had the identical delayed-echo lost update: a page load taken
+        # before another tab switched notifications ON wrote `off` back over it.
+        notify_enabled.input(
             fn=_on_notifications_enabled_change,
             inputs=[notify_enabled],
             outputs=[notify_app_state],

@@ -208,8 +208,19 @@ by an echo of the off state it already means.
 > *guard*: `_on_collision_policy_change` had none, so Reset's own echo produced a second save and a
 > second toast, and a **failed** Reset echoed the default policy back and genuinely persisted it.
 > Settings Preference Consistency R1 added the matching guard, comparing resolved policies through
-> `_collision_policy()`. It is also what makes the widened `app.load` above safe: without it, every
-> new browser session would rewrite `preferences.json` and toast a save nobody asked for.
+> `_collision_policy()`.
+>
+> **R2 then replaced the whole approach, and this toggle moved with it.** A guard closes an
+> *immediate* echo; it cannot close a *delayed* one, because it compares the arriving value
+> against what is stored at the moment it arrives. Measured on `97a056b9`: a page-load snapshot
+> taken before another tab switched notifications ON, delivered after it, wrote `off` back over
+> the operator's choice. **Both option controls are now registered on `.input`**, which fires only
+> for a user gesture — the measurement this rule previously said had not been made is in
+> `.claude/rules/gui-integration.md` (*Settings preference consistency*) and in the task evidence:
+> on the pinned `gradio==6.19.0`, `app.load` and button writes fire `change` and **not** `input`,
+> while a click fires both. The guards stay as an inner check on redundant user-driven writes;
+> they are no longer the protection. Nothing about delivery, the ledger, the envelope, the
+> session key or any outcome translator changed.
 
 ## Content: no caller may supply text
 

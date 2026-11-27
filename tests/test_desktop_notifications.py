@@ -1352,10 +1352,15 @@ def test_the_envelope_starts_empty_and_is_never_visible():
 
 def test_the_notification_panel_writes_only_its_own_app_state_line():
     """The toggle is a server call; the browser-status line is written by the page alone. Keeping
-    them apart is what lets the server rewrite its half without erasing the live answer."""
+    them apart is what lets the server rewrite its half without erasing the live answer.
+
+    [FORK] Digital-Union (Settings Preference Consistency R2, L2): the listener is `.input`, not
+    `.change` -- see `test_both_option_controls_are_user_only` in
+    `tests/test_settings_pref_consistency.py` for why, and for the assertion that neither may
+    silently go back to `.change`."""
     tree = _tree(_GUI)
-    change = next(call for call in _calls(tree, "change")
-                  if ast.unparse(call.func) == "notify_enabled.change")
+    change = next(call for call in _calls(tree, "input")
+                  if ast.unparse(call.func) == "notify_enabled.input")
     kwargs = _kwargs(change)
     assert kwargs["fn"] == "_on_notifications_enabled_change"
     assert kwargs["inputs"] == "[notify_enabled]"
@@ -1377,7 +1382,10 @@ def test_the_notification_panel_writes_no_render_source_or_preparation_widget():
     forbidden = {"status_output", "video_output", "process_btn", "source_state", "prep_state",
                  "session_state", "render_invocation_state", "pref_status", "prep_status",
                  "variant_batch_state", "director_proposal_state", "cut_handoff_state"}
-    for name in ("notify_enabled.change", "notify_permission_btn.click",
+    # [FORK] Digital-Union (R2, L2): `notify_enabled.input` -- the toggle is user-only now.
+    # `notify_envelope.change` is unchanged: it is a hidden relay the server writes deliberately,
+    # and a programmatic write is exactly how a notification is delivered.
+    for name in ("notify_enabled.input", "notify_permission_btn.click",
                  "notify_test_btn.click", "notify_refresh_btn.click",
                  "notify_envelope.change"):
         call = next(node for node in ast.walk(tree)

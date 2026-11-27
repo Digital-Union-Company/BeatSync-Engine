@@ -20,6 +20,70 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-27 (Settings Preference Consistency R2: a stale page load could revert a newer choice, and Save defaults carried the policy)
+
+R1 (below) closed the *immediate* programmatic echo with an equality guard on each option handler.
+A review of the remaining risk found the guard cannot close a **delayed** one, and that a second,
+unrelated route wrote the policy as well. Four orderings, all reproduced against the R1 candidate
+`97a056b9` before anything changed.
+
+**L1/L2/L3 — the delayed echo.** The guard compares the value arriving at the handler against
+what is stored *at the moment it arrives*. When another session changed the setting in between,
+the two genuinely differ, so the guard passes and the **stale** value is written. Reproduced end
+to end in a real browser by holding the page-load reader open for ten seconds, which only widens
+a window that normally lasts milliseconds:
+
+```
+21:28:18  _on_collision_policy_change('suffix')   <- tab B's first choice
+          [page-load snapshot computed = 'suffix', held]
+21:28:48  _on_collision_policy_change('skip')     <- tab B's DELIBERATE choice
+21:28:54  _on_collision_policy_change('suffix')   <- the held snapshot lands and reverts it
+```
+
+The operator's tab still displayed `skip` while the application was suffixing, and a cheerful
+*"Saved…"* toast was the only sign. The same shape applied to the notification toggle (a load
+taken before another tab switched it ON wrote `off` back), and to Reset defaults' own echo.
+
+**The fix is the registration, not the handler.** Both option controls moved from `.change` to
+**`.input`**, which fires only for a user gesture. R17-A had declined this swap on the grounds
+that it was "an event this repository has not measured against the pinned `gradio==6.19.0`" — so
+it was measured, in a real browser, on that exact runtime: an `app.load` write fired `change` and
+**not** `input`; a button write (what Reset does) fired `change` and **not** `input`; a click on
+the control fired **both**. And neither programmatic writer ever needed the handler to run —
+Reset persists the whole option set through `empty_options()` itself, and `_settings_on_load` only
+paints what is already stored — so the swap removes the echo rather than racing it. Replaying the
+identical ordering on the fixed tree produces **no third call at all** and the operator's `skip`
+survives. The equality guards are kept as an inner check on redundant user-driven writes; they are
+no longer the protection, and their docstrings now say so rather than claiming otherwise.
+
+**L4 — Save defaults carried the collision policy.** `pref_collision` was an input to
+`pref_save_btn.click`, so pressing Save submitted whatever the radio happened to show *in that
+tab*. An older tab whose operator edited one folder and pressed Save therefore reverted a policy
+chosen elsewhere and never touched there — reported as an unqualified success. It is no longer an
+input. `_on_save_folder_prefs` keeps the parameter with its `None` default, which already meant
+"leave the options exactly as they are", so this removes a write rather than adding a behaviour.
+Verified live: a stale tab displaying `suffix` pressed Save defaults, the edited folder saved, and
+the stored policy stayed at the other session's `skip`.
+
+Nothing else moved. No new preferences subsystem, no new option key, no schema change, no new
+component, endpoint or `app.load`; `SKIP`/`SUFFIX` resolution, `collision.py`, both sorters and
+every R17-A notification path — the ledger, the envelope, the session key, the outcome translators
+— are untouched. Explicit user changes to either option still persist immediately and still do not
+disturb one another.
+
+**Deliberately not claimed:** a page load still *paints* from a snapshot taken when it began, so a
+tab can briefly **display** a value another session has since changed. It cannot **write** it,
+which is the point; the stored setting stays correct and the next load is right. The R2 evidence
+widened that window to ten seconds artificially to make the ordering observable.
+
+`tests/test_settings_pref_consistency.py` grows to **36 tests**; the 8 new ones assert about
+*delivery* — which listener is wired — rather than only about handler arithmetic, because a test
+that called the handler directly with a stale value would report a defect on a tree that does not
+have one. **7 of the 8 fail against the R1 candidate `97a056b9`**, each on its own assertion; the
+eighth is a deliberate regression pin that must pass on both.
+`tests/test_desktop_notifications.py`'s two listener-identity assertions follow the toggle to
+`.input`.
+
 ### Fixed — 2026-11-27 (Settings Preference Consistency R1: a stale collision radio, and a failed reset that lied)
 
 Two Settings defects, both measured on `main` at `2097822a` before any source changed, and both in

@@ -843,17 +843,33 @@ automatically.
   * **The `value=` is deliberately KEPT alongside it.** It makes the first paint right without
     waiting for a load event; the load event makes every later session right. Dropping it would
     leave the radio blank until the round trip returned.
-  * **Every programmatic writer needs the "a write that changes nothing writes nothing" guard, in
-    the handler where the write happens.** `.change` fires for a function update as well as a
-    gesture, and these components now have two programmatic writers — the page-load reader and
-    Reset. `_on_notifications_enabled_change` had the guard since R2;
-    `_on_collision_policy_change` did **not**, and three things followed, all measured: Reset
-    produced a second save and a second toast on top of its own; a **failed** Reset returned the
-    default policy, which re-entered the handler and **genuinely persisted it**, so a reset reported
-    as failed silently performed part of itself and announced a save nobody asked for; and the
-    widened `app.load` would have made every new browser session rewrite `preferences.json`. The
-    guard compares **resolved** values through the setting's own reader — never the raw widget value
-    and never the defaults table.
+  * **An immediately-persisted option control is registered on `.input`, never `.change`** — this
+    is the R2 rule and it supersedes R1's reliance on a guard. `.change` fires for a *function
+    update* as well as a gesture, so every programmatic write re-entered these handlers. R1 met
+    that with an equality guard, which closes an **immediate** echo and cannot close a **delayed**
+    one: the guard compares the arriving value against what is stored *at the moment it arrives*,
+    so when another session changed the setting in between, the two genuinely differed and the
+    stale value won. Measured on `97a056b9` in a real browser with the page-load reader held open:
+    `_on_collision_policy_change('suffix')` → operator in another tab deliberately chooses
+    `skip` → **six seconds later the held snapshot lands and writes `suffix` back**, with a
+    "Saved" toast, while the second tab still displays `skip`.
+    **Neither programmatic writer ever needed these handlers** — Reset persists the whole option
+    set through `empty_options()` itself, and `_settings_on_load` only paints what is already
+    stored — so the listener swap removes the echo instead of racing it. Measured on the pinned
+    `gradio==6.19.0` (`probe_input_server.py` in the task evidence): an `app.load` write fired
+    `change` and **not** `input`; a button write fired `change` and **not** `input`; a click fired
+    **both**. The same ordering on the fixed tree produces no third call at all.
+    The equality guards are **kept as an inner check** on redundant user-driven writes — they are
+    no longer the protection, and their docstrings say so. They still compare **resolved** values
+    through the setting's own reader, never the raw widget value and never the defaults table.
+  * **A control that persists on its own is never also an input to a Save button.** `pref_collision`
+    was an input to `pref_save_btn.click`, so Save defaults submitted whatever the radio happened
+    to show *in that tab*: an older tab whose operator edited one folder and pressed Save silently
+    reverted a policy chosen elsewhere and never touched there, reported as an unqualified success
+    (measured on `97a056b9`, and live in the browser). It is no longer an input;
+    `_on_save_folder_prefs` keeps the parameter with its `None` default, which already means
+    "leave the options exactly as they are". Folder defaults are saved by an explicit press; the
+    two options persist the moment they are changed. **Do not re-mix them.**
   * **A failed write may not be reported as a successful one.** R2 left a note that Reset's failure
     path returned nine blank folder boxes and the default radio "which is not accurate — nothing was
     cleared", deliberately deferred. It is now closed: the failure path repaints from **the same
@@ -866,17 +882,26 @@ automatically.
     structurally. The nine `_pref` calls are in `user_prefs.DESTINATION_KEYS` order, which is the
     registration's order, and that correspondence is **asserted** rather than trusted — swapping two
     would hand the operator each other's folders.
-  * **What is deliberately NOT claimed.** A stale tab that the operator *presses Save defaults on*
-    still submits the values on its screen, which is a gesture rather than a silent revert and is
-    outside this contract. The two **silent** revert routes — a page load, and Reset's own echo —
-    are the ones closed.
+  * **What is deliberately NOT claimed.** A page load still *paints* from a snapshot taken when
+    the load began, so between that moment and the paint a tab can briefly **display** a value
+    another session has since changed. It cannot **write** it, which is the whole point — the
+    stored setting stays correct and the next load is right. The window is normally milliseconds;
+    the R2 evidence widened it to ten seconds artificially to make the ordering observable, and
+    the display was stale for exactly that window while the file was not. A *folder* textbox
+    edited in one tab and saved from it still wins over another tab's edit of the same box, which
+    is ordinary last-writer-wins on an explicitly saved form and is not a settings revert.
   * **No new preferences subsystem.** Same file, same `beatsync-folder-preferences-1` schema, same
     two `OPTION_KEYS`, same nine `DESTINATION_KEYS`; a test asserts each.
 
   Verified by `tests/test_settings_pref_consistency.py`, which executes the shipped bodies against
-  the real store (**18 of its 28 fail against pristine `2097822a`**; the 10 that pass are scope
-  invariants and R17-A behaviours it pins against regression), plus a real-`gradio` before/after
-  recorded in the task evidence.
+  the real store — **36 tests: 18 of the R1 set fail against pristine `2097822a`, and 7 of the 8
+  R2 tests fail against the R1 candidate `97a056b9`**, each on its own assertion; everything that
+  passes against an older tree is a scope invariant or a behaviour the suite pins against
+  regression. Plus a real-`gradio` two-session before/after recorded in the task evidence.
+
+  **When you add a saved option to this panel, three things are required, not one:** put it in
+  `_settings_on_load`, register its control on `.input`, and keep it out of `pref_save_btn`'s
+  `inputs`. Missing any one of them reintroduces a defect this section already paid for.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
