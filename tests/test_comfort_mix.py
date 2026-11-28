@@ -521,8 +521,14 @@ def test_the_controls_ride_at_the_end_of_the_positional_contract(gui_tree: ast.M
     # [FUN R10] `repeat_music` is the second such append, after R7.3's `voice_overflow` and under the
     # same discipline — appended at the end of both the signature and the click list together, so
     # the pair's own index is still exactly the one it had at R7.1.
-    assert names[start + 2:] == ["voice_overflow", "repeat_music"], names[start + 2:]
-    assert inputs[start + 2:] == ["voice_overflow", "repeat_music"], inputs[start + 2:]
+    # [R16] Music Playlist Mode is the third such append, after R7.3's `voice_overflow` and R10's
+    # `repeat_music`, and under the same discipline again — appended at the end of both the
+    # signature and the click list together, so the pair's own index is still exactly the one it
+    # had at R7.1, which is the property this assertion protects.
+    assert names[start + 2:] == ["voice_overflow", "repeat_music",
+                                 "music_source", "playlist_state"], names[start + 2:]
+    assert inputs[start + 2:] == ["voice_overflow", "repeat_music",
+                                  "music_source", "playlist_state"], inputs[start + 2:]
 
 
 def test_the_config_carries_both_controls(gui_tree: ast.Module):

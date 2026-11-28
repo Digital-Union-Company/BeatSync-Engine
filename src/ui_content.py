@@ -384,6 +384,73 @@ REPEAT_MUSIC_ESTIMATE_INITIAL = (
 )
 
 # ============================================================================
+# [FORK] Digital-Union (R16 Music Playlist Mode V1)
+# Several music files as ONE ordered, continuous soundtrack. Single Track is the default and is the
+# pre-R16 render. The repetition control reads "Repeat Playlist" in playlist mode and repeats the
+# WHOLE ordered playlist -- not each song -- so the info text must not imply either a per-song
+# repeat or a looped video.
+# ============================================================================
+
+LABEL_MUSIC_SOURCE = "🎚️ Music Source"
+CHOICE_MUSIC_SINGLE = "🎵 Single Track"
+CHOICE_MUSIC_PLAYLIST = "🎼 Playlist"
+INFO_MUSIC_SOURCE = (
+    "**Single Track** is the normal render: one song. **Playlist** joins several songs into one "
+    "continuous soundtrack, in the order you arrange them, and plans the whole video over it. "
+    "Your music files are never modified, and nothing is faded, mixed or loudness-matched between "
+    "tracks in this version."
+)
+
+#: The slider's name. It is the SAME control in both modes; only the word for what repeats changes,
+#: because the cycle is whatever soundtrack the render was given.
+HEADING_REPEAT_MUSIC = "#### 🔁 Repeat Music"
+HEADING_REPEAT_PLAYLIST = "#### 🔁 Repeat Playlist"
+
+LABEL_PLAYLIST_SELECTED = "Selected tracks"
+INFO_PLAYLIST_SELECTED = (
+    "Pick one or more rows to Remove, Move Up or Move Down. Selecting nothing leaves the playlist "
+    "exactly as it is."
+)
+LABEL_PLAYLIST_ADD = "➕ Add tracks…"
+LABEL_PLAYLIST_REMOVE = "➖ Remove"
+LABEL_PLAYLIST_UP = "⬆️ Move Up"
+LABEL_PLAYLIST_DOWN = "⬇️ Move Down"
+LABEL_PLAYLIST_SHUFFLE = "🔀 Shuffle"
+LABEL_PLAYLIST_SORT = "🔤 Sort by Name"
+LABEL_PLAYLIST_CLEAR = "🗑️ Clear playlist"
+
+#: The playlist queue's initial state. Content comes from
+#: `beatsync_fork.music_playlist.summary_markdown`; this is only the empty state.
+PLAYLIST_SUMMARY_INITIAL = (
+    "**Playlist is empty.** Press **Add tracks** to choose one or more music files. "
+    "They play in the order shown, top to bottom."
+)
+PLAYLIST_NOTICE_INITIAL = ""
+PLAYLIST_NOTICE_NOTHING_SELECTED = (
+    "Nothing was selected, so the playlist is unchanged. Pick one or more rows first."
+)
+PLAYLIST_NOTICE_AT_TOP = "Already at the top — the playlist is unchanged."
+PLAYLIST_NOTICE_AT_BOTTOM = "Already at the bottom — the playlist is unchanged."
+PLAYLIST_NOTICE_CANCELLED = "No files were chosen, so the playlist is unchanged."
+PLAYLIST_NOTICE_PICKER_UNAVAILABLE = (
+    "The file chooser could not be opened, so the playlist is unchanged."
+)
+PLAYLIST_NOTICE_FULL = (
+    "The playlist is full ({limit} tracks). Remove some tracks before adding more."
+)
+PLAYLIST_NOTICE_ADDED = "Added {added} of {chosen} chosen file(s), in filename order."
+PLAYLIST_NOTICE_SKIPPED = (
+    "{skipped} file(s) were not added: unsupported type, unreadable, or empty."
+)
+PLAYLIST_NOTICE_SHUFFLED = "Shuffled once, with seed {seed}. Press Shuffle again for a new order."
+PLAYLIST_NOTICE_SHUFFLE_EMPTY = "The playlist is empty — there is nothing to shuffle."
+PLAYLIST_NOTICE_SHUFFLE_TOO_SHORT = (
+    "Shuffle needs at least two tracks; one track has only one order."
+)
+PLAYLIST_NOTICE_SORTED = "Sorted by filename, A→Z."
+PLAYLIST_NOTICE_CLEARED = "Playlist cleared. No files were deleted."
+
+# ============================================================================
 # [FORK] Digital-Union: Audio Layers V1 (D)
 # See src/beatsync_fork/audio_mix.py for the placement rules and src/audio_mixdown.py for the
 # mixdown. Voice changes the final audio only — the video edit is still decided entirely by the

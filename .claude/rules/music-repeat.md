@@ -34,6 +34,23 @@ generated artifact and the operator's repeat count, not about their voice clips 
 `MusicRepeatError` is a plain `Exception` and the three `except audio_mixdown.AudioMixError`
 handlers in the render body keep meaning exactly what they meant before.
 
+## What R16 Music Playlist Mode did to this feature, which is almost nothing
+
+**The cycle is whatever audio file R10 was handed, and that contract is what made Repeat Playlist
+free.** By the time `build_repeated_music` runs on a playlist render, `local_audio_path` has been
+rebound to the joined soundtrack master, so the cycle R10 measures *is* the complete ordered
+playlist. The owner's deferred question — repeat the whole playlist, or each song? — is therefore
+settled as **the whole playlist**, structurally rather than by a branch. Neither module here grew a
+playlist parameter, a playlist import or a playlist branch, and a test asserts their *executable*
+source never mentions one.
+
+The one change: `summary_line` gained an optional `label`, defaulting to the pre-R16
+`REPEAT MUSIC`, so the success panel can name the control the operator actually saw
+(`REPEAT PLAYLIST` when the music is a playlist). It is a **label**, not a feature flag — the
+arithmetic, the measured cycle and the total all still come from this one function reading this one
+bus record, so there is still no second formatter and this module still cannot tell a playlist from
+a single track. Full contract: `.claude/rules/music-playlist.md`.
+
 ## 1× is the legacy render structurally, not by value
 
 **Every statement the feature adds to `_process_video_impl` sits behind a repeat guard** —

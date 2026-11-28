@@ -20,6 +20,111 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-28 (R16 R2 final hardening: three ways the playlist preparation was quietly wrong)
+
+A focused pass over the R16 V1 candidate `f8d6aa0a`, closing three findings. **Each was reproduced
+against that candidate first** with a deterministic fake FFmpeg — 13 of 13 reproduce there, 0 of 15
+on the fixed tree.
+
+**F1 — a failed, timed-out or cancelled decode left its partial WAV behind.** The cleanup list was
+appended to *after* a decode had succeeded and been validated, but FFmpeg creates its output the
+moment it starts writing. All four paths leaked, and an unexpected fault after the join left the
+master too, because the master was discarded only inside `except (PlaylistError, RenderCancelled)`.
+Every invocation-owned path is now registered **before** anything can create it, through a helper
+that registers and returns in one expression, and one `finally` with a success flag covers every
+terminal path. The function now catches **nothing at all**, which is both simpler and stronger: no
+exception of any type can be re-typed, so the `PlaylistInputError` / `PlaylistBuildError` split and
+`RenderCancelled`'s unchanged propagation are preserved by construction rather than by enumeration.
+The children are already reaped by `_run`'s own `finally`, which on Windows is the difference
+between a delete and a sharing violation.
+
+**F2 — "verified" sometimes meant "estimated".** When a WAV's `data` chunk sat past the bounded
+header read, the builder fell back to the source containers' durations, scaled them, and handed
+them to the render report as track boundaries. There is now a **second instrument**: for PCM the
+stream's `time_base` is `1/sample_rate`, so ffprobe's `duration_ts` *is* the sample count — no
+rounding — verified against a real 288 000-frame master, including a file whose header exceeded the
+bounded read. If neither instrument can measure an artifact the render is **refused**. The
+estimated branch is deleted rather than left unused. Separately, the render-admission freeze used
+to lose rows in silence: a malformed entry made a three-track queue render as two, and a 205-track
+queue rendered its first 200. The freeze now reports `submitted` / `usable` / `over_limit` and the
+gate refuses on any of them — the 200-track limit is still enforced, now **visibly**. And the
+identity validated by the preflight is re-checked at the **consumption boundary**, minutes later,
+so a track replaced while Stage 5 ran can no longer become part of the soundtrack unannounced.
+
+**F3 — Repeat Playlist could ask for a file that cannot exist.** The capacity check knew nothing
+about the repeat count and R10 has no capacity or format check of its own, so a 20-minute playlist
+at 30× passed every gate, wrote **10.4 GB past the 3.9 GB one-WAV ceiling**, and failed only on
+R10's own duration check *after* the write. The peak now counts all three artifacts that coexist —
+the playlist master, R10's copy of it and the repeated master, `(N + 2) × cycle` — against the real
+free space, and the format ceiling is checked against `N × cycle`. Two gates: an **estimate** before
+the decode so an impossible job costs nothing, and a **guaranteed** one from the measured cycle
+before R10 is handed the file. The verdict records which it was, so an estimated pass is never
+phrased as a promise. Refusals are actionable (`Lower the repeat count to 11x or less`) and the
+slider's read-out shows the same verdict before the operator commits. `music_repeater.py` is
+untouched: Single Track and Repeat Music behave exactly as before, and a 30× single-track render of
+a very long song keeps its pre-existing, now-documented exposure to the same ceiling.
+
+36/36 real-FFmpeg builder checks, 18/18 rendered measurements, 1 579 focused regression tests.
+
+### Added — 2026-11-28 (R16 Music Playlist Mode V1: several songs as one ordered soundtrack)
+
+Create Music Video can now take an **ordered playlist** instead of a single track and treat it as
+one continuous soundtrack for beat analysis, shot planning and rendering. **Single Track remains
+the default and is structurally the pre-R16 render.**
+
+**The architecture is one sentence: the playlist master simply *is* the music file.** The queued
+tracks are frozen at render admission, each is decoded to the canonical 48 kHz / stereo /
+`pcm_s24le` PCM, those runs are stream-copied into one soundtrack master, and `local_audio_path` is
+rebound to it — immediately before `analyze_beats_auto`. Everything downstream is unaware a
+playlist happened, which buys four things without a line of new code in any of them:
+
+- **Stages 1–5 run ONCE over the whole soundtrack** — one beat grid, one section pass, one cut
+  selection, one Stage-5 library.
+- **Repeat Playlist repeats the WHOLE ordered playlist**, settling the question R16's roadmap entry
+  deferred. R10's cycle has always been "whatever audio file you were handed", and by the time
+  `build_repeated_music` runs that file is the complete soundtrack. `music_repeat.py` and
+  `music_repeater.py` carry no playlist parameter, import or branch; the single change is an
+  optional `label` on `summary_line` so the panel can say `REPEAT PLAYLIST` when the control did.
+- **No playlist name reaches Stage-5 cache identity, a Qwen request, the prompt or a persisted
+  record.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and no cache payload gained a field.
+- **`video_processor.py` and `ffmpeg_processing.py` are untouched** — the frame-locked timeline is
+  derived from whichever audio file the renderer is handed.
+
+**Verification is the master's SAMPLE COUNT, not a tolerance.** The one-command concat *filter* was
+rejected for the reason `-stream_loop` was rejected for Repeat Music: it needs no intermediates and
+makes the result unmeasurable. Decoding each track separately means every track's contribution is a
+byte run whose frame count is a fact on disk, so the master's count must equal their **sum,
+exactly** — and the measured track boundaries in the render report are real offsets rather than a
+cumulative sum of container metadata. A header that cannot be parsed is a third answer
+(*unmeasured*), never a refusal, which is `frame_lock`'s rule restated.
+
+**Failure is loud and never partial.** The whole selection is validated before Stage 1 and the
+first unusable entry raises: a missing, moved, **replaced** (size/`mtime_ns` checked), empty,
+unsupported or undecodable track fails the render rather than yielding a shorter soundtrack, and an
+empty playlist in playlist mode is refused rather than falling back to the Single Track picker.
+`PlaylistInputError` → `SHARED_FATAL`, `PlaylistBuildError` → `UNKNOWN_FATAL`, and `RenderCancelled`
+propagates unchanged through both.
+
+**The UI** adds a Music Source radio, a read-only queue table, a position-valued selector and seven
+buttons — Add tracks (the native multi-select dialog, no upload and no copies), Remove, Move Up,
+Move Down, Shuffle, Sort by Name, Clear. Shuffle is an explicit **seeded, one-time** reorder
+performed on the press, so there is no randomisation anywhere on the render path; the seed is shown
+so an arrangement can be recreated. The repetition control is renamed to *Repeat Playlist* by a
+sibling heading rather than by writing the slider, which must stay a zero-writer widget.
+
+**Measured, end to end, with the real portable FFmpeg and a real browser:** single-track output is
+**frame-checksum identical to pristine `13cdfa48`** (`cd9f9bad…`, 150 frames, audio PCM
+`b79826cc…`); a 3-track playlist published 450 frames against a contract of 450 with video and
+audio 0.0 ms apart; voice landed in three windows past the first track; 2× produced
+**A B C A B C**, not A A B B C C; a browser-driven NVENC render published 551 of 551; a Variant Lab
+pair rendered byte-identical audio with different video; and a confirmed video source snapshot
+survived every playlist edit. 11,845+ tests pass. Full contract and every measurement:
+`.claude/rules/music-playlist.md`.
+
+**Not in V1, deliberately:** crossfades, DJ mixing, automatic loudness mastering, per-song repeat,
+and a CLI flag.
+
 ### Fixed — 2026-11-28 (Raw Cutter R4-D R2: three ways the disk-full protection was still telling the operator something untrue)
 
 A focused remediation pass over the R4-D candidate `45957e7c`, closing three findings. Each was
