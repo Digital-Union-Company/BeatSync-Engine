@@ -342,6 +342,18 @@ import audio_mixdown
 # pure/runtime split, same `session_dir` scratch ownership, same loud-failure discipline.
 from beatsync_fork import music_repeat as fork_music_repeat
 import music_repeater
+# [FORK] Digital-Union (R16 Music Playlist Mode V1): the two halves of "several songs, one ordered
+# soundtrack", in the same pure/runtime split and imported in the same place for the same reasons.
+# The pure one owns the Music Source control, the seven editing operations, the frozen identity and
+# every read-out; the runtime one owns the per-track decode, the single stream-copy join and the
+# sample-count verification that produces the temporary soundtrack master.
+#
+# The playlist master then simply IS "the music file" for everything downstream, which is why
+# neither `music_repeat.py` nor `music_repeater.py` needed a single change: R10's cycle is whatever
+# audio file it was handed, so a playlist master makes **Repeat Playlist repeat the whole ordered
+# playlist** by construction rather than by a new code path.
+from beatsync_fork import music_playlist as fork_playlist
+import music_playlist_builder
 
 #: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
 #: worker and the generator. It lives in `session_state` as ordinary render bookkeeping — the
@@ -2781,6 +2793,24 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        # new module, builds no file, rebuilds no array and takes exactly the
                        # statements it took before.
                        music_repeat: int = 1,
+                       # [FORK] Digital-Union (R16 Music Playlist Mode V1): the FROZEN ordered
+                       # soundtrack, as a plain tuple of `(path, size, mtime_ns, duration)` tuples,
+                       # resolved at the render boundary in `_process_video_guarded_unlocked`
+                       # exactly as the creative profile, both mix configs and the repeat count are.
+                       # Appended with the legacy default and placed BEFORE `lifecycle`, which the
+                       # cancellation seam requires to stay last.
+                       #
+                       # **Plain primitives, never a fork record** — the same discipline Freestyle's
+                       # eleven-value tuple follows, and for the same measured reason: several suites
+                       # AST-extract this function and execute it against a synthesised namespace in
+                       # which the fork modules do not exist.
+                       #
+                       # `()` is not a neutral value of a new code path -- it is the ONLY value for
+                       # which none of the playlist code below runs at all. Every statement this
+                       # feature adds sits behind `if playlist:` or `if playlist_master_path:`, so a
+                       # Single Track render resolves no new module, builds no file and takes exactly
+                       # the statements it took before.
+                       playlist: tuple = (),
                        # [FORK] Digital-Union (C3-R1A): appended LAST with a default, same reasoning.
                        # `None` preserves today's exact behaviour -- no boundary check anywhere
                        # below ever fires, and RENDER_OUTCOME_KEY is still written truthfully.
@@ -2802,6 +2832,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     # expression below reads. `None` on a 1x render, which is what keeps that expression resolve to
     # the original path OBJECT rather than to an equal copy of it.
     repeated_master_path = None
+    # [FORK] Digital-Union (R16 Music Playlist Mode V1): declared before the `try` for exactly the
+    # reasons the two above are -- the `finally` below discards it on every path, including the
+    # early returns -- and it doubles as the "was this a playlist render?" fact the report lines
+    # below read. `None` on a Single Track render, which is what keeps every added statement
+    # unreached and the legacy path structurally intact.
+    playlist_master_path = None
     # [FORK] Digital-Union (Smart Mix V1 / E): same lifetime, same reason — the success panel asks
     # afterwards whether any SFX was actually used.
     smart_mix_plan = None
@@ -2858,6 +2894,15 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     return None, '❌ Error: Could not access audio file', session_state
             else:
                 local_audio_path = session_state.get('local_audio_path')
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): in playlist mode there is no single
+        # `audio_file` to resolve -- the render audio is the soundtrack master built below from the
+        # frozen queue, and `local_audio_path` is bound to it there.
+        #
+        # This `elif` is the whole of the feature's intrusion into the primary-input block, and it
+        # resolves no module: it tests the truthiness of a plain tuple. A Single Track render reaches
+        # the identical `else` it always reached, with the identical message.
+        elif playlist:
+            local_audio_path = None
         else:
             session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
             return None, '❌ Error: No audio file selected', session_state
@@ -2878,8 +2923,41 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
             return None, '❌ Error: No video files selected', session_state
 
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the playlist preflight, deliberately
+        # HERE -- before the audio-existence check below, before the voice and SFX preflights, and
+        # a long way before Stage 1.
+        #
+        # It is the primary input, so it is validated first, and validating it is cheap: a `stat`
+        # and one short bounded ffprobe per queued track. No decoding happens yet. A missing, moved,
+        # replaced, empty or unsupported track is therefore reported in seconds rather than after
+        # minutes of analysis, and the expensive decode-and-join runs later, immediately before
+        # `analyze_beats_auto`.
+        #
+        # The WHOLE selection is validated and the first unusable entry raises --
+        # `prepare_playlist_tracks` never returns a subset. A four-track soundtrack for an operator
+        # who queued five is a plausible-looking render that silently dropped a song, which is
+        # exactly what `prepare_voice_inputs` refuses to do for voice.
+        #
+        # SHARED_FATAL, and proven: the frozen playlist is one of this handler's own submitted
+        # arguments, identical for every candidate of a C3 batch, and a candidate contributes only
+        # its output stem, seven creative values and three audio levels -- none of which is an input
+        # to "can this music file be reached". So every remaining candidate would fail identically.
+        playlist_tracks = ()
+        if playlist:
+            try:
+                playlist_tracks = music_playlist_builder.prepare_playlist_tracks(
+                    playlist, lifecycle=lifecycle)
+            except music_playlist_builder.PlaylistInputError as exc:
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
+                return None, f'❌ Music Playlist: {exc}', session_state
+
         # Verify files exist
-        if not local_audio_path or not os.path.exists(local_audio_path):
+        # [FORK] Digital-Union (R16): `not playlist and` is the only change. In playlist mode
+        # `local_audio_path` is deliberately still `None` at this point -- the soundtrack master it
+        # will name has not been built yet -- and the queued tracks have just been validated one by
+        # one above, with their own messages. A Single Track render evaluates `not ()` -> True and
+        # takes the identical check with the identical message.
+        if not playlist and (not local_audio_path or not os.path.exists(local_audio_path)):
              session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
              return None, f"❌ Error: Audio file is missing or inaccessible.", session_state
         if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
@@ -3008,6 +3086,87 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                           f"Nothing was rendered. Rename the output, or move the existing file, "
                           f"and run again."), session_state
 
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the ONE place several songs become one
+        # soundtrack, and it is deliberately the LAST thing before the analysis.
+        #
+        # Everything after this line is unaware that a playlist happened. `local_audio_path` is
+        # rebound to the soundtrack master, so `analyze_beats_auto` below receives the complete
+        # ordered soundtrack as its single music file -- one beat grid, one feature pass, one
+        # section pass, one cut selection and one Stage-5 library over the whole thing. That is the
+        # architecture, and three consequences follow from it:
+        #
+        #   * **Repeat Playlist repeats the WHOLE ordered playlist.** R10's `build_repeated_music`
+        #     below still receives `music_path=local_audio_path` and still measures its own cycle,
+        #     and that cycle is now the complete soundtrack. Neither `music_repeat.py` nor
+        #     `music_repeater.py` was changed, and neither needed to be.
+        #   * **Nothing about the playlist can reach Stage-5 cache identity, a Qwen request, the
+        #     prompt or a persisted record.** Stage 5 keys on the VIDEO sources; the music reaches
+        #     it only as the one audio file it has always received, and the playlist's order,
+        #     names and repeat count exist nowhere in that path. `CACHE_CONTRACT_VERSION` and
+        #     `ANALYSIS_VERSION` are untouched and no cache payload gained a field.
+        #   * **Voice, SFX and the frame-locked timeline need no playlist awareness**, because they
+        #     are all derived from the rendered audio file's own measured duration.
+        #
+        # It runs after the output-collision check on purpose: a render doomed by an occupied
+        # destination must not pay for a full decode first.
+        if playlist:
+            if event_callback is not None:
+                event_callback(ProgressEvent(
+                    stage=1, kind=EventKind.STATE,
+                    message=f"Preparing playlist soundtrack ({len(playlist_tracks)} tracks)",
+                    data={"phase": "music_playlist", "tracks": int(len(playlist_tracks))}))
+
+            def _playlist_track_progress(position, total, name):
+                """One STATE event per decoded track. No new stage, no new counter, no ETA."""
+                if event_callback is not None:
+                    event_callback(ProgressEvent(
+                        stage=1, kind=EventKind.STATE,
+                        message=f"Preparing playlist soundtrack: track {position}/{total} - {name}",
+                        data={"phase": "music_playlist", "track": int(position),
+                              "tracks": int(total)}))
+
+            try:
+                prepared_playlist = music_playlist_builder.build_playlist_master(
+                    tracks=playlist_tracks,
+                    session_dir=session_dir,
+                    lifecycle=lifecycle,
+                    on_track=_playlist_track_progress,
+                )
+            except music_playlist_builder.PlaylistInputError as exc:
+                # A statement about the operator's own files, frozen for the whole batch, so every
+                # remaining candidate fails identically: SHARED_FATAL, exactly as the preflight is.
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
+                return None, f'❌ Music Playlist: {exc}', session_state
+            except music_playlist_builder.PlaylistBuildError as exc:
+                # UNKNOWN_FATAL, and fail-closed on purpose -- the same reasoning Repeat Music's
+                # failure carries. A timeout, a non-zero FFmpeg, a missing or empty master or a
+                # sample-count mismatch on this render's OWN generated artifact is
+                # indistinguishable here from a broken binary or a full disk, and this repository
+                # has no structured FFmpeg diagnostic classification able to tell them apart.
+                # SHARED_FATAL would be a claim that every remaining candidate must fail, and a
+                # transient disk condition is not that.
+                #
+                # There is deliberately NO fallback to a shorter soundtrack and none to the Single
+                # Track picker: rendering four of five queued songs, or one unrelated track, is a
+                # plausible-looking result that silently ignored the request.
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
+                return None, f'❌ Music Playlist: {exc}', session_state
+            playlist_master_path = prepared_playlist.path
+            local_audio_path = prepared_playlist.path
+            if console_logger:
+                console_logger.line(
+                    f"Music Playlist: {prepared_playlist.describe()} "
+                    f"(prepared in {prepared_playlist.prepare_seconds:.1f}s"
+                    f"{'' if prepared_playlist.measured else ', boundaries estimated'})")
+            if event_callback is not None:
+                event_callback(ProgressEvent(
+                    stage=1, kind=EventKind.STATE,
+                    message=f"Playlist soundtrack ready: {prepared_playlist.describe()}",
+                    data={"phase": "music_playlist",
+                          "tracks": int(prepared_playlist.count),
+                          "total_seconds": float(prepared_playlist.total_seconds),
+                          "measured": bool(prepared_playlist.measured)}))
+
         selected_beats, beat_info = analyze_beats_auto(
             local_audio_path,
             use_gpu=use_gpu,
@@ -3091,6 +3250,18 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                           "cycle_seconds": float(repeated.cycle_seconds),
                           "total_seconds": float(repeated.total_seconds),
                           "planned_cuts": int(len(selected_beats))}))
+
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the playlist's own diagnostics record,
+        # placed on the bus AFTER the repeat extension so it survives
+        # `extend_beat_info`'s fresh containers. Reporting only -- nothing in Stage 4, Stage 5,
+        # Stage 6 or any cache reads this key, and `music_playlist.summary_line` is its one reader.
+        #
+        # The boundaries it carries are the **measured** sample offsets of the decoded PCM, which is
+        # the whole reason the preparation decodes each track separately. The repeat count is
+        # deliberately absent from it: the repeat is R10's own record, two lines above, and one fact
+        # with two independently-formatted views is how a panel starts disagreeing with itself.
+        if playlist_master_path:
+            beat_info[fork_playlist.BUS_KEY] = prepared_playlist.bus_record()
 
         beat_times = beat_info.get('times', selected_beats)
 
@@ -3462,8 +3633,28 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # Behind the same `repeated_master_path` guard as every other statement this feature adds,
         # so a 1x render resolves neither fork module; the LINE's content still comes only from the
         # bus, never from the guard.
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the ordered soundtrack and where each
+        # track actually begins in it, and ONLY when the render was a playlist render — a Single
+        # Track panel is character for character what it was.
+        #
+        # Read back off the bus the pipeline just returned, through the pure module's single
+        # reader/formatter, rather than from the queue widget or the frozen tuple: the panel must
+        # report what the render DID, and the measured track offsets are a fact only the prepared
+        # soundtrack knows. Nothing is recomputed, re-probed or re-derived here. It is placed BEFORE
+        # the repeat line so the panel reads in the order the audio was built — the playlist first,
+        # then how many times it played.
+        if playlist_master_path:
+            playlist_summary_text = fork_playlist.summary_line(beat_info)
+            if playlist_summary_text:
+                status_msg = f"{status_msg}\n\n{playlist_summary_text}"
         if repeated_master_path:
-            repeat_summary = fork_music_repeat.summary_line(beat_info)
+            # [FORK] R16: the panel names the control the operator actually used. The LABEL is the
+            # only thing that varies -- the arithmetic, the measured cycle and the total all still
+            # come from R10's one reader reading R10's one bus record, so there is no second
+            # formatter and no second authority on what the render did.
+            repeat_summary = fork_music_repeat.summary_line(
+                beat_info,
+                'REPEAT PLAYLIST' if playlist_master_path else 'REPEAT MUSIC')
             if repeat_summary:
                 status_msg = f"{status_msg}\n\n{repeat_summary}"
         # [FORK] Digital-Union (Audio Layers V1 / D): one concise line, and ONLY when voice was
@@ -3582,6 +3773,19 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # property instead of a value coincidence. The helper stays total for its CLI caller.
         if repeated_master_path:
             music_repeater.discard_repeated_master(repeated_master_path)
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the soundtrack master has the same
+        # lifetime and the same reasoning again — invocation-owned scratch in `session_dir`,
+        # discarded on success, on failure and on cancellation. The per-track decoded intermediates
+        # are removed by `build_playlist_master`'s own `finally`, so nothing it created outlives it.
+        # The operator's own music files are never touched, and nothing is ever written into their
+        # Media Library.
+        #
+        # Guarded rather than relying on the helper's own `if not path: return`, so that a Single
+        # Track render does not resolve this module at all: EVERY statement this feature adds to
+        # this function sits behind a playlist guard, which is what makes "Single Track is the legacy
+        # path" a structural property instead of a value coincidence.
+        if playlist_master_path:
+            music_playlist_builder.discard_playlist_master(playlist_master_path)
 
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
@@ -3603,6 +3807,13 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  # — a longer render is a longer render, not a different lifecycle. Placed before
                  # `lifecycle`, which the cancellation seam requires to stay last.
                  music_repeat: int = 1,
+                 # [FORK] Digital-Union (R16 Music Playlist Mode V1): the frozen ordered soundtrack
+                 # as plain primitives, threaded through untouched. This generator's worker thread,
+                 # its synchronous join on generator close, the render mutex and the concurrency
+                 # group are all unchanged — a soundtrack made of several files is still one audio
+                 # file by the time the pipeline sees it, not a different lifecycle. Placed before
+                 # `lifecycle`, which the cancellation seam requires to stay last.
+                 playlist: tuple = (),
                  # [FORK] Digital-Union (C3-R1A): appended last with a default, same reasoning.
                  # `None` preserves today's exact behaviour.
                  lifecycle: "RenderLifecycle | None" = None
@@ -3661,6 +3872,9 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     smart_mix=smart_mix,
                     freestyle=freestyle,
                     music_repeat=music_repeat,
+                    # [FORK] R16: the frozen ordered soundtrack, threaded through without
+                    # reinterpretation. `()` is a Single Track render.
+                    playlist=playlist,
                     lifecycle=lifecycle,
                 )
         except RenderCancelled:
@@ -3787,14 +4001,15 @@ SOURCE_MODE_VALUES = {
 }
 
 
-def _on_repeat_music_change(audio_file, repeat_value) -> str:
+def _on_repeat_music_change(audio_file, repeat_value, music_source=None,
+                            playlist_state=None) -> Tuple:
     """[FORK] Digital-Union (FUN R10 Repeat Music): the pre-render "03:30 x 5 = 17:30" read-out.
 
-    Writes **one** read-only Markdown and nothing else. It is deliberately not a source or
-    preparation handler: the music file is not a video source, so this cannot clear a confirmation,
+    Writes **two** read-only Markdowns and nothing else. It is deliberately not a source or
+    preparation handler: the music is not a video source, so this cannot clear a confirmation,
     disable Create Music Video, start a scan or touch Media Library Preparation — and it writes no
-    execution widget either, so it cannot change what a render would do. The slider itself remains
-    the only execution authority for the repeat count.
+    execution widget either, so it cannot change what a render would do. The slider, the Music
+    Source radio and the playlist `gr.State` remain the only execution authorities.
 
     The duration is probed, never guessed. `music_repeater.probe_duration` raises rather than
     answering a fallback, and that is exactly what is wanted here: an unreadable file yields `None`
@@ -3803,9 +4018,28 @@ def _on_repeat_music_change(audio_file, repeat_value) -> str:
     must never be the thing that breaks the Render tab — and the probe is one short bounded ffprobe
     read of a file the operator just selected.
 
-    Totality is the pure module's job: `estimate_markdown` handles `None`, 1x and 2x..30x itself,
+    Totality is the pure modules' job: `estimate_markdown` handles `None`, 1x and 2x..30x itself,
     so there is no formatting logic here.
+
+    [FORK] Digital-Union (R16 Music Playlist Mode V1): it is now **mode-aware, and it is the one
+    read-out function for both modes** — which is why the playlist editing handlers below call it
+    rather than formatting an estimate of their own. In playlist mode the slider's own name changes
+    to *Repeat Playlist* and the arithmetic is the whole queue's, so:
+
+    * no file is probed at all — every queued track's length was measured when it was added, and
+      re-probing a 40-track playlist on every slider nudge would be a visible stall for a number
+      already known;
+    * the estimate names the playlist and states explicitly that the **whole** playlist repeats,
+      because "Repeat 3x" over five songs has two readings and only one of them is this feature.
+
+    `music_source` and `playlist_state` default to `None` so every existing direct caller — and
+    every test that calls this with two arguments — stays valid, and `normalize_mode(None)` resolves
+    to Single Track, which is the safe answer.
     """
+    # [FORK] R16: in playlist mode the lengths are already known, so nothing is probed.
+    if fork_playlist.is_playlist(music_source):
+        return (fork_playlist.repeat_estimate_markdown(playlist_state, repeat_value),
+                fork_playlist.summary_markdown(playlist_state))
     duration = None
     path = _as_existing_source_path(audio_file)
     if path:
@@ -3813,7 +4047,234 @@ def _on_repeat_music_change(audio_file, repeat_value) -> str:
             duration = music_repeater.probe_duration(path)
         except Exception:
             duration = None
-    return fork_music_repeat.estimate_markdown(duration, repeat_value)
+    # The playlist queue is rendered even in Single Track mode, because the panel holding it is
+    # merely hidden rather than emptied: switching back to Playlist must show the queue the
+    # operator left there, not a blank one.
+    return (fork_music_repeat.estimate_markdown(duration, repeat_value),
+            fork_playlist.summary_markdown(playlist_state))
+
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (R16 Music Playlist Mode V1): the playlist queue handlers.
+#
+# All seven operations are **pure** — `beatsync_fork.music_playlist` owns every one of them, and
+# these functions do nothing but project the result onto the five widgets the panel writes. The one
+# exception is Add tracks, which has to open a dialog; that too is delegated, to
+# `desktop_folders.pick_files`, so `gui.py` gains no `subprocess` call site (two suites pin that
+# count at two).
+#
+# Four invariants hold across every one of them:
+#
+#   * **The `gr.State` is written together with everything that reads it.** The queue, its table,
+#     the selector's choices, the notice and the repeat estimate are returned as ONE tuple, for the
+#     same reason `_cut_handoff` returns the record and the button that offers it together: writing
+#     them separately is how a selection outlives the rows it points at.
+#   * **The selection is returned, not preserved.** Removing or reordering rows invalidates the
+#     positions the operator had selected, so the pure operation says what the new selection is and
+#     a stale one can never make the next press act on the wrong track.
+#   * **They write no video-source or preparation widget**, and no execution widget other than the
+#     playlist state itself — so editing the soundtrack cannot clear a confirmed video source set.
+#   * **Nothing here reads the disk except Add tracks**, which `stat`s and probes only the files the
+#     operator just chose.
+# ---------------------------------------------------------------------------------------------
+
+
+def _playlist_frame(playlist, selection, notice, audio_file, repeat_value) -> Tuple:
+    """The one projection every playlist handler returns, in `playlist_outputs` order.
+
+    `(playlist_state, playlist_summary, playlist_selected, playlist_notice, repeat_music_estimate)`.
+    The estimate comes from `_on_repeat_music_change`, so there is exactly one place in the app that
+    decides what a repeat count means for a queue.
+    """
+    entries = fork_playlist.entries_of(playlist)
+    estimate, summary = _on_repeat_music_change(
+        audio_file, repeat_value, fork_playlist.MODE_PLAYLIST, entries)
+    return (entries,
+            summary,
+            gr.update(choices=fork_playlist.choice_labels(playlist),
+                      value=list(selection or ())),
+            notice or '',
+            estimate)
+
+
+def _playlist_probe_chosen(paths) -> Tuple:
+    """`(entries, skipped)` — the identity and length of each newly chosen file.
+
+    Measured **now**, when the operator chooses the file, for two reasons. The length is needed for
+    the queue's table and the soundtrack total, and it is the only moment at which probing is free:
+    the alternative is probing the whole queue on every slider nudge. And the size/`mtime_ns`
+    captured here is what `prepare_playlist_tracks` compares against at render time, which is how a
+    file *replaced* between queueing and rendering is reported rather than silently rendered.
+
+    A file that cannot be stat'ed, is empty, is of an unsupported type or cannot be probed is
+    **skipped and counted** rather than queued with an invented length — and the notice says how
+    many, because a silently shorter playlist than the operator selected is the exact failure this
+    feature refuses at render time too.
+    """
+    entries: list = []
+    skipped = 0
+    for raw in paths or ():
+        path = raw if isinstance(raw, str) else ''
+        if not path or not fork_playlist.has_supported_extension(path):
+            skipped += 1
+            continue
+        try:
+            stat = os.stat(path)
+        except OSError:
+            skipped += 1
+            continue
+        if not os.path.isfile(path) or stat.st_size <= 0:
+            skipped += 1
+            continue
+        try:
+            duration = music_playlist_builder.probe_duration(path)
+        except Exception:                          # noqa: BLE001 - a bad file is skipped, not fatal
+            skipped += 1
+            continue
+        entries.append((path, int(stat.st_size), int(stat.st_mtime_ns), float(duration)))
+    return tuple(entries), skipped
+
+
+def _on_playlist_add(playlist_state, audio_file, repeat_value) -> Tuple:
+    """Add tracks: one native multi-select dialog, then append in filename order.
+
+    The dialog is the same machinery every folder field in this app uses, and its contract is the
+    same: cancel, timeout and any failure to show it all leave the queue **exactly** as it was, so
+    pressing Add tracks can only ever add. Nothing is uploaded and nothing is copied — the queue
+    holds the operator's own absolute paths, which is also what keeps a 40-track playlist from
+    filling Gradio's upload scratch.
+    """
+    current = fork_playlist.playlist_from_entries(playlist_state)
+    if current.count >= fork_playlist.MAX_TRACKS:
+        return _playlist_frame(current, (),
+                               PLAYLIST_NOTICE_FULL.format(limit=fork_playlist.MAX_TRACKS),
+                               audio_file, repeat_value)
+    # Reopen where the operator last was: the folder of the track they added most recently, else
+    # the folder of whatever Single Track file is loaded. Deliberately NOT a saved folder
+    # preference — none of the nine is a music-source folder, and borrowing one would make a
+    # Settings value quietly decide where this dialog opens.
+    start = (current.tracks[-1].path if current.count
+             else (_as_existing_source_path(audio_file) or ''))
+    try:
+        status, chosen = fork_folders.pick_files(
+            start or None,
+            filter_text=fork_folders.file_filter(
+                'Music', fork_playlist.SUPPORTED_TRACK_EXTENSIONS))
+    except Exception:                              # noqa: BLE001 - browsing is never fatal
+        return _playlist_frame(current, (), PLAYLIST_NOTICE_PICKER_UNAVAILABLE,
+                               audio_file, repeat_value)
+    if status != fork_folders.PICKED or not chosen:
+        notice = (PLAYLIST_NOTICE_CANCELLED if status == fork_folders.CANCELLED
+                  else PLAYLIST_NOTICE_PICKER_UNAVAILABLE)
+        return _playlist_frame(current, (), notice, audio_file, repeat_value)
+
+    entries, skipped = _playlist_probe_chosen(chosen)
+    updated = fork_playlist.add_tracks(current, entries)
+    added = updated.count - current.count
+    lines = [PLAYLIST_NOTICE_ADDED.format(added=added, chosen=len(chosen))]
+    if skipped:
+        lines.append(PLAYLIST_NOTICE_SKIPPED.format(skipped=skipped))
+    if updated.count >= fork_playlist.MAX_TRACKS:
+        lines.append(PLAYLIST_NOTICE_FULL.format(limit=fork_playlist.MAX_TRACKS))
+    return _playlist_frame(updated, (), ' '.join(lines), audio_file, repeat_value)
+
+
+def _on_playlist_remove(playlist_state, selection, audio_file, repeat_value) -> Tuple:
+    """Remove the selected tracks. Nothing on disk is deleted — this is a queue, not a library."""
+    current = fork_playlist.playlist_from_entries(playlist_state)
+    updated, new_selection = fork_playlist.remove_tracks(current, selection)
+    removed = current.count - updated.count
+    notice = (f"Removed {removed} track(s) from the playlist. No files were deleted."
+              if removed else PLAYLIST_NOTICE_NOTHING_SELECTED)
+    return _playlist_frame(updated, new_selection, notice, audio_file, repeat_value)
+
+
+def _on_playlist_move_up(playlist_state, selection, audio_file, repeat_value) -> Tuple:
+    """Move the selected tracks one position earlier. The selection follows them."""
+    current = fork_playlist.playlist_from_entries(playlist_state)
+    updated, new_selection = fork_playlist.move_up(current, selection)
+    if not new_selection:
+        return _playlist_frame(current, (), PLAYLIST_NOTICE_NOTHING_SELECTED,
+                               audio_file, repeat_value)
+    notice = '' if updated.as_entries() != current.as_entries() else PLAYLIST_NOTICE_AT_TOP
+    return _playlist_frame(updated, new_selection, notice, audio_file, repeat_value)
+
+
+def _on_playlist_move_down(playlist_state, selection, audio_file, repeat_value) -> Tuple:
+    """Move the selected tracks one position later. The selection follows them."""
+    current = fork_playlist.playlist_from_entries(playlist_state)
+    updated, new_selection = fork_playlist.move_down(current, selection)
+    if not new_selection:
+        return _playlist_frame(current, (), PLAYLIST_NOTICE_NOTHING_SELECTED,
+                               audio_file, repeat_value)
+    notice = '' if updated.as_entries() != current.as_entries() else PLAYLIST_NOTICE_AT_BOTTOM
+    return _playlist_frame(updated, new_selection, notice, audio_file, repeat_value)
+
+
+def _on_playlist_shuffle(playlist_state, audio_file, repeat_value) -> Tuple:
+    """Shuffle **once**, now, with a freshly minted recorded seed.
+
+    This is the owner's explicit requirement and it is structural rather than careful: the shuffled
+    order is written straight into the queue the operator is looking at, and the render freezes
+    whatever is in that queue. There is no randomisation anywhere on the render path, and the seed
+    is in the notice so an arrangement worth keeping can be recreated.
+
+    The seed comes from the existing `variation.random_seed()` — the one place in this app that
+    mints one — so the playlist introduces no second source of randomness.
+    """
+    current = fork_playlist.playlist_from_entries(playlist_state)
+    if current.count < 2:
+        # Two different facts, so two different sentences: an empty queue has nothing to shuffle,
+        # and a one-track queue has only one order. Neither is "nothing was selected" -- Shuffle
+        # takes no selection at all, and saying so would send the operator to the wrong control.
+        return _playlist_frame(current, (),
+                               PLAYLIST_NOTICE_SHUFFLE_TOO_SHORT if current.count
+                               else PLAYLIST_NOTICE_SHUFFLE_EMPTY,
+                               audio_file, repeat_value)
+    seed = fork_variation.random_seed()
+    updated, new_selection = fork_playlist.shuffle(current, seed)
+    return _playlist_frame(updated, new_selection,
+                           PLAYLIST_NOTICE_SHUFFLED.format(seed=seed),
+                           audio_file, repeat_value)
+
+
+def _on_playlist_sort(playlist_state, audio_file, repeat_value) -> Tuple:
+    """Sort by name: stable, case-insensitive, filename first."""
+    current = fork_playlist.playlist_from_entries(playlist_state)
+    updated, new_selection = fork_playlist.sort_by_name(current)
+    return _playlist_frame(updated, new_selection, PLAYLIST_NOTICE_SORTED,
+                           audio_file, repeat_value)
+
+
+def _on_playlist_clear(audio_file, repeat_value) -> Tuple:
+    """Empty the queue. Nothing on disk is touched."""
+    updated, new_selection = fork_playlist.clear()
+    return _playlist_frame(updated, new_selection, PLAYLIST_NOTICE_CLEARED,
+                           audio_file, repeat_value)
+
+
+def _on_music_source_change(music_source, playlist_state, audio_file, repeat_value) -> Tuple:
+    """Switch between Single Track and Playlist: show one panel, hide the other, rename the control.
+
+    Writes the two panels' visibility, the repetition control's **heading**, and the two read-outs.
+    It deliberately writes neither `audio_input` nor `playlist_state`: switching modes must not
+    discard the music the operator already chose in the other one, so both are kept and only one is
+    shown.
+
+    The heading is a separate `gr.Markdown` and the slider carries `show_label=False` — the same
+    pattern the Video Source radio already uses, and for the same reason. The slider's own `label=`
+    constant is still passed, so assistive technology and every test that reads it are unaffected,
+    and the slider itself stays a **zero-writer** widget: no handler in this app may write the
+    control whose value decides how long the video is.
+    """
+    playlist_mode = fork_playlist.is_playlist(music_source)
+    estimate, summary = _on_repeat_music_change(
+        audio_file, repeat_value, music_source, playlist_state)
+    return (gr.update(visible=not playlist_mode),
+            gr.update(visible=playlist_mode),
+            HEADING_REPEAT_PLAYLIST if playlist_mode else HEADING_REPEAT_MUSIC,
+            estimate,
+            summary)
 
 
 def _source_ui_updates(state) -> Tuple:
@@ -4921,6 +5382,27 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # default that dereferences a real module raises at def-time. A
                                     # test pins the literal equal to the real constant.
                                     repeat_music=1,
+                                    # [FORK] Digital-Union (R16 Music Playlist Mode V1): the LIVE
+                                    # Music Source radio and the LIVE playlist queue, appended after
+                                    # R10's count with legacy defaults, for the identical reason --
+                                    # nothing is inserted, so no pre-existing positional index moves
+                                    # and a caller that omits them renders exactly as it did before.
+                                    #
+                                    # They are *live* values for the same reason the source controls
+                                    # are: Gradio delivers widget changes as separate queued events,
+                                    # so a click must act on the soundtrack the operator is currently
+                                    # declaring rather than on a `gr.State` that may lag it.
+                                    #
+                                    # STRING and TUPLE literals rather than
+                                    # `fork_playlist.MODE_SINGLE` / `fork_playlist.EMPTY`, for the
+                                    # same measured reason `voice_overflow`'s default is the literal
+                                    # `'strict'` and `repeat_music`'s is the literal `1`: several
+                                    # suites AST-extract this function and exec it against a
+                                    # synthesised namespace where the fork modules are stubs, so a
+                                    # default that dereferenced a real module raises at def-time.
+                                    # Tests pin both literals equal to the real constants.
+                                    music_source: str = 'single',
+                                    playlist_state=(),
                                     lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -5073,6 +5555,42 @@ def _process_video_guarded_unlocked(audio_file: str,
     if repeat_music != 1:
         music_repeat = fork_music_repeat.normalize_repeat(repeat_music)
 
+    # [FORK] Digital-Union (R16 Music Playlist Mode V1): **the render-admission freeze.** The
+    # ordered soundtrack is captured HERE, once, at the same render boundary the creative profile,
+    # both mix configs and the repeat count are resolved at — so nothing downstream ever sees a live
+    # widget value, and an operator who reorders the queue while a render or a Variant Lab batch is
+    # running cannot reach it.
+    #
+    # The `!= 'single'` pre-check is the explicit legacy branch this repository prefers over "the new
+    # code with a neutral value" — at exactly `single` nothing is resolved, nothing is frozen and
+    # the value threaded onward is the empty tuple. Every other value, valid or malformed, goes
+    # through the ONE normaliser inside `freeze_entries`, which answers `()` for anything that is not
+    # a playlist declaration, so there is no second interpretation of what Music Source means.
+    #
+    # Like the creative controls, the audio levels and the repeat count this is a render-request
+    # input and NOT video source identity: neither widget is wired into a source or preparation
+    # handler, so changing the playlist cannot clear a confirmed video source set, start a scan or
+    # touch Media Library Preparation. The converse also holds and is the point of the split —
+    # editing the playlist DOES invalidate the audio-dependent read-outs, because those are written
+    # by the playlist handlers themselves.
+    playlist = ()
+    if music_source != 'single':
+        playlist = fork_playlist.freeze_entries(music_source, playlist_state)
+        if not playlist:
+            # Playlist mode armed with an empty queue. A refusal, never a silent fall back to the
+            # Single Track picker -- which would render music the operator did not ask for, or
+            # nothing at all, without saying which. It happens BEFORE `RENDER_STARTED_KEY` is set,
+            # so a refused click raises no desktop notification, exactly as a source-gate refusal
+            # does not.
+            #
+            # SHARED_FATAL: the gate's inputs here are this handler's own submitted arguments,
+            # frozen and identical for every candidate of a C3 batch, and no candidate recipe can
+            # put a track in an empty playlist.
+            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
+            yield (None, f"❌ {fork_playlist.EMPTY_PLAYLIST_MESSAGE}", session_state,
+                   '', '', invocation_id)
+            return
+
     # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): `process_video` keeps its
     # existing 3-value streaming contract — video, status, session_state — and this handler projects
     # each yield onto the five Gradio outputs by appending the two read-outs that
@@ -5108,6 +5626,8 @@ def _process_video_guarded_unlocked(audio_file: str,
         smart_mix=smart_mix,
         freestyle=freestyle,
         music_repeat=music_repeat,
+        # [FORK] R16: the frozen ordered soundtrack. `()` is a Single Track render.
+        playlist=playlist,
         lifecycle=lifecycle,
     )
     try:
@@ -6351,6 +6871,18 @@ def process_video_guarded(audio_file: str,
                           # not assumed: the first draft used the constant and took that suite down.
                           # A test pins the literal equal to the real constant so it cannot drift.
                           repeat_music=1,
+                          # [FORK] Digital-Union (R16 Music Playlist Mode V1): the live Music Source
+                          # radio and the live playlist queue, appended last, same discipline again —
+                          # so every pre-existing positional index in the
+                          # `process_btn.click(inputs=...)` contract is unchanged.
+                          #
+                          # A STRING literal and a TUPLE literal, not `fork_playlist.MODE_SINGLE` /
+                          # `fork_playlist.EMPTY`, for the reason `repeat_music`'s integer literal
+                          # records: this body is AST-extracted and exec'd against namespaces in
+                          # which the fork modules are stubs. Tests pin both equal to the real
+                          # constants so they cannot drift.
+                          music_source: str = 'single',
+                          playlist_state=(),
                           # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser
                           # session, INJECTED by Gradio rather than submitted. It is appended last
                           # with a default, so no pre-existing positional index moves, and it is
@@ -6426,6 +6958,10 @@ def process_video_guarded(audio_file: str,
             voice_overflow=voice_overflow,
             # [FORK] FUN R10: the live Repeat Music value, normalised inside the core.
             repeat_music=repeat_music,
+            # [FORK] R16: the live Music Source and playlist queue, frozen inside the core at the
+            # same boundary — so this wrapper adds no second interpretation of either.
+            music_source=music_source,
+            playlist_state=playlist_state,
         )
         # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
         # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
@@ -6519,6 +7055,21 @@ def render_selected_variants_guarded(
         # `fork_music_repeat` would raise at def-time. A test pins it equal to
         # `music_repeat.DEFAULT_REPEAT`.
         repeat_music=1,
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the Music Source and the playlist
+        # queue, appended LAST with legacy defaults so no existing positional index moves. They are
+        # threaded here as well as into the single-render path on purpose: a soundtrack is *shared
+        # render intent*, exactly like the audio file, the source set, the encoder, the output
+        # profile and the repeat count — not a candidate value. So they are read from THIS handler's
+        # own submitted arguments once, before the candidate loop, and never from a `CreativeRecipe`
+        # or an `AudioRecipe`. Every selected candidate therefore renders the **same** soundtrack in
+        # the **same** order while keeping its own creative settings, and an operator who reorders
+        # the playlist mid-batch cannot reach candidate 3. Comparing candidates is only meaningful
+        # when the thing that differs between them is their creative settings.
+        #
+        # Literals for the same def-time reason `voice_overflow` and `repeat_music` carry literals;
+        # tests pin both equal to the real constants.
+        music_source: str = 'single',
+        playlist_state=(),
         # [FORK] Digital-Union (R17-A Desktop Notifications): the owning browser session, injected
         # by Gradio and appended LAST with a default, exactly as on the single-render wrapper and
         # for the same reasons -- no pre-existing positional index moves, it is absent from the
@@ -6648,6 +7199,13 @@ def render_selected_variants_guarded(
                         # slider had drifted to would make the comparison meaningless — the whole
                         # point of comparing candidates is that only the creative settings differ.
                         repeat_music=repeat_music,
+                        # [FORK] R16: this handler's OWN frozen arguments, never a recipe field. A
+                        # batch that rendered candidate 1 over a five-track playlist and candidate 2
+                        # over whatever the queue had drifted to would make the comparison
+                        # meaningless — the whole point of comparing candidates is that only the
+                        # creative settings differ.
+                        music_source=music_source,
+                        playlist_state=playlist_state,
                         lifecycle=lifecycle)
             try:
                 for video, status, state, _a_report, _s_report, _invocation_id in candidate_stream:
@@ -14622,6 +15180,18 @@ def create_ui() -> gr.Blocks:
         # or anything carrying `MappingProxyType` could not live here. A test walks the whole object
         # graph and asserts `copy.deepcopy(proposal) == proposal`.
         director_proposal_state = gr.State(None)
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the ordered soundtrack awaiting a
+        # render, and nothing else. Its value is a tuple of `(path, size, mtime_ns, duration)`
+        # tuples — plain strings, ints and floats, which is a contract rather than a nicety:
+        # Gradio deep-copies state, so a `Playlist` record (or anything carrying
+        # `MappingProxyType`) could not live here, and the same shape is what crosses into
+        # `_process_video_impl` unchanged.
+        #
+        # It is a render-request input, not video-source identity: it is absent from
+        # `source_outputs`, `prep_outputs`, `live_declaration` and every source and preparation
+        # handler, so editing the playlist cannot clear a confirmed video source set or start a
+        # scan. Its readers are the two render events and the playlist panel's own handlers.
+        playlist_state = gr.State(())
 
         # [FORK] Digital-Union (R17-A Desktop Notifications): the one hidden channel from a
         # finished job to the browser. It carries a compact JSON envelope of notifications for
@@ -14678,23 +15248,115 @@ def create_ui() -> gr.Blocks:
                             # Wider: it holds a drop zone and a file path.
                             with gr.Column(scale=3):
                                 gr.Markdown('### 📁 Input Files')
-                                # [FORK] R8 Final Polish: the music track, in a third of the
-                                # height. `height=` bounds the drop zone instead of letting it
-                                # claim the default ~190 px for a single-file control -- measured
-                                # as the largest block above Create Music Video that was not a
-                                # setting. Drag-and-drop is unchanged, and so are the component,
-                                # its `elem_id`, its `type` and every handler that names it.
+                                # [FORK] Digital-Union (R16 Music Playlist Mode V1): what the main
+                                # soundtrack is made of. Placed FIRST in the Input Files block,
+                                # above the two music controls it chooses between, because it
+                                # decides which of them the operator is looking at.
                                 #
-                                # A native Browse button was ALSO built here and reverted: a
-                                # `gr.File` refuses to display a path outside Gradio's allowed
-                                # roots, and the three ways around that each cost more than the
-                                # button is worth. The measurement, the exact exception and the
-                                # rejected options are in `tests/test_render_music_input.py`.
-                                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', height=110, elem_id='audio-file-input')
+                                # Single Track is the value, the default and the pre-R16 render.
+                                # `(label, value)` choices so the stored value IS the internal mode
+                                # name — the same convention `voice_overflow` and `sfx_roles` use —
+                                # so no mapping table stands between the widget and
+                                # `music_playlist.normalize_mode`.
+                                music_source = gr.Radio(
+                                    choices=[
+                                        (CHOICE_MUSIC_SINGLE, fork_playlist.MODE_SINGLE),
+                                        (CHOICE_MUSIC_PLAYLIST, fork_playlist.MODE_PLAYLIST),
+                                    ],
+                                    value=fork_playlist.DEFAULT_MODE,
+                                    label=LABEL_MUSIC_SOURCE,
+                                    info=INFO_MUSIC_SOURCE,
+                                    elem_id='music-source-radio',
+                                )
+                                # [FORK] R16: the Single Track picker is unchanged — same
+                                # component, same `elem_id`, same `type`, same `file_types`, same
+                                # bounded height, same handlers. It is only *wrapped* so the two
+                                # modes can be shown one at a time, and it is never emptied when
+                                # hidden: switching to Playlist and back must not discard the track
+                                # the operator already chose.
+                                with gr.Group(visible=True) as single_track_group:
+                                    # [FORK] R8 Final Polish: the music track, in a third of the
+                                    # height. `height=` bounds the drop zone instead of letting it
+                                    # claim the default ~190 px for a single-file control --
+                                    # measured as the largest block above Create Music Video that
+                                    # was not a setting. Drag-and-drop is unchanged, and so are the
+                                    # component, its `elem_id`, its `type` and every handler that
+                                    # names it.
+                                    #
+                                    # A native Browse button was ALSO built here and reverted: a
+                                    # `gr.File` refuses to display a path outside Gradio's allowed
+                                    # roots, and the three ways around that each cost more than the
+                                    # button is worth. The measurement, the exact exception and the
+                                    # rejected options are in `tests/test_render_music_input.py`.
+                                    # (R16's Add tracks button is **not** a revival of that: it
+                                    # writes a `gr.State` of absolute paths, never this `gr.File`,
+                                    # so the measured limitation does not apply to it.)
+                                    audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', height=110, elem_id='audio-file-input')
+                                # [FORK] Digital-Union (R16 Music Playlist Mode V1): the ordered
+                                # soundtrack, hidden until Music Source says Playlist.
+                                #
+                                # A read-only Markdown table plus a multi-select Dropdown, rather
+                                # than an editable `gr.Dataframe`: the table occupies no input slot
+                                # the operator could type into, so `playlist_state` beside it stays
+                                # the only authority on what the soundtrack is, and the Dropdown's
+                                # VALUES are positions rather than names — which is what lets the
+                                # same song appear twice and still be reordered unambiguously.
+                                with gr.Group(visible=False) as playlist_group:
+                                    playlist_summary = gr.Markdown(
+                                        PLAYLIST_SUMMARY_INITIAL,
+                                        elem_id='playlist-summary',
+                                    )
+                                    playlist_selected = gr.Dropdown(
+                                        choices=[], value=[], multiselect=True,
+                                        type='value',
+                                        label=LABEL_PLAYLIST_SELECTED,
+                                        info=INFO_PLAYLIST_SELECTED,
+                                        elem_id='playlist-selected',
+                                    )
+                                    with gr.Row():
+                                        playlist_add_btn = gr.Button(
+                                            LABEL_PLAYLIST_ADD, variant='secondary', size='sm',
+                                            elem_id='playlist-add')
+                                        playlist_remove_btn = gr.Button(
+                                            LABEL_PLAYLIST_REMOVE, variant='secondary', size='sm',
+                                            elem_id='playlist-remove')
+                                    with gr.Row():
+                                        playlist_up_btn = gr.Button(
+                                            LABEL_PLAYLIST_UP, variant='secondary', size='sm',
+                                            elem_id='playlist-up')
+                                        playlist_down_btn = gr.Button(
+                                            LABEL_PLAYLIST_DOWN, variant='secondary', size='sm',
+                                            elem_id='playlist-down')
+                                    with gr.Row():
+                                        playlist_shuffle_btn = gr.Button(
+                                            LABEL_PLAYLIST_SHUFFLE, variant='secondary', size='sm',
+                                            elem_id='playlist-shuffle')
+                                        playlist_sort_btn = gr.Button(
+                                            LABEL_PLAYLIST_SORT, variant='secondary', size='sm',
+                                            elem_id='playlist-sort')
+                                        playlist_clear_btn = gr.Button(
+                                            LABEL_PLAYLIST_CLEAR, variant='secondary', size='sm',
+                                            elem_id='playlist-clear')
+                                    playlist_notice = gr.Markdown(
+                                        PLAYLIST_NOTICE_INITIAL,
+                                        elem_id='playlist-notice',
+                                    )
                                 # [FORK] Digital-Union (FUN R10 Repeat Music): directly below the
-                                # Audio File control it modifies, because it is a property of the
+                                # music controls it modifies, because it is a property of the
                                 # MUSIC and not of the video settings in the next column.
                                 #
+                                # [FORK] R16: the heading is its own Markdown and the slider carries
+                                # `show_label=False`, so the ONE control can be named *Repeat Music*
+                                # or *Repeat Playlist* without any handler ever writing the slider
+                                # itself — which must stay a zero-writer widget, because the value
+                                # that decides how long the video is is the operator's alone. This
+                                # is exactly the pattern the Video Source radio below already uses:
+                                # the `label=` constant is still passed, so assistive technology and
+                                # every test that reads it are unaffected.
+                                repeat_music_heading = gr.Markdown(
+                                    HEADING_REPEAT_MUSIC,
+                                    elem_id='repeat-music-heading',
+                                )
                                 # A `gr.Slider` with `step=1` rather than a `gr.Number`: the range
                                 # is small, closed and fully meaningful end to end, so dragging is
                                 # the natural gesture and no value outside 1..30 can be typed in
@@ -14708,6 +15370,7 @@ def create_ui() -> gr.Blocks:
                                     step=1,
                                     value=fork_music_repeat.DEFAULT_REPEAT,
                                     label=LABEL_REPEAT_MUSIC,
+                                    show_label=False,
                                     info=INFO_REPEAT_MUSIC,
                                     elem_id='repeat-music-slider',
                                 )
@@ -17945,6 +18608,12 @@ def create_ui() -> gr.Blocks:
                 # from this click and never from a candidate recipe. Comparing candidates is only
                 # meaningful when the thing that differs between them is their creative settings.
                 repeat_music,
+                # [FORK] Digital-Union (R16 Music Playlist Mode V1): appended after the repeat
+                # count, in both the click list and the handler signature together, for the
+                # identical reason. The soundtrack is shared render intent: every selected
+                # candidate renders the SAME playlist in the SAME order, frozen from this click, so
+                # an operator who reorders the queue mid-batch cannot reach candidate 3.
+                music_source, playlist_state,
             ],
             outputs=[video_output, status_output, session_state, render_batch_summary,
                      render_invocation_state],
@@ -18222,15 +18891,102 @@ def create_ui() -> gr.Blocks:
         # delivering it.
         repeat_music.change(
             fn=_on_repeat_music_change,
-            inputs=[audio_input, repeat_music],
-            outputs=[repeat_music_estimate],
+            inputs=[audio_input, repeat_music, music_source, playlist_state],
+            outputs=[repeat_music_estimate, playlist_summary],
             show_progress='hidden',
             concurrency_limit=None,
         )
         audio_input.change(
             fn=_on_repeat_music_change,
+            inputs=[audio_input, repeat_music, music_source, playlist_state],
+            outputs=[repeat_music_estimate, playlist_summary],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+
+        # [FORK] Digital-Union (R16 Music Playlist Mode V1): the Music Source switch and the seven
+        # playlist editing operations.
+        #
+        # What every one of them writes, and nothing else:
+        #
+        #   music_source.change       the two panels' visibility, the repetition control's HEADING,
+        #                             and the two read-outs -- never `audio_input`, never
+        #                             `playlist_state`, so switching modes cannot discard the music
+        #                             the operator already chose in the other one
+        #   the seven buttons         `playlist_outputs` -- the queue, its table, the selector, the
+        #                             notice and the repeat estimate, as ONE tuple
+        #
+        # What none of them writes: `repeat_music` (a zero-writer widget, by rule), `audio_input`,
+        # any video-source or preparation widget, `source_state`, `prep_state`, `status_output` or
+        # any creative control. Editing the soundtrack therefore cannot clear a confirmed video
+        # source set, start a scan, or change any creative setting -- while it DOES invalidate every
+        # audio-dependent read-out, because these handlers are the ones that write them.
+        #
+        # No `concurrency_id` on any of them, for the same measured S2-A R3 reason: none is a render
+        # and none may queue behind one. Add tracks opens a modal dialog whose wait is bounded at
+        # `desktop_folders.PICKER_TIMEOUT_SECONDS`, which is why it is the only one of the eight
+        # that is not instantaneous.
+        music_source.change(
+            fn=_on_music_source_change,
+            inputs=[music_source, playlist_state, audio_input, repeat_music],
+            outputs=[single_track_group, playlist_group, repeat_music_heading,
+                     repeat_music_estimate, playlist_summary],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+
+        #: The one projection every playlist button writes, in `_playlist_frame`'s own order.
+        #: Gradio matches by position, so this list and that function's return tuple are one
+        #: contract -- a test pins them together.
+        playlist_outputs = [playlist_state, playlist_summary, playlist_selected,
+                            playlist_notice, repeat_music_estimate]
+
+        playlist_add_btn.click(
+            fn=_on_playlist_add,
+            inputs=[playlist_state, audio_input, repeat_music],
+            outputs=playlist_outputs,
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        playlist_remove_btn.click(
+            fn=_on_playlist_remove,
+            inputs=[playlist_state, playlist_selected, audio_input, repeat_music],
+            outputs=playlist_outputs,
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        playlist_up_btn.click(
+            fn=_on_playlist_move_up,
+            inputs=[playlist_state, playlist_selected, audio_input, repeat_music],
+            outputs=playlist_outputs,
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        playlist_down_btn.click(
+            fn=_on_playlist_move_down,
+            inputs=[playlist_state, playlist_selected, audio_input, repeat_music],
+            outputs=playlist_outputs,
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        playlist_shuffle_btn.click(
+            fn=_on_playlist_shuffle,
+            inputs=[playlist_state, audio_input, repeat_music],
+            outputs=playlist_outputs,
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        playlist_sort_btn.click(
+            fn=_on_playlist_sort,
+            inputs=[playlist_state, audio_input, repeat_music],
+            outputs=playlist_outputs,
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        playlist_clear_btn.click(
+            fn=_on_playlist_clear,
             inputs=[audio_input, repeat_music],
-            outputs=[repeat_music_estimate],
+            outputs=playlist_outputs,
             show_progress='hidden',
             concurrency_limit=None,
         )
@@ -18281,6 +19037,14 @@ def create_ui() -> gr.Blocks:
                 # yet. The estimate read-out is an output of its own handler and is deliberately
                 # absent here.
                 repeat_music,
+                # [FORK] Digital-Union (R16 Music Playlist Mode V1): appended after R10's count, in
+                # both places together, for the identical reason. Both are LIVE inputs for the same
+                # reason the source controls are: the click must act on the soundtrack that is on
+                # screen. The queue is a `gr.State` because it is a structured list rather than a
+                # single widget value, and it is the ONE authority on what the soundtrack is -- the
+                # table beside it is a read-only rendering of it. The two read-outs are outputs of
+                # their own handlers and are deliberately absent here.
+                music_source, playlist_state,
             ],
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or

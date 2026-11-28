@@ -36,6 +36,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `shared-analysis-cache.md` | `src/beatsync_fork/analysis_cache.py`, `tests/test_analysis_cache_sharing.py` |
 | `audio-mixdown.md` | `src/audio_mixdown.py`, `src/beatsync_fork/{audio_mix,smart_mix}.py` + their tests |
 | `music-repeat.md` | `src/music_repeater.py`, `src/beatsync_fork/music_repeat.py`, `tests/test_music_repeat.py` |
+| `music-playlist.md` | `src/music_playlist_builder.py`, `src/beatsync_fork/music_playlist.py`, `tests/test_music_playlist.py` |
 | `progress-events.md` | `src/beatsync_fork/{progress,progress_view,qwen_progress}.py`, `tests/test_progress_*.py`, `tests/test_gui_progress_seam.py` |
 | `input-gate.md` | `src/beatsync_fork/{input_manager,input_report,input_confirmation,input_session}.py`, `tests/test_input_*.py`, `tests/test_gui_guard_seam.py` |
 | `library-preparation.md` | `src/beatsync_fork/library_prep.py`, **`src/video_analysis.py`** (where `classify_library_sources` and the cache seams live), `tests/test_library_preparation.py` |

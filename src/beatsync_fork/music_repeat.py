@@ -527,11 +527,24 @@ def bus_record(beat_info: Any) -> Mapping | None:
     return record if isinstance(record, Mapping) else None
 
 
-def summary_line(beat_info: Any) -> str:
+#: The default name of the control this line reports on. A *label*, not a feature flag: the caller
+#: may pass the name the operator actually saw (R16's Render tab says "Repeat Playlist" when the
+#: music is a playlist), and this module still knows nothing about what the audio file is made of --
+#: its contract has always been "repeat whatever audio file you were handed".
+DEFAULT_SUMMARY_LABEL = "REPEAT MUSIC"
+
+
+def summary_line(beat_info: Any, label: Any = DEFAULT_SUMMARY_LABEL) -> str:
     """``REPEAT MUSIC: 5x - 03:30 -> 17:30`` for the success panel, or ``''`` at 1x.
 
     Reads the bus record and formats it; it never recomputes, re-measures or re-derives anything,
     so the panel can never become a second authority on what the render actually did.
+
+    ``label`` names the control, and defaults to the pre-R16 wording so every existing caller --
+    production and test -- produces the identical line. It exists so the panel can say *Repeat
+    Playlist* when the operator's control said *Repeat Playlist*, without a second formatter for one
+    fact: the arithmetic, the cycle and the total all still come from this one function reading this
+    one bus record.
     """
     record = bus_record(beat_info)
     if record is None:
@@ -539,12 +552,14 @@ def summary_line(beat_info: Any) -> str:
     repeat = normalize_repeat(record.get("repeat"))
     if repeat <= MIN_REPEAT:
         return ""
-    return f"🔁 REPEAT MUSIC: {describe(repeat, record.get('cycle_seconds'))}"
+    name = label if isinstance(label, str) and label.strip() else DEFAULT_SUMMARY_LABEL
+    return f"🔁 {name}: {describe(repeat, record.get('cycle_seconds'))}"
 
 
 __all__ = [
     "BUS_KEY",
     "DEFAULT_REPEAT",
+    "DEFAULT_SUMMARY_LABEL",
     "ENERGY_BEAT_SERIES",
     "ENERGY_FRAME_SERIES",
     "LONG_OUTPUT_WARNING_SECONDS",

@@ -96,6 +96,37 @@ _FILE_SCRIPT = (
 )
 
 
+# [FORK] R16: the same dialog machinery for SEVERAL files at once, which the Music Playlist needs
+# because an operator building a soundtrack picks a folder's worth of songs in one gesture.
+#
+# It is the identical `OpenFileDialog` with `Multiselect = $true`, so it carries every one of the
+# three properties above for the same reasons, and it emits **one marked line per chosen file** in
+# the dialog's own order. The caller does not rely on that order: `music_playlist.add_tracks` sorts
+# the addition by filename, because what a multi-select dialog returns is not the operator's click
+# order -- the measured defect `audio_mix.voice_order_key` exists for.
+_FILES_SCRIPT = (
+    "Add-Type -AssemblyName System.Windows.Forms | Out-Null; "
+    "$owner = New-Object System.Windows.Forms.Form; "
+    "$owner.TopMost = $true; "
+    "$owner.ShowInTaskbar = $false; "
+    "$owner.StartPosition = 'CenterScreen'; "
+    "$dlg = New-Object System.Windows.Forms.OpenFileDialog; "
+    "$dlg.Title = 'Choose music files for the BeatSync playlist'; "
+    "$dlg.Multiselect = $true; "
+    "$dlg.CheckFileExists = $true; "
+    "$filter = $env:BEATSYNC_PICK_FILTER; "
+    "if ($filter) { $dlg.Filter = $filter }; "
+    "$start = $env:BEATSYNC_PICK_START; "
+    "if ($start -and (Test-Path -LiteralPath $start -PathType Container)) "
+    "{ $dlg.InitialDirectory = $start }; "
+    "$answer = $dlg.ShowDialog($owner); "
+    "$owner.Dispose(); "
+    "if ($answer -eq [System.Windows.Forms.DialogResult]::OK) "
+    "{ foreach ($f in $dlg.FileNames) { Write-Output ('" + _PICKED_PREFIX + "' + $f) } } "
+    "else { Write-Output '" + _CANCELLED + "' }"
+)
+
+
 def build_picker_command(powershell: str = "powershell.exe") -> list[str]:
     """The one picker argv. `-STA` is required; `-NoProfile` keeps a slow profile out of the way."""
     return [powershell, "-NoProfile", "-NonInteractive", "-STA", "-Command", _SCRIPT]
@@ -161,6 +192,51 @@ def pick_file(start: str | None = None, *, filter_text: str = "", runner=None,
     if status != PICKED:
         return CANCELLED, ""
     return PICKED, os.path.abspath(chosen)
+
+
+def build_files_picker_command(powershell: str = "powershell.exe") -> list[str]:
+    """The multi-select file-dialog argv. Same switches, same reasons, `Multiselect` on."""
+    return [powershell, "-NoProfile", "-NonInteractive", "-STA", "-Command", _FILES_SCRIPT]
+
+
+def parse_multi_picker_output(text: str) -> tuple[str, tuple]:
+    """`(status, paths)` from the child's stdout — every marked line, in the order emitted.
+
+    Unlike :func:`parse_picker_output`, which answers the *last* marked line, this collects all of
+    them: a multi-select dialog legitimately produces several. An explicit `CANCELLED` and an
+    answer containing no marked line at all are both cancellations, for the same reason — reading
+    an unknown answer as "keep what you had" is the safe direction.
+    """
+    chosen: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith(_PICKED_PREFIX):
+            value = line[len(_PICKED_PREFIX):].strip()
+            if value:
+                chosen.append(value)
+    if not chosen:
+        return CANCELLED, ()
+    return PICKED, tuple(chosen)
+
+
+def pick_files(start: str | None = None, *, filter_text: str = "", runner=None,
+               timeout: int = PICKER_TIMEOUT_SECONDS,
+               powershell: str = "powershell.exe") -> tuple[str, tuple]:
+    """Open the native multi-select file dialog and return `(status, paths)`.
+
+    `paths` holds absolute paths only when `status` is :data:`PICKED`; every other status returns
+    `()` and the caller must leave the existing queue alone — identical in contract to
+    :func:`pick_file` and :func:`pick_folder`, so pressing Add tracks can only ever *add*.
+    """
+    run = runner or run_picker_command
+    status, output = run(build_files_picker_command(powershell),
+                         file_picker_environment(start, filter_text), timeout)
+    if status in (TIMED_OUT, UNAVAILABLE):
+        return status, ()
+    status, chosen = parse_multi_picker_output(output)
+    if status != PICKED:
+        return CANCELLED, ()
+    return PICKED, tuple(os.path.abspath(path) for path in chosen)
 
 
 def picker_environment(start: str | None, base: dict | None = None) -> dict:
@@ -234,4 +310,5 @@ def pick_folder(start: str | None = None, *, runner=None,
 __all__ = ["PICKER_TIMEOUT_SECONDS", "PICKED", "CANCELLED", "UNAVAILABLE", "TIMED_OUT",
            "build_picker_command", "picker_environment", "parse_picker_output",
            "run_picker_command", "pick_folder",
-           "build_file_picker_command", "file_filter", "file_picker_environment", "pick_file"]
+           "build_file_picker_command", "file_filter", "file_picker_environment", "pick_file",
+           "build_files_picker_command", "parse_multi_picker_output", "pick_files"]

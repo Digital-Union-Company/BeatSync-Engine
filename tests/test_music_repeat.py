@@ -1147,9 +1147,17 @@ def test_both_render_events_pass_the_repeat_at_the_same_index_as_the_signature(b
     args = submitted_parameters(_func(_GUI, handler))
     assert "repeat_music" in inputs, button
     assert inputs.index("repeat_music") == args.index("repeat_music"), (button, handler)
-    # appended LAST in both, so no pre-existing positional index moved
-    assert inputs[-1] == "repeat_music"
-    assert args[-1] == "repeat_music"
+    # Appended in both at the same index, so no pre-existing positional index moved.
+    #
+    # [FORK] R16: it is no longer the LAST entry, and that is the discipline working rather than
+    # breaking. Music Playlist Mode appended `music_source` and `playlist_state` after it, in the
+    # click list and the signature together, so `repeat_music` keeps exactly the index it had at
+    # R10 -- which is the property this assertion actually protects. (R7.3's `voice_overflow` went
+    # through the same amendment when R10 itself appended; see `test_r7_3s_policy_did_not_move`.)
+    assert inputs[-3] == "repeat_music"
+    assert args[-3] == "repeat_music"
+    assert inputs[-2:] == ["music_source", "playlist_state"], inputs[-3:]
+    assert args[-2:] == ["music_source", "playlist_state"], args[-3:]
     # ...and the injected parameter is genuinely the only thing after it, so the exclusion above
     # cannot become a way to hide a widget argument this contract should have caught.
     all_args = [arg.arg for arg in _func(_GUI, handler).args.args]
@@ -1157,14 +1165,21 @@ def test_both_render_events_pass_the_repeat_at_the_same_index_as_the_signature(b
 
 
 def test_r7_3s_policy_did_not_move():
-    """The regression this ordering discipline exists to prevent, stated directly."""
+    """The regression this ordering discipline exists to prevent, stated directly.
+
+    The ordinal is amended by every later append and the *claim* never changes: R7.3's policy keeps
+    the index it had when it was added, so nothing was inserted in front of it. It was second to
+    last at R7.3, third to last once R10 appended `repeat_music`, and is fourth to last now that
+    R16 appended `music_source` and `playlist_state`.
+    """
     for button, handler in (("process_btn", "process_video_guarded"),
                             ("render_selected_variants_btn",
                              "render_selected_variants_guarded")):
         inputs = _click_inputs(_GUI, button)
         args = [arg.arg for arg in _func(_GUI, handler).args.args]
         assert inputs.index("voice_overflow") == args.index("voice_overflow")
-        assert inputs.index("voice_overflow") == len(inputs) - 2
+        assert inputs.index("voice_overflow") == len(inputs) - 4
+        assert inputs[-3:] == ["repeat_music", "music_source", "playlist_state"], inputs[-4:]
 
 
 @pytest.mark.parametrize("handler", [
@@ -1213,6 +1228,11 @@ def test_the_count_is_threaded_through_without_reinterpretation():
 
 
 def test_the_estimate_handler_writes_only_its_own_read_out():
+    """[FORK] R16: the handler is now mode-aware, so it reads two more values and writes the
+    playlist's own queue table beside the estimate. The contract this test protects is unchanged:
+    it writes **only read-only Markdown read-outs** -- no execution widget, no source widget, no
+    confirmation widget and no state object -- so neither selecting a music file, moving the slider
+    nor switching Music Source can clear a confirmed source set or change what a render would do."""
     tree = _tree(_GUI)
     registrations = [node for node in ast.walk(tree)
                      if isinstance(node, ast.Call)
@@ -1226,9 +1246,9 @@ def test_the_estimate_handler_writes_only_its_own_read_out():
     for node in registrations:
         kwargs = {kw.arg: kw.value for kw in node.keywords}
         assert [getattr(e, "id", None) for e in kwargs["inputs"].elts] == \
-            ["audio_input", "repeat_music"]
+            ["audio_input", "repeat_music", "music_source", "playlist_state"]
         assert [getattr(e, "id", None) for e in kwargs["outputs"].elts] == \
-            ["repeat_music_estimate"]
+            ["repeat_music_estimate", "playlist_summary"]
         # not a render: it must never share the render lane
         assert "concurrency_id" not in kwargs
         assert ast.unparse(kwargs["concurrency_limit"]) == "None"

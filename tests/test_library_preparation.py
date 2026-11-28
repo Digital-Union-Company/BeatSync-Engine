@@ -1083,6 +1083,12 @@ _RENDER_CLICK_INPUTS = [
     # same reason. It is render-request state in exactly the sense this list is about: it is read at
     # click time and describes the video to produce, not which library has been prepared.
     "repeat_music",
+    # [R16] Music Playlist Mode, appended after R10's count in both places together, for the
+    # identical reason. The ordered soundtrack is render-request state in exactly the same sense:
+    # it is read at click time and describes the video to produce. It is emphatically NOT
+    # preparation state -- the Media Library is about the VIDEO sources, and no preparation value
+    # reaches either of these two.
+    "music_source", "playlist_state",
 ]
 
 

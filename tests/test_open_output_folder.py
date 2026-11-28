@@ -664,7 +664,17 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
 #: Net: 14 - 3 + 1 = 12. Fewer states is not automatically an improvement, so the removal is pinned
 #: in both directions -- the count below, and the named-survivor list in the self-check, which still
 #: holds Audio Review's four.
-_EXPECTED_STATE_COUNT = 12
+#:
+#: **13 since R16 Music Playlist Mode**, which adds exactly one: `playlist_state`, the ordered
+#: soundtrack awaiting a render. It qualifies under the same rules every state above does -- it is
+#: per-session, it holds a tuple of plain `(path, size, mtime_ns, duration)` primitives (Gradio
+#: deep-copies state, so nothing live and nothing carrying `MappingProxyType` may enter), and it is
+#: deliberately NOT merged into an existing slot: a soundtrack is render-request state, so putting
+#: it in `source_state` would let a playlist edit invalidate a confirmed VIDEO source set, and
+#: putting it in `session_state` would make it render bookkeeping rather than something the two
+#: render events read as an input. Its readers are exactly those two events and the playlist panel's
+#: own handlers.
+_EXPECTED_STATE_COUNT = 13
 
 
 def test_the_expected_state_count_matches_the_named_states():
@@ -687,7 +697,9 @@ def test_the_expected_state_count_matches_the_named_states():
                      "audio_preview_state", "audio_preview_armed_state",
                      # [R8 Final Polish] Video Review's own sweep signature, named for the same
                      # reason: a later state must not satisfy the count by displacing it.
-                     "clips_armed_state"):
+                     "clips_armed_state",
+                     # [R16] The ordered soundtrack, named for the same reason again.
+                     "playlist_state"):
         assert expected in names, f"{expected} missing from {names}"
     # [FORK] Digital-Union (R15-C): the removal has a positive half too. Asserting only the count
     # would be satisfied by deleting three *other* states, so the three that R15-C retires are

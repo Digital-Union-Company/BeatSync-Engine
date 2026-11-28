@@ -929,6 +929,47 @@ automatically.
   its clip count is the whole batch's. Composing it at the raise site was the R2 F3 defect. A stop
   detected inside `record` (the checkpoint write) cannot break the loop from there — it sets a flag
   the loop honours at the top of the next iteration, which is before that source is touched at all.
+- **Music Source is a render-request control, and the repetition slider is renamed by a HEADING
+  rather than by writing it (R16).** The Render tab's Input Files block now chooses between one
+  track and an ordered playlist:
+
+  ```
+  music_source            gr.Radio   'single' (default) | 'playlist'
+  single_track_group      the UNCHANGED gr.File drop zone, only WRAPPED so one mode shows at a time
+  playlist_group          playlist_summary · playlist_selected · 7 buttons · playlist_notice
+  playlist_state          gr.State(())   -- a tuple of (path, size, mtime_ns, duration) primitives
+  repeat_music_heading    gr.Markdown    "Repeat Music" | "Repeat Playlist"
+  ```
+
+  * **`repeat_music` stays a ZERO-WRITER widget.** The owner asked for the control to read *Repeat
+    Playlist* in playlist mode, and the easy way — `gr.update(label=…)` — would have made the
+    slider that decides how long the video is writable by a handler. So the slider carries
+    `show_label=False` and the name lives in a sibling Markdown, exactly as the Video Source radio
+    already does it; the `label=` constant is still passed, so assistive technology and every test
+    that reads it are unaffected. `test_music_repeat.py::test_the_slider_has_no_writer_anywhere_in_the_app`
+    is unchanged and still passes.
+  * **`music_source` and `playlist_state` were APPENDED to both render events**, after
+    `repeat_music` and before the injected `request`, in the click list and the signature together
+    — so every pre-existing positional index is unchanged. The four "appended last" ordinal guards
+    (`test_music_repeat.py` ×2, `test_comfort_mix.py`, `test_library_preparation.py`,
+    `test_variant_lab.py`) were amended, as each previous append amended them.
+  * **The defaults are the literals `'single'` and `()`**, not `fork_playlist.MODE_SINGLE` /
+    `fork_playlist.EMPTY`, for the measured def-time reason `repeat_music`'s integer literal
+    records. Tests pin both equal to the real constants.
+  * **`_on_repeat_music_change` is the ONE read-out function for both modes**, so the seven
+    playlist handlers call it rather than formatting an estimate of their own. Its registration
+    count is unchanged at two; its `inputs` and `outputs` each gained the playlist's half.
+  * **The seven playlist buttons write ONE projection**, `playlist_outputs`, and write no execution
+    widget other than the queue itself — so editing the soundtrack cannot clear a confirmed video
+    source set, and `music_source.change` writes neither `audio_input` nor `playlist_state`, so
+    switching modes discards neither the track nor the queue.
+  * **`gui.py` gained no `subprocess` call site.** Add tracks' native multi-select dialog is
+    delegated to `desktop_folders.pick_files`, exactly as every folder picker already is; the
+    pinned site count of two (the delivery preview and the Director) is untouched.
+  * **One new `gr.State`**, taking `_EXPECTED_STATE_COUNT` to 13, and `_on_playlist_shuffle` is the
+    fifth entry in the exact `random_seed()` owner list — both pinned by name, not by count alone.
+
+  Full contract: `.claude/rules/music-playlist.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -944,6 +985,7 @@ automatically.
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | the C3 2–4-candidate render seam, render mutex, continuation policy, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/render-worker.md` **+** `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |
+| the **Music Source** radio, the playlist queue, any of its seven buttons, `playlist_state`, `music_playlist.py` or `music_playlist_builder.py` (R16) | `.claude/rules/music-playlist.md` **+** `.claude/rules/music-repeat.md` (Repeat Playlist is R10's control over a different cycle) **+** `.claude/rules/pipeline-core.md` (the frame-locked timeline the soundtrack's duration feeds) — and `.claude/rules/audio-mixdown.md` if you touch where voice and SFX are placed against it |
 | the six creative sliders, Variation Seed, Randomize | `.claude/rules/creative-controls.md` |
 | the **AI Director** group, its instruction box, either Director button, `director_proposal_state`, or the one-shot model invocation | `.claude/rules/director.md` **+** `.claude/rules/creative-controls.md` **+** `.claude/rules/creative-presets.md` — Apply writes the seed, the six sliders and the preset label, so all three writer matrices apply |
 | the Creative Preset selector and its `.input()` graph | `.claude/rules/creative-presets.md` |

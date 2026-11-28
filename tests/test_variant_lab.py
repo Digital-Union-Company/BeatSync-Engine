@@ -2640,8 +2640,18 @@ def test_only_the_shared_helper_owns_the_draw():
     six-control payload exists, which is why `_on_generate_director_proposal` is here and not a
     private helper of its own.
 
+    **Extended by exactly one more entry for R16 Music Playlist Mode** (`_on_playlist_shuffle`),
+    under the identical rule. Shuffle mints through *this* call rather than inventing a second seed
+    implementation, and its draw is **surfaced twice over**: the seed itself is printed in the
+    playlist notice the operator is reading, and its only effect — the new track order — is written
+    straight into the visible queue in the same response. Nothing unsurfaced decides anything, and
+    in particular the draw does **not** reach the render path: the render freezes whatever order is
+    in the queue, so there is no randomisation anywhere in a render. It is deliberately not a
+    playlist-local seed implementation for the same reason Surprise me is not a Freestyle-local
+    one.
+
     What is **not** relaxed: this is still an exact sorted list, not a containment check, so a
-    fourth minting site still fails. Nothing about the lab's own draws moved —
+    sixth minting site still fails. Nothing about the lab's own draws moved —
     `_build_variant_resolution_context` still owns the master seed for all three lab handlers and
     `_fresh_variant_master_seed` still owns New Variant's guaranteed-different one. The Director's
     draw is also *surfaced*, like every other draw in this application: it lands in the proposal
@@ -2656,6 +2666,7 @@ def test_only_the_shared_helper_owns_the_draw():
     assert sorted(owners) == ["_build_variant_resolution_context",
                               "_fresh_variant_master_seed",
                               "_on_generate_director_proposal",
+                              "_on_playlist_shuffle",
                               "_on_surprise_me"], owners
 
     # The lab's own two sites are unchanged, and the Director's is NOT one of the lab's handlers.
@@ -2822,8 +2833,13 @@ def test_both_render_wrappers_take_the_same_freestyle_widgets():
 #: pre-existing positional index moved. `test_the_injected_session_is_appended_and_is_not_a_widget`
 #: below pins what distinguishes it, so this list cannot quietly admit a real widget argument that
 #: was never wired up.
+#: [R16] `music_source` and `playlist_state` join them, and in BOTH handlers again, for the
+#: identical reason: an ordered soundtrack is shared render intent, so the batch freezes one
+#: playlist in one order for every candidate exactly as it freezes the audio file, the source set,
+#: the encoder and the repeat count. They are appended BEFORE `request`, which is the one entry
+#: Gradio injects rather than submits and which therefore stays last.
 _APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return", "voice_overflow",
-                             "repeat_music", "request")
+                             "repeat_music", "music_source", "playlist_state", "request")
 
 
 def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched():

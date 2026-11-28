@@ -178,6 +178,25 @@ These apply in almost every session. Each has a scoped rule with the full contra
   feature adds sits behind a repeat guard, so at 1× neither new module is resolved. Musical cut
   positions repeat; the shots do not — Stage 6 plans one continuous timeline and carries its running
   state across cycle boundaries. → `.claude/rules/music-repeat.md`
+- **Music Playlist Mode (R16) makes several songs into ONE audio file BEFORE the analysis, and
+  nothing downstream knows.** The queued tracks are frozen at render admission, each is decoded to
+  the canonical 48 kHz/stereo/`pcm_s24le` PCM, the runs are stream-copied into one soundtrack
+  master, and `local_audio_path` is rebound to it — so `analyze_beats_auto` receives the complete
+  ordered soundtrack as its single music file and Stages 1–5 run **once** over the whole thing.
+  Three consequences follow for free: **Repeat Playlist repeats the WHOLE ordered playlist**
+  because R10's cycle is whatever audio file it was handed (neither R10 module needed a change,
+  and neither got one beyond an optional panel *label*); the playlist can reach **no** Stage-5
+  cache identity, Qwen request or persisted record, because the music has only ever reached Stage 5
+  as one audio file; and `video_processor.py` needed no playlist awareness, exactly as it needed no
+  repeat awareness. The master's **sample count must equal the sum of the decoded tracks', exactly**
+  — an unmeasurable header is a third answer, never a refusal — and a queued track that is missing,
+  changed, unreadable or undecodable **fails the render** rather than yielding a shorter soundtrack.
+  **Single Track is the legacy render structurally**: every reference to either new module sits
+  behind a playlist guard (the only added statements outside one are two bare declarations and two
+  truthiness tests), and the candidate's single-track output is frame-checksum identical to
+  pristine `13cdfa48`.
+  Shuffle is an explicit seeded one-time reorder — there is no randomness on the render path. →
+  `.claude/rules/music-playlist.md`
 - **Cancellation (C3-R1A, extended into Stage 5 by FUN Stage-5 Cancel).** Exactly one
   `RenderLifecycle` per top-level render event — one Create Music Video click, or the **whole**
   2–4-candidate batch. FFmpeg-class children are terminated *and reaped* before `RenderCancelled`
