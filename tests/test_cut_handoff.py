@@ -29,6 +29,7 @@ import pytest
 
 from beatsync_fork import clips_review as fork_clips
 from beatsync_fork import cut_handoff as handoff
+from beatsync_fork import disk_guard
 # [FORK] R17-A: `_notify_cut` maps each terminal path's counts through this module's four outcome
 # tokens, so the AST-executed namespace needs it just as it needs the other fork aliases.
 from beatsync_fork import desktop_notify as notify
@@ -359,15 +360,38 @@ def test_the_batch_terminal_outcome_table_is_keyed_by_the_pure_classifier(gui_so
     start = gui_source.index("_CUT_BATCH_HANDOFF = {")
     block = gui_source[start:gui_source.index("}", start)]
     for terminal in ("TERMINAL_FAILED", "TERMINAL_CANCELLED",
-                     "TERMINAL_COMPLETED_WITH_FAILURES", "TERMINAL_COMPLETED"):
+                     "TERMINAL_COMPLETED_WITH_FAILURES", "TERMINAL_COMPLETED",
+                     # [FORK] R4-D: the fifth class the classifier can produce.
+                     "TERMINAL_STORAGE_FULL"):
         assert f"fork_cutter_batch.{terminal}" in block, terminal
     # Every class the pure classifier can produce has a row, so a new one cannot be silently
     # absorbed into a neutral default that happens to look reasonable. The set is read off the
-    # fork module itself rather than listed here, so adding a fifth terminal class there fails
+    # fork module itself rather than listed here, so adding a sixth terminal class there fails
     # this test instead of quietly inheriting the default.
+    #
+    # [FORK] R4-D: `TERMINAL_IN_PROGRESS` is excluded, and the exclusion is the accurate reading of
+    # what this assertion is for rather than a weakening of it. `terminal_status` can never return
+    # it -- it is the checkpoint-only marker, written exclusively by `manifest_payload(...,
+    # in_progress=True)` and never by a final write -- so `sink['terminal']` cannot hold it and a
+    # handoff row for it would be an unreachable branch. The guard is therefore asserted against
+    # what the classifier PRODUCES, which is measured here rather than assumed.
     produced = {name for name in dir(fork_batch) if name.startswith("TERMINAL_")}
     assert produced, "the batch module must publish its terminal vocabulary"
-    assert len(produced) == block.count("fork_cutter_batch.TERMINAL_"), produced
+    classifier_answers = {
+        fork_batch.terminal_status([], 0, False),
+        fork_batch.terminal_status([], 0, True),
+        fork_batch.terminal_status([], 0, False, "boom"),
+        fork_batch.terminal_status([], 0, False, storage_full=True),
+        fork_batch.terminal_status(
+            [fork_batch.BatchItem(index=1, source_path="a.mp4",
+                                  outcome=fork_batch.OUTCOME_EXPORT_FAILED)], 1, False),
+    }
+    assert fork_batch.TERMINAL_IN_PROGRESS not in classifier_answers, \
+        "TERMINAL_IN_PROGRESS must never be a terminal answer; it is the checkpoint marker"
+    assert classifier_answers == {getattr(fork_batch, name) for name in produced
+                                  if name != "TERMINAL_IN_PROGRESS"}, classifier_answers
+    assert len(classifier_answers) == block.count("fork_cutter_batch.TERMINAL_"), \
+        classifier_answers
 
 
 def test_the_handoff_count_is_never_a_planned_count(gui_tree):
@@ -446,6 +470,56 @@ class _FakeCancelled(Exception):
     pass
 
 
+def _real_storage_exhausted():
+    """[FORK] R4-D: the SHIPPED `StorageExhausted`, AST-extracted from `src/raw_cutter_export.py`.
+
+    Not a local stand-in that happens to share the name. The handler's whole correctness here is
+    that it names this exact class *before* its generic `except Exception`, so a look-alike would
+    make these cases pass against a tree in which the real class had been renamed, moved, or made
+    a `BaseException` -- any of which changes what the shipped handler actually catches.
+
+    The adapter itself cannot be imported on a bare interpreter (it needs `ffmpeg_processing`,
+    hence the whole stub-module harness around it), so the class alone is extracted and executed
+    against the one name its body uses.
+
+    **Answers `None` rather than asserting when the class is absent**, and that is deliberate: a
+    module-level `assert` here would make this whole file uncollectable against a pre-R4-D tree,
+    which collapses every case's non-vacuity into one shared import error and hides whether each
+    test fails on its own assertion. One named test below carries the existence requirement
+    instead. The same reasoning produced `_OPTIONAL` in `tests/test_settings_pref_consistency.py`.
+    """
+    path = os.path.join(_REPO_ROOT, "src", "raw_cutter_export.py")
+    with open(path, encoding="utf-8") as hand:
+        tree = ast.parse(hand.read(), filename=path)
+    node = next((n for n in tree.body
+                 if isinstance(n, ast.ClassDef) and n.name == "StorageExhausted"), None)
+    if node is None:
+        return None
+    space: dict = {"fork_disk": disk_guard, "__annotations__": {}}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), space)  # noqa: S102
+    return space["StorageExhausted"]
+
+
+class _AbsentStorageExhausted(Exception):
+    """Stands in only on a tree that has no `StorageExhausted`, so this file still collects."""
+
+
+_REAL_STORAGE_EXHAUSTED = _real_storage_exhausted()
+_StorageExhausted = _REAL_STORAGE_EXHAUSTED or _AbsentStorageExhausted
+
+
+def test_the_adapter_exports_the_storage_stop_exception():
+    """[FORK] R4-D: the existence requirement, as one named case rather than a collection-time
+    assert. Everything else in this file's storage group then fails on its own assertion."""
+    assert _REAL_STORAGE_EXHAUSTED is not None, \
+        "raw_cutter_export must define StorageExhausted"
+    # An ordinary `Exception` -- the same choice `CutterCancelled` and `RenderCancelled` make --
+    # which is precisely WHY every broad catch on this path has to name it explicitly. Promoting
+    # it to a bare `BaseException` would make the handlers' ordering guards pointless.
+    assert issubclass(_REAL_STORAGE_EXHAUSTED, Exception)
+    assert Exception in _REAL_STORAGE_EXHAUSTED.__mro__
+
+
 class _FakeJob:
     def __init__(self):
         self.cancelled = False
@@ -489,8 +563,9 @@ _UI = _ui_strings()
 class _CutRun:
     """What one executed single-video cut did, on screen and to the handoff."""
 
-    def __init__(self, yields, run_dir, clips):
+    def __init__(self, yields, run_dir, clips, published=()):
         self.yields, self.run_dir, self.clips = yields, run_dir, clips
+        self._published = list(published)
 
     # `(report, panel) + _cut_handoff(record) + <three button updates>`: indices 2 and 3.
     @property
@@ -513,9 +588,24 @@ class _CutRun:
     def widths(self):
         return {len(y) for y in self.yields}
 
+    # [FORK] R4-D: what each terminal path asked to ANNOUNCE, recorded by the stubbed
+    # `_notify_publish`. What a notification may SAY is `tests/test_desktop_notifications.py`'s
+    # subject; what this harness can prove is that a real terminal path produces exactly one, and
+    # the right one.
+    @property
+    def published(self):
+        return list(getattr(self, "_published", ()))
+
 
 def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, fault=None,
-             plan_state=..., prelock=False, run_dir_error="", cancel_at=None):
+             plan_state=..., prelock=False, run_dir_error="", cancel_at=None,
+             # [FORK] R4-D: `storage_at` stops the export after N clips the way a full output
+             # volume does -- by raising the shipped `StorageExhausted` out of `export_segments`,
+             # after the clips before it have already fired `on_complete`. `refuse_capacity` drives
+             # the preflight instead, by handing the handler a REAL refusing `CapacityVerdict`.
+             # [FORK] R4-D R2 (F2): `run_dir_storage` meets the full volume one step earlier --
+             # at the run folder, before a single clip has been attempted.
+             storage_at=None, refuse_capacity="", run_dir_storage=False):
     """Execute the REAL `_on_cut_run` against a synthesised adapter and a real filesystem.
 
     There was no executable harness for the single-video handler before R11. It is built the way
@@ -535,7 +625,10 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
             and getattr(node.targets[0], "id", "") == "_CUT_TONES"]
     body += [_strip_docstrings(_func(gui, name)) for name in wanted]
     namespace: dict = dict(fork_activity=activity, fork_handoff=handoff, fork_cutter=cutter,
-                           fork_profiles=profiles, fork_notify=notify)
+                           fork_profiles=profiles, fork_notify=notify,
+                           # [FORK] R4-D: the REAL policy module, so the storage-stop frame's
+                           # wording and the notification's outcome are the shipped ones.
+                           fork_disk=disk_guard)
     # A recorder rather than a no-op: the ledger is a process-global this harness must not write,
     # but what each terminal path asked to announce is worth being able to read back.
     namespace["_notify_publish"] = (
@@ -554,6 +647,20 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
     exporter = _types.ModuleType("raw_cutter_export")
     exporter.CutterCancelled = _FakeCancelled
     exporter.CutterJob = _FakeJob
+    # [FORK] R4-D: the stub adapter's two new names. `StorageExhausted` is the REAL class, imported
+    # by path below, so what the handler catches is the shipped exception type and not a local
+    # stand-in that merely shares its name.
+    exporter.StorageExhausted = _StorageExhausted
+
+    def capacity_for_export(destination, source=None, plan=None):
+        # The REAL `disk_guard.evaluate` either way. A refusal is produced by handing it a
+        # measured free-space figure below the shipped floor, not by fabricating a verdict object:
+        # the message, the `ok` property and the floor are all then the shipped policy's.
+        if refuse_capacity:
+            return disk_guard.evaluate(1024, volume=refuse_capacity)
+        return disk_guard.evaluate(500 * 1024 * 1024 * 1024)
+
+    exporter.capacity_for_export = capacity_for_export
 
     stat = os.stat(source_file)
     source_info = cutter.SourceInfo(path=str(source_file), duration=60.0, width=1280, height=720,
@@ -564,6 +671,13 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
         return _Res(ok=True, error="", source=source_info)
 
     def prepare_run_directory(output_folder, source_path, timestamp, naming=None):
+        if run_dir_storage:
+            # [FORK] R4-D R2 (F2): the shipped adapter RAISES here on a confirmed full volume
+            # rather than returning `"Could not create the output folder: [Errno 28] ..."`, so the
+            # single-video handler's own storage clause reports it instead of its refusal path.
+            raise _StorageExhausted(
+                disk_guard.CLIP_STORAGE_FULL_REASON, free_bytes=0, path=str(out_root),
+                detail="[Errno 28] No space left on device")
         if run_dir_error:
             return "", run_dir_error
         target = os.path.join(str(out_root), "RawCutter_" + str(timestamp))
@@ -580,6 +694,15 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
                 raise _FakeCancelled("stopped")
             if raise_after is not None and position > raise_after:
                 raise RuntimeError("injected export fault")
+            # [FORK] R4-D: raised AFTER the earlier clips fired `on_complete`, which is the
+            # ordering the shipped exporter guarantees -- so what the handler reads is the real
+            # callback evidence rather than a return value the exception discarded.
+            if storage_at is not None and position > storage_at:
+                raise _StorageExhausted(
+                    disk_guard.CLIP_STORAGE_FULL_REASON, free_bytes=2 * 1024 * 1024,
+                    path=run_directory, detail="av_interleaved_write_frame(): No space left on "
+                                               "device",
+                    clips_written=sum(1 for r in results if r.ok))
             ok = True if clip_results is None else bool(clip_results[position - 1])
             if ok:
                 target = os.path.join(run_directory, f"clip_{segment.index:03d}.mp4")
@@ -649,7 +772,7 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
     clips = sorted(os.listdir(run_dir)) if run_dir and os.path.isdir(run_dir) else []
     if prelock and lock.locked():
         lock.release()
-    return _CutRun(yields, run_dir, clips)
+    return _CutRun(yields, run_dir, clips, published=namespace.get("_published", ()))
 
 
 def test_a_successful_cut_hands_over_its_own_run_directory(tmp_path, monkeypatch):
@@ -1046,3 +1169,134 @@ def test_the_handoff_takes_the_injected_request_and_no_new_widget(gui_tree):
     assert ast.unparse(handler.args.args[1].annotation) == "gr.Request"
     assert _names(_kwargs(_click(gui_tree, "cut_open_library_btn"))["inputs"]) \
         == ["cut_handoff_state"]
+
+
+# =============================================================================================
+# [FORK] Digital-Union (Raw Cutter R4-D): Single Video when the output drive fills up.
+#
+# The folder batch's own storage paths -- counters, `not_attempted`, the manifest, the checkpoint,
+# the panel and the one notification -- are `tests/test_raw_cutter_batch.py`'s subject. What this
+# harness can prove, and nothing else can, is that the shipped single-video handler reports a full
+# drive truthfully and keeps offering the clips that reached disk.
+#
+# Non-vacuity, and which cases here are PINS rather than change-detectors, is recorded once in
+# `tests/test_raw_cutter_batch.py`'s R4-D section header -- the measurement spans both files.
+# =============================================================================================
+
+def test_an_unwritable_output_volume_refuses_the_cut_and_keeps_the_plan(tmp_path, monkeypatch):
+    """A refusal performs no work: no run folder, no encode, and the handoff is cleared. The plan
+    is KEPT, so an operator who frees some space presses Cut Video again without re-analysing."""
+    run = _run_cut(tmp_path, monkeypatch, refuse_capacity="E:")
+    assert run.run_dir == "", "a refused cut must not create a run folder"
+    assert run.clips == []
+    assert run.handoff is None
+    assert run.review_enabled is False
+    assert "full" in run.report
+    # `keep_plan` is the default, so Cut Video stays available.
+    assert run.yields[-1][-2].get("interactive") is True
+
+
+def test_a_full_drive_mid_cut_keeps_and_offers_the_clips_already_written(tmp_path, monkeypatch):
+    run = _run_cut(tmp_path, monkeypatch, storage_at=2)
+    assert len(run.clips) == 2, run.clips
+    assert run.handoff is not None
+    assert run.handoff["clips"] == 2
+    assert run.handoff["directory"] == run.run_dir
+    assert run.handoff["outcome"] == handoff.OUTCOME_PARTIAL
+    assert run.review_enabled is True
+    assert "ran out of space" in run.report
+    assert "not a problem with your source video" in run.report
+    assert "new output folder" in run.report
+
+
+def test_a_full_drive_before_the_first_clip_offers_nothing(tmp_path, monkeypatch):
+    run = _run_cut(tmp_path, monkeypatch, storage_at=0)
+    assert run.clips == []
+    assert run.handoff is None
+    assert run.review_enabled is False
+    assert "No clips were finished" in run.report
+
+
+def test_a_full_drive_is_not_reported_as_a_failed_cut(tmp_path, monkeypatch):
+    """The whole point. `StorageExhausted` is an ordinary `Exception`, so before this handler
+    named it the generic clause would have headlined a correctly diagnosed full drive
+    "Cutting failed" -- the misreport R4-D exists to remove."""
+    run = _run_cut(tmp_path, monkeypatch, storage_at=2)
+    panel = run.yields[-1][1]
+    assert _UI["CUT_CUT_STORAGE_FULL_TITLE"] in panel
+    assert _UI["CUT_CUT_FAILED_TITLE"] not in panel
+    assert _UI["CUT_CUT_DONE_TITLE"] not in panel
+    assert "Error" not in run.report and "crash" not in run.report
+
+
+def test_a_full_drive_is_not_reported_as_a_cancellation(tmp_path, monkeypatch):
+    """Nobody pressed anything, so the stop must not borrow the cancellation wording."""
+    run = _run_cut(tmp_path, monkeypatch, storage_at=2)
+    assert _UI["CUT_CANCELLED_TEXT"] not in run.report
+
+
+def test_one_notification_for_a_storage_stop_and_never_a_success(tmp_path, monkeypatch):
+    run = _run_cut(tmp_path, monkeypatch, storage_at=2)
+    assert len(run.published) == 1, run.published
+    job_kind, outcome, _counts = run.published[0]
+    assert job_kind == notify.JOB_RAW_CUTTER
+    assert outcome == notify.OUTCOME_PARTIAL
+    assert outcome != notify.OUTCOME_SUCCESS
+    assert outcome != notify.OUTCOME_CANCELLED, "nobody pressed anything"
+
+
+def test_a_storage_stop_with_no_clips_is_announced_as_a_failure(tmp_path, monkeypatch):
+    run = _run_cut(tmp_path, monkeypatch, storage_at=0)
+    assert len(run.published) == 1
+    assert run.published[0][1] == notify.OUTCOME_FAILED
+
+
+def test_a_refused_capacity_preflight_announces_nothing(tmp_path, monkeypatch):
+    """A refusal performed no work, so it is deliberately not a notification site -- the same rule
+    every other `refuse(...)` path on this handler already follows."""
+    run = _run_cut(tmp_path, monkeypatch, refuse_capacity="E:")
+    assert run.published == []
+
+
+def test_a_full_volume_at_the_RUN_FOLDER_is_reported_as_a_full_drive(tmp_path, monkeypatch):
+    """[FORK] R4-D R2 (F2): the single-video equivalent of the batch-directory boundary.
+
+    **A regression pin, NOT a reproduction, and the distinction is worth stating.** The R1
+    candidate's defect at this boundary was entirely in the adapter: `prepare_run_directory`
+    returned ``"Could not create the output folder: [Errno 28] No space left on device"`` instead
+    of raising, so the handler's storage clause was never reached. That half is reproduced in
+    `tests/test_raw_cutter_disk_full.py`, which fails against the candidate. The single-video
+    handler, unlike the batch one, ALREADY named `StorageExhausted` before its generic clause -- so
+    this case passes on both trees, and it is here to keep that true now that a second boundary can
+    reach it.
+    """
+    run = _run_cut(tmp_path, monkeypatch, run_dir_storage=True)
+    report = run.report
+    assert _UI["CUT_CUT_STORAGE_FULL_TITLE"] in report
+    assert "ran out of space" in report
+    assert "Errno 28" not in report.splitlines()[0], "the headline names the drive, not an errno"
+    assert "No clips were finished" in report, "none were, and it must not invent any"
+    assert "your source files were not modified" in report.lower()
+    assert run.handoff is None, "nothing was written, so nothing is offered for review"
+    assert run.review_enabled is False
+    # One notification, and a total loss is a FAILURE rather than a partial one.
+    assert len(run.published) == 1
+    assert run.published[0][1] == notify.OUTCOME_FAILED
+
+
+def test_every_storage_frame_is_as_wide_as_the_handler_declares(tmp_path, monkeypatch):
+    """Gradio matches `outputs` by position, so a new terminal path that emits a different number
+    of values misaligns every update on that frame."""
+    cases = {"mid_cut": {"storage_at": 2}, "first_clip": {"storage_at": 0},
+             "refused": {"refuse_capacity": "E:"}, "run_folder": {"run_dir_storage": True}}
+    for name, kwargs in cases.items():
+        run = _run_cut(tmp_path / name, monkeypatch, **kwargs)
+        assert run.widths == {7}, (name, run.widths)
+
+
+def test_a_clean_cut_is_untouched_by_r4d(tmp_path, monkeypatch):
+    run = _run_cut(tmp_path, monkeypatch)
+    assert run.clips
+    assert run.handoff is not None
+    assert run.handoff["outcome"] == handoff.OUTCOME_COMPLETED
+    assert _UI["CUT_CUT_STORAGE_FULL_TITLE"] not in run.yields[-1][1]

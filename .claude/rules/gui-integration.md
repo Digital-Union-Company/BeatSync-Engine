@@ -902,6 +902,33 @@ automatically.
   **When you add a saved option to this panel, three things are required, not one:** put it in
   `_settings_on_load`, register its control on `.input`, and keep it out of `pref_save_btn`'s
   `inputs`. Missing any one of them reintroduces a defect this section already paid for.
+- **A full output volume stops the Raw Cutter, and it is reported as a FULL DRIVE rather than as a
+  broken video or a crash (R4-D).** Both cut handlers gained one terminal path, and both name
+  `cutter_export.StorageExhausted` **before** their generic `except Exception` — it is an ordinary
+  `Exception`, exactly as `CutterCancelled` is, so a generic clause listed first reports a
+  correctly diagnosed and correctly handled stop as a failure. That misreport is the owner's
+  2026-11-16 incident, in which nine sources were presented as broken footage.
+
+  ```
+  capacity_for_export(...)      pre-admission in the batch; pre-encode in Single Video
+  StorageExhausted              recorded first, then raised; no child is running
+  TERMINAL_STORAGE_FULL         a FIFTH terminal class -- not a flavour of TERMINAL_FAILED
+  ```
+
+  The preflight refusal is a `refuse(...)` / early `yield`, so it holds no mutex, creates no
+  directory and — like every other refusal here — **publishes no notification**. A storage stop
+  resolves to PARTIAL or FAILED and **never to SUCCESS**. The clips that reached disk are still
+  offered for review, because a full drive is a reason to stop writing and never a reason to
+  withhold footage the operator already has. Full contract:
+  `.claude/rules/raw-cutter-storage.md`.
+
+  **R2 added a THIRD storage clause to `_on_cut_batch_run`** — an outer one, for a stop met before
+  the batch has a directory or a source (`prepare_batch_directory`). Both in-loop clauses and this
+  one call `note_storage_stop(exc)`, which records facts only; the operator-facing sentence is
+  rendered by `storage_report()` at each terminal site, **after** every outcome is in `items`, so
+  its clip count is the whole batch's. Composing it at the raise site was the R2 F3 defect. A stop
+  detected inside `record` (the checkpoint write) cannot break the loop from there — it sets a flag
+  the loop honours at the top of the next iteration, which is before that source is touched at all.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -911,6 +938,7 @@ automatically.
 |---|---|
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
 | the Raw Cutter's **Activity & Performance** panel, `_cut_activity` / `_cut_activity_final`, `CUT_ACTIVITY_JS` or `raw_cutter_activity.py` (R12) | the R12 bullet above **+** `ROADMAP.md` R12 for the product contract — and `tests/test_raw_cutter_activity.py`, which executes the pure timer rules rather than asserting about them |
+| the Raw Cutter's capacity preflight, `StorageExhausted`, `measure_free_space`, `disk_guard.py`, `OUTCOME_STORAGE_FULL` / `TERMINAL_STORAGE_FULL`, or the batch manifest **checkpoint** (R4-D) | `.claude/rules/raw-cutter-storage.md` **+** `ROADMAP.md` R4-D for the product contract. A new terminal class must be added to **all four** keyed tables (`summary_text`'s headline dict, `_CUT_BATCH_ACTIVITY`, `_CUT_BATCH_HANDOFF`, and `_notify_cut_batch`'s rules) — the headline dict is a plain index and raises `KeyError` without it. `.claude/rules/desktop-notifications.md` too, since a storage stop may never be announced as a success |
 | the **"Review these clips"** button, `cut_handoff_state`, `_cut_handoff`, `_on_cut_open_in_library`, `_CUT_BATCH_HANDOFF` or `cut_handoff.py` (R11) | the R11 bullet above **+** `ROADMAP.md` R11 for the product contract — and `tests/test_cut_handoff.py`, which executes the real `_on_cut_run` on every terminal path rather than asserting about it. `.claude/rules/clips-preview.md` too if you touch what Video Review does with the folder it receives |
 | Video Review's **Confirm / Proceed / Discard all loaded clips** path, `_clips_confirm_frames`, `_clips_discard_all_frames`, `_clips_working_frame`, `_CLIPS_TRANSFERS`, `iter_sorted_clips`, `TransferTally`, `transfer_guard.py` (R13), or any `SortPlan` admission rule (UX-ZERO-KEEP) | `.claude/rules/video-review-transfer.md` **+** `.claude/rules/clips-preview.md` — the page lifecycle it decides against is the coordinator's, and `ROADMAP.md` R13 / UX-ZERO-KEEP for the product contract. `.claude/rules/audio-review.md` too if you touch `SortPlan.can_sort`, which Audio Review is admitted by |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |

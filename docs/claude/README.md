@@ -32,6 +32,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `director.md` | `src/beatsync_fork/director.py`, `tests/test_director.py` |
 | `variant-lab.md` | `src/beatsync_fork/{variant_lab,creative_recipe}.py` + their tests |
 | `render-worker.md` | `src/beatsync_fork/render_worker.py`, `tests/test_render_{worker,cancellation}.py`, `tests/test_stage5_cancellation.py` |
+| `raw-cutter-storage.md` | `src/beatsync_fork/disk_guard.py`, `src/raw_cutter_export.py`, `src/beatsync_fork/raw_cutter_batch.py`, `tests/test_raw_cutter_disk_full.py` — what a full output volume means (R4-D): the classification, the one floor, the stop, the outcome and terminal vocabulary, and the bounded manifest checkpoint |
 | `shared-analysis-cache.md` | `src/beatsync_fork/analysis_cache.py`, `tests/test_analysis_cache_sharing.py` |
 | `audio-mixdown.md` | `src/audio_mixdown.py`, `src/beatsync_fork/{audio_mix,smart_mix}.py` + their tests |
 | `music-repeat.md` | `src/music_repeater.py`, `src/beatsync_fork/music_repeat.py`, `tests/test_music_repeat.py` |

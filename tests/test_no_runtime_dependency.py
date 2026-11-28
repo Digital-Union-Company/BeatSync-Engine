@@ -153,6 +153,13 @@ def test_fork_modules_import_only_stdlib():
         # tile goes through `html.escape`, so no filename or label can carry markup or script into
         # the page. A hand-rolled escaper would be strictly worse than the stdlib one.
         "html",
+        # `errno` arrived with Raw Cutter R4-D: `disk_guard.is_disk_full_error` asks whether an
+        # `OSError` is the operating system reporting a full volume, and `errno.ENOSPC` is the name
+        # for that. Hard-coding `28` instead would be a magic number for a value the stdlib already
+        # names, and the module deliberately does NOT import `shutil` -- the one `disk_usage` call
+        # is in `raw_cutter_export`, so the policy stays testable with no disk to fill. Still
+        # stdlib, still no runtime dependency.
+        "errno",
         "math",
         "types",
         "typing",

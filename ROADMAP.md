@@ -377,6 +377,111 @@ new `tests/test_raw_cutter_naming.py`. The 88 added tests cover the job-wide sou
 batch through the real handler and an executable negative control in which the superseded
 per-index rule fails the ordering requirement.
 
+#### R4-D — Disk-full protection for Raw Cutter exports · **SOURCE COMPLETE AND TESTED · R2 REMEDIATION CLOSED · NOT OWNER PLAYTESTED**
+
+> **Supersedes the documentation proposal in PR #106** (head `df115cba`), which added the accepted
+> scope to this file and nothing else. That branch is **obsolete and is not to be merged
+> separately**: the scope text it proposed is reproduced and extended here, in the same commit as
+> the implementation, so the roadmap and the code cannot disagree about what was built.
+
+**Owner incident, 2026-11-16.** A Folder Batch attempted 15 sources; 5 completed, 1 was partial and
+9 failed. FFmpeg repeatedly returned `-28 (No space left on device)`; 580 of 1,137 planned clips
+(8.2 GB) were reported written, then the final `batch_manifest.json` could not be saved with
+`Errno 28`. The trace supports output storage exhaustion, **not a finding of corrupt source
+video**. Private source names and local filesystem paths are deliberately omitted from this public
+roadmap.
+
+**Reproduced before anything was written**, on pristine `71403afa`, by injecting FFmpeg's own
+disk-full stderr at clip 3 of a 6-clip plan and running the real exporter: **6 export attempts, 4
+identical failures, no stop**. The tool had no way to say *the drive is full*, so it said *this
+video failed* once per remaining clip.
+
+**What was implemented.**
+
+- **A capacity preflight on the REAL destination volume.** `realpath` first, so a junction or a
+  symlinked output folder is measured where the bytes actually land; a folder that does not exist
+  yet is measured at its nearest existing ancestor, so a doomed batch is refused **without first
+  creating the folder it would have written into**. The folder batch is refused before admission —
+  before the mutex, before any probe, before any scene detection, which is the "before spending
+  minutes analysing it" the scope asks for. Single Video is refused before the encode but **after**
+  its analysis, because `_on_cut_analyze` does not know the output folder; that limitation is
+  recorded rather than worked around.
+- **One floor, and estimates that can only ever warn.** Below `disk_guard.MIN_FREE_EXPORT_BYTES`
+  (64 MiB) nothing is attempted. **Only a measurement can refuse** (R2 F1): both the total and the
+  largest-clip estimates are advisory, because `estimate_bytes` derives its figure from the
+  *source's* bitrate while the clips are re-encoded and may be downscaled — measured on real media
+  at **3.1× overstatement** for a high-bitrate source, which is a refusal of jobs that would have
+  finished. The two refusal causes are also distinguished in the operator's own words and published
+  as a value: a volume reporting **zero** free is `REFUSAL_VOLUME_FULL` ("the drive is full"), while
+  anything between zero and the floor is `REFUSAL_INSUFFICIENT_HEADROOM`, which says in so many
+  words that the drive is *not* full. Every headroom figure carries the sentence that it was
+  measured just now and is not a guarantee.
+- **An immediate, classified stop — at every boundary that can meet the condition.** FFmpeg's own
+  disk-full wording and a real `ENOSPC`/Windows disk-full `OSError` raise `StorageExhausted`; the
+  exporter stops scheduling, and the batch stops scheduling further **sources**. R2 (F2) extended
+  that from two boundaries to **six**: the between-clip gate, the clip failure, the item directory,
+  and now the **in-progress checkpoint write**, the **batch directory** and the **run directory**.
+  The checkpoint was the one that mattered — it previously returned an ordinary error string, so
+  the batch switched checkpointing off and carried on scheduling onto a volume that had just failed
+  to absorb a few kilobytes of JSON. Measured end-to-end with neither half stubbed: **8 sources
+  exported before, 1 after.** The cause is read from the exception, never from rendered text, and
+  an **ordinary** failure at any of those boundaries stays ordinary and does not stop the run —
+  measured, as the negative control, against the real binary. The stderr markers are whole sentence
+  fragments on purpose: FFmpeg quotes paths, so a short marker could misdiagnose a folder named
+  `disk full` and stop a healthy run.
+- **Its own outcome and its own terminal class.** `OUTCOME_STORAGE_FULL` and
+  `TERMINAL_STORAGE_FULL`, deliberately distinct from `export_failed` and from "an unexpected
+  error" — which is the conflation that made nine sources read as nine broken videos. The source
+  it stopped on is **partial** if it published anything, later sources are **not attempted**, and
+  the headline, the panel, the handoff record, the manifest and the one notification are five
+  renderings of that single class. A storage stop can never be announced as a success.
+- **The preserved-clip count is the WHOLE batch's** (R2 F3). It is folded from the recorded
+  outcomes by the same `summarise` the table, the manifest totals, the progress bar, the handoff
+  and the notification already read — not a second counter. Before, the stop sentence carried the
+  *current source's* count, so a batch whose first source wrote 11 clips and whose second filled
+  the drive told the operator **"No clips were finished before it stopped"** directly beneath a
+  table reading "Clips exported 11 of 11". Two authorities, and the wrong one was the one that
+  makes a run look lost.
+- **Completed results are safe.** No clip, cache, output or source file is ever deleted to recover
+  space — there is no automatic recovery in R4-D at all. Staging, atomic no-overwrite publication
+  and post-encode validation are unchanged, **Review these clips** still offers the clips that
+  really exist, and a later attempt still gets a fresh output folder.
+- **Recoverable progress.** A bounded in-progress checkpoint (at most 50 writes per batch, however
+  many sources) reuses the existing manifest payload builder with `in_progress=True` and lands on
+  its **own** filename, so the authoritative record never holds an incomplete document and the
+  final write's no-replace rename cannot collide with it. A checkpoint carries `complete: false`
+  and a non-terminal status, so it cannot be mistaken for a finished run; it is discarded when the
+  final write succeeds and **kept** when it fails. One checkpoint failure is final — no retry.
+- **A lost record says so in plain words.** The final write's failure message now names a full
+  drive instead of quoting `[Errno 28]`, which was the one sentence in the incident report nobody
+  could act on.
+
+**Verification.** `tests/test_raw_cutter_disk_full.py` (the pure policy, plus the real adapter
+reached by AST extraction with its real `shutil.disk_usage`, real staging writes and real
+no-replace rename) plus handler cases in `tests/test_raw_cutter_batch.py` and
+`tests/test_cut_handoff.py`. **No drive is ever filled**: the condition is injected as FFmpeg's own
+stderr, as a real `OSError(ENOSPC)`, or as a raised policy floor. Measured non-vacuity against
+pristine `71403afa`: 45 of 68 and 20 of 29; and for the R2 pass, **21 cases fail against the R1
+candidate `45957e7c`**, each on its own assertion. Every case that passes is a named scope
+invariant or regression pin.
+
+One R2 case deliberately stubs **neither** side of a seam: F2 was a *composition* defect — both the
+adapter's error string and the handler's reaction to it were individually defensible — so the real
+`write_batch_checkpoint` runs against a real directory and a real `OSError(ENOSPC)` with the real
+handler reacting to it, and the assertion is simply how many sources reached FFmpeg.
+
+Two real-FFmpeg smokes on synthetic media verify published clips by **FFprobe frame counting and a
+full decode**, never by exit code; the R2 one measures the estimate against the bytes actually
+written. A **real-browser** smoke (Chrome against an isolated instance, production untouched) drives
+Analyze → Cut Video with one injected disk-full attempt *after* a real publication, and confirms the
+terminal report, the controls, the retained clip by decode, and the Review handoff landing on the
+right folder while scanning nothing. Real FFmpeg executions are logged separately from injected
+failures, and notification *constructor* calls separately from OS delivery, which is suppressed.
+
+**Status:** R2 findings F1, F2 and F3 closed. This commit is the candidate covered by the owner's
+conditional merge-and-install authorization. **Not owner-playtested**, and no behaviour against a
+genuinely full physical disk has ever been observed — that remains out of scope by STOP boundary.
+
 #### Remaining R4 ideas · **PLANNED, NOT IMPLEMENTED**
 
 - **Cancellation during an active FFmpeg segment**, rather than only between clips.
@@ -2301,6 +2406,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
+| **R4-D** — Raw Cutter disk-full protection and partial-run manifest | **SOURCE COMPLETE AND TESTED · R2 REMEDIATION CLOSED · NOT OWNER PLAYTESTED** (owner incident 2026-11-16; scope accepted 2026-11-17; implemented 2026-11-27; R2 remediation 2026-11-28). Capacity preflight on the resolved output volume, fail-fast on FFmpeg's disk-full wording and on `ENOSPC` at **six** boundaries, its own `OUTCOME_STORAGE_FULL` / `TERMINAL_STORAGE_FULL` rather than `export_failed`, already-published clips preserved with **no** automatic recovery, bounded per-source checkpoints on their own filename, truthful missing-manifest reporting, and real-FFmpeg plus real-browser smokes verified by decode. R2 closed three findings: estimates can no longer refuse a job (only a measurement can), a confirmed `ENOSPC` at the checkpoint stops scheduling instead of being read as an ordinary write failure, and the preserved-clip count is the whole batch's. **Supersedes PR #106**, whose documentation-only branch is obsolete and must not be merged separately. No other priority changes |
 
 ### Current priority order (product-owner decision)
 

@@ -452,8 +452,13 @@ def test_both_handlers_start_one_clock_and_pass_it_to_every_frame(gui_tree):
 
 
 def test_every_terminal_frame_freezes_the_timers(gui_tree):
-    """A running timer left on a finished job is the failure this read-out exists to prevent."""
-    for name, expected in (("_on_cut_analyze", 3), ("_on_cut_run", 3),
+    """A running timer left on a finished job is the failure this read-out exists to prevent.
+
+    [FORK] R4-D: `_on_cut_run` has FOUR terminal frames now -- finished, cancelled, crashed, and
+    the output drive filling up. The storage stop freezes the timers exactly as the other three do,
+    which is the whole point of the count: a new terminal path that forgot to would fail here.
+    """
+    for name, expected in (("_on_cut_analyze", 3), ("_on_cut_run", 4),
                            ("_on_cut_batch_run_ui", 1)):
         body = _code_only(_func(gui_tree, name))
         assert body.count("_cut_activity_final(") == expected, (name, body.count(

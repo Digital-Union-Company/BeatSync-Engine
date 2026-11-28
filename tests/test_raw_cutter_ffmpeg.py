@@ -24,6 +24,7 @@ import subprocess
 
 import pytest
 
+from beatsync_fork import disk_guard
 from beatsync_fork import raw_cutter as rc
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -152,7 +153,12 @@ def adapter():
               # supported is gone -- the planner now stands a fixed margin back from every
               # reported cut instead. See `beatsync_fork.raw_cutter.SCENE_GUARD_SECONDS`.
               "SCENE_TIMEOUT_SECONDS", "PROBE_TIMEOUT_SECONDS", "EXPORT_TIMEOUT_SECONDS",
-              "ANALYSIS_FPS", "ANALYSIS_WIDTH", "SUPPORTED_SOURCE_SUFFIXES")
+              "ANALYSIS_FPS", "ANALYSIS_WIDTH", "SUPPORTED_SOURCE_SUFFIXES",
+              # [FORK] R4-D: the export loop's two new names. Both are extracted REAL, so these
+              # real-FFmpeg cases run the live capacity re-check against `tmp_path`'s actual
+              # volume -- which also makes them a standing check that an ordinary export on a
+              # healthy drive is not refused by the gate.
+              "StorageExhausted", "measure_free_space")
     nodes = [n for n in tree.body
              if (isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted)
              or (isinstance(n, ast.Assign) and len(n.targets) == 1
@@ -189,6 +195,9 @@ def adapter():
         "_run_media_command": run_media,
         "_short_ffmpeg_error": short_error,
         "_extract_scene_times": extract_scene_times,
+        # [FORK] R4-D: the REAL `shutil` and the REAL policy module, so the measurement and the
+        # floor are the shipped ones rather than a stub that always answers "plenty".
+        "shutil": shutil, "fork_disk": disk_guard,
     }
     namespace["__annotations__"] = {}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), _EXPORT, "exec"), namespace)

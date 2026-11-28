@@ -13,10 +13,12 @@ overwritten, and the report is honest after a failure or a cancellation.
 from __future__ import annotations
 
 import ast
+import errno as _errno
 import os
 
 import pytest
 
+from beatsync_fork import disk_guard
 from beatsync_fork import raw_cutter as cutter
 from beatsync_fork import raw_cutter_batch as batch
 # [FORK] R6: the handlers reference `fork_profiles` for the output-profile default, so the
@@ -1278,9 +1280,14 @@ class _BatchRun:
     """What one executed batch did: on disk, on screen, and to the mutex."""
 
     def __init__(self, yields, batch_dir, manifest, clips, events, lock, released,
-                 published=()):
+                 published=(), checkpoints=()):
         self.yields, self.batch_dir, self.manifest = yields, batch_dir, manifest
         self.clips, self.events, self.lock, self.released = clips, events, lock, released
+        # [FORK] R4-D: every in-progress payload the batch asked to checkpoint, in order. The
+        # payloads rather than a count, because what a checkpoint may CLAIM is the half of the
+        # feature worth asserting -- an incomplete record that reads as a finished run is the
+        # thing it exists to prevent.
+        self.checkpoints = list(checkpoints)
         # [FORK] R17-A R2: what the wrapper's terminal frame asked to ANNOUNCE, recorded by the
         # stubbed `_notify_publish`. The desktop-notification subsystem is
         # `tests/test_desktop_notifications.py`'s subject; what this file can prove, and nothing
@@ -1358,10 +1365,98 @@ class _BatchRun:
         return [y for y in self.yields if y[0] == "__ESCAPED__"]
 
 
+def _real_storage_exhausted():
+    """[FORK] R4-D: the SHIPPED `StorageExhausted`, AST-extracted from `src/raw_cutter_export.py`.
+
+    The adapter cannot be imported on a bare interpreter, which is the whole reason this file
+    synthesises one -- but the exception the handler NAMES before its generic `except Exception`
+    must be the real class, or these cases would pass against a tree in which it had been renamed,
+    moved or promoted to `BaseException`. A second copy of this helper lives in
+    `tests/test_cut_handoff.py` for the single-video handler, deliberately: each suite in this
+    repository builds its own harness rather than sharing one.
+
+    **Answers `None` rather than asserting when the class is absent.** A module-level `assert`
+    would make this whole file uncollectable against a pre-R4-D tree, which collapses every case's
+    non-vacuity into one shared collection error and hides whether each test fails on its own
+    assertion. The existence requirement is one named case in `tests/test_cut_handoff.py`.
+    """
+    path = os.path.join(_REPO_ROOT, "src", "raw_cutter_export.py")
+    with open(path, encoding="utf-8") as hand:
+        tree = ast.parse(hand.read(), filename=path)
+    node = next((n for n in tree.body
+                 if isinstance(n, ast.ClassDef) and n.name == "StorageExhausted"), None)
+    if node is None:
+        return None
+    space: dict = {"fork_disk": disk_guard, "__annotations__": {}}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), space)  # noqa: S102
+    return space["StorageExhausted"]
+
+
+class _AbsentStorageExhausted(Exception):
+    """Stands in only on a tree that has no `StorageExhausted`, so this file still collects."""
+
+
+def _real_checkpoint_writer():
+    """[FORK] R4-D R2 (F2): the SHIPPED `write_batch_checkpoint`, AST-extracted and executable.
+
+    Every other adapter entry point in this file is a synthesised double, and for the usual reason:
+    the real module cannot be imported on a bare interpreter. That is fine for a seam whose *shape*
+    is the contract -- but F2 was not a defect in either half. Both halves were individually
+    defensible: an adapter that reported a failed write as an error string, and a handler that
+    reacted to an error string by switching checkpointing off and carrying on. The defect was the
+    **composition**, and a hand-written double that raises would assert the fix into existence
+    rather than observe it.
+
+    So this one double is the real function, executed against the real `disk_guard`, over a real
+    directory, with only `open` replaced -- which is what a full volume actually looks like to it.
+    `None` when the tree does not define it, so this file still collects against a pre-R4-D tree.
+    """
+    path = os.path.join(_REPO_ROOT, "src", "raw_cutter_export.py")
+    with open(path, encoding="utf-8") as hand:
+        tree = ast.parse(hand.read(), filename=path)
+    wanted = ("write_batch_checkpoint", "_discard_staging", "measure_free_space")
+    nodes = [n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
+    if {n.name for n in nodes} != set(wanted):
+        return None
+    # `StorageExhausted` is supplied rather than exec'd a second time. A second exec of the same
+    # class statement produces a DIFFERENT class object, which the handler's
+    # `except cutter_export.StorageExhausted` would not match -- so the stop would escape as an
+    # unhandled exception and the case would "fail" for a reason that has nothing to do with the
+    # product. One class, shared by the adapter double and the handler, exactly as at runtime.
+    space: dict = {"os": os, "uuid": __import__("uuid"), "shutil": __import__("shutil"),
+                   "fork_disk": disk_guard, "StorageExhausted": _StorageExhausted,
+                   "__annotations__": {}}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), path, "exec"), space)  # noqa: S102
+    return space
+
+
+_StorageExhausted = _real_storage_exhausted() or _AbsentStorageExhausted
+
+
 def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
                probe_fault=None, export_hook=None, manifest_error="", manifest_raises=False,
                prelock=False, batch_dir_error="", ui=False, rename_output=False,
-               profile=profiles.SAME_AS_SOURCE):
+               profile=profiles.SAME_AS_SOURCE,
+               # [FORK] R4-D: four ways to drive the storage paths, each at a different seam.
+               #   `refuse_capacity`   the pre-admission preflight refuses
+               #   `storage_at`        `export_segments` raises after N clips of the Nth source
+               #   `item_dir_storage`  `prepare_item_directory` raises (even a folder won't fit)
+               #   `checkpoint_error`  the in-progress checkpoint write fails
+               refuse_capacity=False, storage_at=None, item_dir_storage=None,
+               checkpoint_error="",
+               # [FORK] R4-D R2: two more seams, for the two findings reached through boundaries
+               # the earlier four could not touch.
+               #   `checkpoint_storage`  the Nth checkpoint write hits a CONFIRMED full volume
+               #                         (raises `StorageExhausted`) rather than merely failing
+               #   `batch_dir_storage`   `prepare_batch_directory` meets a full volume, so the run
+               #                         stops before it has a directory or a single source
+               checkpoint_storage=None, batch_dir_storage=False,
+               #   `checkpoint_real_enospc`  the REAL `write_batch_checkpoint` meets a real
+               #                             `OSError(ENOSPC)`, so the composition of the shipped
+               #                             adapter and the shipped handler is what runs
+               checkpoint_real_enospc=False,
+               free_bytes=500 * 1024 * 1024 * 1024, largest_clip_bytes=None):
     """Execute the real `_on_cut_batch_run` against a synthesised adapter and a real filesystem.
 
     [FORK] P19-R4: with ``ui=True`` the run is driven through the real `_on_cut_batch_run_ui`
@@ -1439,6 +1534,57 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
     exporter = _types.ModuleType("raw_cutter_export")
     exporter.CutterCancelled = _FakeCancelled
     exporter.CutterJob = _FakeJob
+    exporter.StorageExhausted = _StorageExhausted
+    checkpoints: list = []
+
+    def capacity_for_export(destination, source=None, plan=None):
+        # The REAL `disk_guard.evaluate` either way -- a refusal is produced by handing it a
+        # measured figure below the shipped floor, so the message, the `ok` property and the floor
+        # are all the shipped policy's rather than a fabricated verdict object's.
+        events.append("capacity")
+        # [FORK] R4-D R2 (F1): `largest_clip_bytes` rides through to the real policy, so a case can
+        # prove an ESTIMATE cannot refuse an admission the measurement allows.
+        return disk_guard.evaluate(1024 if refuse_capacity else free_bytes,
+                                   largest_clip_bytes=largest_clip_bytes)
+
+    def write_batch_checkpoint(batch_directory, payload):
+        events.append("checkpoint")
+        checkpoints.append(payload)
+        if checkpoint_real_enospc:
+            # The SHIPPED function, over a real directory, with only `open` replaced by the error a
+            # full volume actually raises. Whatever it does next -- raise or return -- is the
+            # adapter's own behaviour, and the handler reacts to it unaided.
+            space = _real_checkpoint_writer()
+            assert space is not None, "the adapter must define write_batch_checkpoint"
+
+            def _enospc(*_a, **_k):
+                raise OSError(_errno.ENOSPC, "No space left on device")
+
+            space["open"] = _enospc
+            return space["write_batch_checkpoint"](batch_directory, payload)
+        # [FORK] R4-D R2 (F2): the shipped adapter RAISES on a confirmed full volume here, rather
+        # than returning a string the caller can only read as "something went wrong". The double
+        # reproduces that shape so the handler's own lifecycle is what these cases drive.
+        if checkpoint_storage is not None and len(checkpoints) >= checkpoint_storage:
+            raise _StorageExhausted(
+                disk_guard.CLIP_STORAGE_FULL_REASON, free_bytes=2 * 1024 * 1024,
+                path=batch_directory, detail="[Errno 28] No space left on device")
+        if checkpoint_error:
+            return checkpoint_error
+        with open(os.path.join(batch_directory, batch.MANIFEST_CHECKPOINT_FILENAME), "w",
+                  encoding="utf-8") as handle:
+            _json.dump(payload, handle)
+        return ""
+
+    def discard_batch_checkpoint(batch_directory):
+        events.append("checkpoint:discarded")
+        target = os.path.join(batch_directory, batch.MANIFEST_CHECKPOINT_FILENAME)
+        if os.path.exists(target):
+            os.remove(target)
+
+    exporter.capacity_for_export = capacity_for_export
+    exporter.write_batch_checkpoint = write_batch_checkpoint
+    exporter.discard_batch_checkpoint = discard_batch_checkpoint
 
     def discover_batch_sources(folder, recursive):
         found = sorted(str(src_root / n) for n in sources)
@@ -1448,6 +1594,13 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         return str(src_root), str(out_root), ""
 
     def prepare_batch_directory(root, stamp):
+        if batch_dir_storage:
+            # [FORK] R4-D R2 (F2): the shipped adapter raises here too, so a full volume met before
+            # the batch has a directory is reported as a full volume rather than as an
+            # unexplained `[Errno 28]` folder-creation failure.
+            raise _StorageExhausted(
+                disk_guard.CLIP_STORAGE_FULL_REASON, free_bytes=0, path=root,
+                detail="[Errno 28] No space left on device")
         if batch_dir_error:
             # [FORK] P19-R4 (F-2): the real refusal shape -- a read-only or full output volume.
             # It returns from INSIDE the handler's `try`, which is what makes it reach the
@@ -1458,6 +1611,14 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         return target, ""
 
     def prepare_item_directory(batch_directory, parts):
+        # [FORK] R4-D: the shipped adapter RAISES on a full volume here rather than returning an
+        # error string, precisely so the batch stops instead of carrying the same failure into
+        # every remaining source. The double reproduces that shape.
+        if item_dir_storage is not None and len(
+                [e for e in events if e.startswith("export:")]) >= item_dir_storage:
+            raise _StorageExhausted(disk_guard.CLIP_STORAGE_FULL_REASON,
+                                    free_bytes=1024, path=batch_directory,
+                                    detail="[Errno 28] No space left on device")
         target = os.path.join(batch_directory, *parts)
         os.makedirs(target, exist_ok=False)
         return target, ""
@@ -1487,6 +1648,19 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         if export_hook:
             return export_hook(source, plan, run_directory, job, on_complete, naming)
         for segment in plan.segments:
+            # [FORK] R4-D: raised AFTER the earlier clips fired `on_complete`, which is the
+            # ordering the shipped exporter guarantees. `storage_at` is a (source_index, clips)
+            # pair so a case can choose between "stopped having written some" (PARTIAL) and
+            # "stopped having written none" (the distinct storage outcome).
+            if storage_at is not None:
+                stop_source, stop_after = storage_at
+                done = len([e for e in events if e.startswith("export:")])
+                if done >= stop_source and segment.index > stop_after:
+                    raise _StorageExhausted(
+                        disk_guard.CLIP_STORAGE_FULL_REASON, free_bytes=3 * 1024 * 1024,
+                        path=run_directory,
+                        detail="av_interleaved_write_frame(): No space left on device",
+                        clips_written=stop_after)
             # [FORK] R4-C: the REAL name builder, so what lands on disk here is what the shipped
             # adapter would write -- including the synthetic spelling when the batch asked for it.
             # Inventing a `clip_%03d.mp4` name in both modes would make every naming assertion
@@ -1540,7 +1714,11 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         _install_cutter_job=lambda job: events.append("job:installed"),
         _clear_cutter_job=lambda: events.append("job:cleared"),
         _cut_busy_message=lambda: "BUSY", NVENC_AVAILABLE=False,
-        CUT_BATCH_DONE_STATUS="DONE", CUT_BATCH_CANCELLED_STATUS="CANCELLED")
+        # [FORK] R4-D: the REAL policy module, so the storage sentences in the summary and the
+        # terminal classification are the shipped ones.
+        fork_disk=disk_guard,
+        CUT_BATCH_DONE_STATUS="DONE", CUT_BATCH_CANCELLED_STATUS="CANCELLED",
+        CUT_BATCH_STORAGE_FULL_STATUS="STORAGE_FULL")
 
     if ui:
         # The wrapper needs `gr.update` and the real operator-facing titles. The titles are read
@@ -1575,7 +1753,7 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
     if prelock and lock.locked():
         lock.release()
     return _BatchRun(yields, batch_dir, manifest, clips, events, lock, len(released),
-                     published=namespace.get("_published", ()))
+                     published=namespace.get("_published", ()), checkpoints=checkpoints)
 
 
 def _assert_complete_manifest(run, discovered):
@@ -2573,3 +2751,417 @@ def test_a_failed_first_source_in_a_thousand_source_batch_keeps_source_two_as_fi
     # The failed source published nothing, and no later source adopted its index.
     assert {p.split("/")[0] for p in _relative_clips(run)} == \
         {"File%04d" % i for i in range(2, 1001)}
+
+
+# =============================================================================================
+# [FORK] Digital-Union (Raw Cutter R4-D): the folder batch when the output drive fills up.
+#
+# The owner's incident of 2026-11-16: 15 sources attempted, 5 completed, 1 partial, 9 reported as
+# FAILURES as though their footage were broken, 557 of 1,137 planned clips never written, and
+# `batch_manifest.json` finally lost to `Errno 28`. Everything below drives the shipped handler on
+# that shape, with the full volume INJECTED rather than created -- no drive is ever filled.
+#
+# **Measured non-vacuity against pristine `71403afa`** (these files copied onto a pristine `src`,
+# plus `disk_guard.py` so each case fails on its own assertion rather than on one shared import):
+# 20 of the 29 R4-D cases across this file and `test_cut_handoff.py` FAIL there. The 9 that pass
+# are each a scope invariant or a regression pin, and are named here so a future reader does not
+# mistake one for proof of the change:
+#
+#   * review stays usable / clips survive / no-clips offers nothing -- scope invariants the
+#     accepted scope requires be PRESERVED. They were already true, because `TERMINAL_FAILED`
+#     also maps to a partial handoff and nothing ever deleted a published clip.
+#   * the counters, the frame arity, and both notification outcomes -- regression pins. On the
+#     pristine tree the stop arrived as an `unexpected_error` crash, which reaches the same
+#     counts, the same 7-value frame and the same PARTIAL/FAILED answers by a different route.
+#     What changed is the CLASS and the wording, which the 20 failing cases carry.
+# =============================================================================================
+
+def test_an_unwritable_output_volume_is_refused_before_any_work(tmp_path, monkeypatch):
+    """"Refuse an obviously unwritable job before spending minutes analysing it." The refusal is
+    pre-admission, so nothing is probed, nothing is detected, no mutex is taken, and -- the part a
+    check placed one statement later would get wrong -- no `RawCutter_Batch_<ts>` folder is left
+    behind to be mistaken for an attempted run."""
+    run = _run_batch(tmp_path, monkeypatch, refuse_capacity=True, ui=True)
+    assert "capacity" in run.events
+    assert not [e for e in run.events if e.startswith(("probe:", "detect:", "export:"))]
+    assert "job:installed" not in run.events
+    assert run.released == 0, "a refused batch must not have taken the mutex"
+    assert run.batch_dir == "", "no output folder may be created for a refused job"
+    assert run.manifest is None
+    assert "full" in run.status
+    # A job that never started has no outcome to announce.
+    assert run.published == []
+    assert run.handoff is None
+
+
+def test_the_preflight_runs_before_the_mutex_and_before_the_directory(tmp_path, monkeypatch):
+    """Ordering, measured on the event trace of a normal run: the capacity check precedes both."""
+    run = _run_batch(tmp_path, monkeypatch)
+    assert run.events.index("capacity") < run.events.index("job:installed")
+    assert run.events.index("capacity") < run.events.index("probe:a.mp4")
+
+
+def test_a_full_drive_stops_scheduling_and_marks_later_sources_not_attempted(tmp_path,
+                                                                             monkeypatch):
+    """The correction to the incident, end to end. Source 2 published 2 of its 4 clips and is
+    PARTIAL; source 3 is never opened and is `not_attempted` -- rather than producing one more
+    identical failure, which is what nine of the owner's fifteen sources did."""
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(2, 2), ui=True)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_COMPLETED, batch.OUTCOME_PARTIAL,
+                            batch.OUTCOME_NOT_ATTEMPTED]
+    assert [e for e in run.events if e.startswith("export:")] == ["export:a.mp4", "export:b.mp4"]
+    assert "probe:c.mp4" not in run.events, "no later source may be opened"
+    assert run.manifest["terminal_status"] == batch.TERMINAL_STORAGE_FULL
+    assert run.manifest["output_storage_full"] is True
+    assert run.manifest["cancelled"] is False, "a full drive is not a cancellation"
+    assert run.manifest["fatal_error"] == "", "a full drive is not a crash"
+    assert run.manifest["complete"] is True
+    assert run.status == _ui_strings()["CUT_BATCH_STORAGE_FULL_STATUS"]
+    assert run.status != _ui_strings()["CUT_BATCH_DONE_STATUS"], \
+        "a run that stopped part-way may not use the finished-batch status line"
+
+
+def test_a_source_that_lost_every_clip_to_the_drive_is_not_an_export_failure(tmp_path,
+                                                                             monkeypatch):
+    """`export_failed` is this module's word for "the encoder could not produce these clips" -- a
+    statement about the footage. Nine such rows is what made the incident report read as nine
+    broken videos."""
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(1, 0), ui=True)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_STORAGE_FULL, batch.OUTCOME_NOT_ATTEMPTED,
+                            batch.OUTCOME_NOT_ATTEMPTED]
+    assert run.outcomes[0] != batch.OUTCOME_EXPORT_FAILED
+    assert run.outcomes[0] != batch.OUTCOME_UNEXPECTED_ERROR
+    assert disk_guard.CLIP_STORAGE_FULL_REASON in run.manifest["sources"][0]["error"]
+
+
+def test_the_batch_counters_are_right_after_a_storage_stop(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(2, 2), ui=True)
+    totals = run.manifest["totals"]
+    rows = run.manifest["sources"]
+    assert totals["discovered"] == 3
+    assert totals["attempted"] == 2, "the source it never opened was not attempted"
+    assert totals["completed"] == 1
+    assert totals["partial"] == 1
+    assert totals["not_attempted"] == 1
+    # Derived, not hardcoded: the fixture's plan size is incidental to this assertion, and the
+    # invariant is that the record and the disk agree.
+    assert totals["clips_written"] == len(run.clips)
+    assert rows[1]["clips_written"] == 2, "the stopped source kept exactly what it published"
+    assert rows[1]["clips_written"] < rows[1]["clips_planned"]
+    assert totals["clips_written"] == rows[0]["clips_written"] + 2
+    assert rows[2]["clips_written"] == 0 and rows[2]["clips_planned"] == 0
+
+
+def test_the_clips_already_written_survive_a_storage_stop(tmp_path, monkeypatch):
+    """Nothing is deleted to recover space, and the source tree is untouched."""
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(2, 2), ui=True)
+    assert run.clips, "the harness must really have written clips"
+    assert all(os.path.getsize(c) > 0 for c in run.clips)
+    assert len(run.clips) == run.manifest["totals"]["clips_written"]
+    # Source 3 was never opened, so it has no folder at all -- nothing was created for it and
+    # nothing of anyone else's was removed to make room.
+    assert sorted(p.name for p in (tmp_path / "in").iterdir()) == ["a.mp4", "b.mp4", "c.mp4"]
+    assert set(os.listdir(run.batch_dir)) == {batch.MANIFEST_FILENAME, "a", "b"}
+
+
+def test_a_storage_stopped_batch_still_offers_review_of_the_clips_that_exist(tmp_path,
+                                                                             monkeypatch):
+    """A full drive is a reason to stop writing, never a reason to withhold footage the operator
+    already has -- the same trade a lost manifest gets."""
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(2, 2), ui=True)
+    assert run.handoff is not None
+    assert run.handoff["directory"] == run.batch_dir
+    assert run.handoff["clips"] == run.manifest["totals"]["clips_written"]
+    assert run.handoff["clips"] == len(run.clips), "the count is PUBLISHED clips, never planned"
+    assert run.handoff["outcome"] == handoff.OUTCOME_PARTIAL
+    assert run.review_enabled is True
+    # ...and every running frame still cleared it, so a working batch cannot offer the previous
+    # job's folder.
+    assert run.handoffs[:-1] == [None] * (len(run.handoffs) - 1)
+
+
+def test_a_storage_stop_with_no_clips_at_all_offers_nothing(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(1, 0), ui=True)
+    assert run.clips == []
+    assert run.handoff is None
+    assert run.review_enabled is False
+
+
+def test_the_panel_names_the_drive_rather_than_blaming_the_run(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(2, 2), ui=True)
+    titles = _ui_strings()
+    assert run.panel.get("title") == titles["CUT_BATCH_STORAGE_FULL_TITLE"]
+    assert "drive" in run.panel.get("title", "")
+    assert run.panel.get("state") == "failed"
+    assert run.panel.get("title") != titles["CUT_BATCH_DONE_TITLE"]
+    assert run.panel.get("title") != titles["CUT_BATCH_CANCELLED_TITLE"]
+    assert run.headline.endswith("the output drive is full")
+    # The panel is determinate and stopped part-way: 2 of 3 sources recorded. A 100 % bar over a
+    # run that never reached its last source would be the panel agreeing with nothing.
+    assert run.panel.get("done") == "2"
+    assert run.panel.get("pct") != 100
+
+
+def test_exactly_one_notification_and_it_is_never_a_success(tmp_path, monkeypatch):
+    """One for the BATCH, not one per failed clip, and a run stopped part-way through its frozen
+    list may not be announced as finished however many clips it wrote first."""
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(2, 2), ui=True)
+    assert len(run.published) == 1, run.published
+    job_kind, outcome = run.notification
+    assert job_kind == notify.JOB_RAW_CUTTER_BATCH
+    assert outcome == notify.OUTCOME_PARTIAL
+    assert outcome != notify.OUTCOME_SUCCESS
+    assert outcome != notify.OUTCOME_CANCELLED, "nobody pressed anything"
+
+
+def test_a_total_loss_to_the_drive_is_announced_as_a_failure(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch, storage_at=(1, 0), ui=True)
+    assert len(run.published) == 1
+    assert run.notification == (notify.JOB_RAW_CUTTER_BATCH, notify.OUTCOME_FAILED)
+
+
+def test_a_full_drive_at_the_item_directory_stops_the_batch_too(tmp_path, monkeypatch):
+    """Even a directory entry needs space. Without the adapter raising there, the handler's generic
+    clause would have recorded `unexpected_error` and headlined a diagnosed stop as a crash."""
+    run = _run_batch(tmp_path, monkeypatch, item_dir_storage=1, ui=True)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_COMPLETED, batch.OUTCOME_STORAGE_FULL,
+                            batch.OUTCOME_NOT_ATTEMPTED]
+    assert run.manifest["terminal_status"] == batch.TERMINAL_STORAGE_FULL
+    assert run.manifest["fatal_error"] == ""
+    assert run.escaped == [], "the stop must not escape the generator"
+
+
+# --- the recoverable-progress half ------------------------------------------------------------
+
+def test_a_checkpoint_is_written_while_space_is_still_available(tmp_path, monkeypatch):
+    """Three sources, so a checkpoint after each of the first two and none after the last -- which
+    finalisation follows immediately."""
+    run = _run_batch(tmp_path, monkeypatch)
+    assert len(run.checkpoints) == 2, run.checkpoints
+    for payload in run.checkpoints:
+        assert payload["complete"] is False
+        assert payload["terminal_status"] == batch.TERMINAL_IN_PROGRESS
+    assert [p["totals"]["attempted"] for p in run.checkpoints] == [1, 2]
+
+
+def test_a_successful_final_write_discards_the_checkpoint(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch)
+    assert "checkpoint:discarded" in run.events
+    assert not os.path.exists(os.path.join(run.batch_dir,
+                                           batch.MANIFEST_CHECKPOINT_FILENAME))
+    assert os.path.exists(os.path.join(run.batch_dir, batch.MANIFEST_FILENAME))
+
+
+def test_a_lost_final_write_KEEPS_the_checkpoint(tmp_path, monkeypatch):
+    """This is the case the checkpoint exists for, and it is exactly how the incident ended: the
+    clips were written and the authoritative record was not. The partial record is then the only
+    one there is, so it must not be cleaned up."""
+    run = _run_batch(tmp_path, monkeypatch, manifest_error="the output drive is full")
+    assert "checkpoint:discarded" not in run.events
+    assert os.path.exists(os.path.join(run.batch_dir, batch.MANIFEST_CHECKPOINT_FILENAME))
+    assert not os.path.exists(os.path.join(run.batch_dir, batch.MANIFEST_FILENAME))
+    assert "could NOT be saved" in run.summary
+
+
+def test_a_failed_checkpoint_is_not_retried_per_source(tmp_path, monkeypatch):
+    """A failure here is final -- an attempt per remaining source is the unbounded retry R4-D
+    forbids.
+
+    [FORK] R4-D R2 (F2): the injected failure is deliberately an ORDINARY one (a permission), and
+    this case is now the negative control for the storage stop below. It proves the two outcomes
+    are genuinely different and not merely differently worded: a bookkeeping failure that is not a
+    capacity failure must leave the batch cutting every remaining source.
+    """
+    run = _run_batch(tmp_path, monkeypatch,
+                     sources=tuple(f"s{i:02d}.mp4" for i in range(1, 9)),
+                     checkpoint_error="Permission denied")
+    assert len([e for e in run.events if e == "checkpoint"]) == 1, run.events
+    # ...and the batch itself is unaffected: a bookkeeping failure is not a job failure.
+    assert len([e for e in run.events if e.startswith("export:")]) == 8
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] * 8
+    assert run.manifest["terminal_status"] == batch.TERMINAL_COMPLETED
+    assert run.manifest["output_storage_full"] is False
+
+
+# --- [FORK] R4-D R2, finding F2: a CONFIRMED full volume at the checkpoint -------------------
+
+def test_a_confirmed_full_volume_at_the_CHECKPOINT_stops_scheduling(tmp_path, monkeypatch):
+    """The F2 defect, driven through the real handler.
+
+    The shipped candidate could only learn "the checkpoint write failed", so it switched
+    checkpointing off and carried on scheduling. With eight sources that is seven more sources
+    probed, detected, planned, given a folder and handed to FFmpeg on a volume that had just failed
+    to absorb a few kilobytes of JSON -- the 2026-11-16 incident, through a different boundary.
+    """
+    run = _run_batch(tmp_path, monkeypatch,
+                     sources=tuple(f"s{i:02d}.mp4" for i in range(1, 9)),
+                     checkpoint_storage=1, ui=True)
+    # ONE source exported. This is the whole finding.
+    assert len([e for e in run.events if e.startswith("export:")]) == 1, run.events
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] + [batch.OUTCOME_NOT_ATTEMPTED] * 7
+    assert run.manifest["terminal_status"] == batch.TERMINAL_STORAGE_FULL
+    assert run.manifest["output_storage_full"] is True
+    assert run.manifest["cancelled"] is False, "nobody pressed anything"
+    assert run.manifest["fatal_error"] == "", "a diagnosed stop is not a crash"
+    assert run.escaped == [], "the stop must not escape the generator"
+    # The REAL status line, because `ui=True` loads the shipped `ui_content` strings.
+    assert run.status == _ui_strings()["CUT_BATCH_STORAGE_FULL_STATUS"]
+
+
+def test_the_REAL_adapter_and_the_REAL_handler_together_stop_on_a_real_ENOSPC(tmp_path,
+                                                                              monkeypatch):
+    """[FORK] R4-D R2 (F2): the composition, which is where the defect actually was.
+
+    Both halves of the shipped candidate were individually defensible -- an adapter that reported a
+    failed checkpoint write as an error string, and a handler that reacted to an error string by
+    switching checkpointing off and carrying on cutting. Neither is wrong on its own, and a case
+    that stubs either one passes on the broken tree. So this case stubs **neither**: the real
+    `write_batch_checkpoint` runs against a real directory and a real `OSError(ENOSPC)`, the real
+    `_on_cut_batch_run` reacts to whatever it does, and the only thing asserted is how many sources
+    got handed to FFmpeg.
+
+    On the candidate: **eight**. The volume had just refused a few kilobytes of JSON and the batch
+    went on to attempt every remaining source -- the 2026-11-16 incident, through a boundary the
+    first pass did not reach.
+    """
+    run = _run_batch(tmp_path, monkeypatch,
+                     sources=tuple(f"s{i:02d}.mp4" for i in range(1, 9)),
+                     checkpoint_real_enospc=True, ui=True)
+    assert len([e for e in run.events if e.startswith("export:")]) == 1, run.events
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] + [batch.OUTCOME_NOT_ATTEMPTED] * 7
+    assert run.manifest["terminal_status"] == batch.TERMINAL_STORAGE_FULL
+    assert run.manifest["output_storage_full"] is True
+    assert run.escaped == []
+    # The first source's clips are kept, and the whole-batch count is what the operator is told.
+    kept = run.manifest["totals"]["clips_written"]
+    assert kept > 0 and len(run.clips) == kept
+    assert f"{kept} clip(s) were finished before it stopped" in run.summary
+
+
+def test_no_later_source_is_even_LOOKED_AT_after_a_checkpoint_storage_stop(tmp_path, monkeypatch):
+    """"Stop scheduling further clips and sources." Not just no export -- no probe and no scene
+    detection either, which is where the minutes actually go."""
+    run = _run_batch(tmp_path, monkeypatch,
+                     sources=tuple(f"s{i:02d}.mp4" for i in range(1, 9)),
+                     checkpoint_storage=1)
+    assert [e for e in run.events if e.startswith("probe:")] == ["probe:s01.mp4"]
+    assert [e for e in run.events if e.startswith("detect:")] == ["detect:s01.mp4"]
+    # And exactly one checkpoint was attempted -- the one that found the volume full.
+    assert len([e for e in run.events if e == "checkpoint"]) == 1
+
+
+def test_a_checkpoint_storage_stop_preserves_the_clips_and_the_last_good_checkpoint(tmp_path,
+                                                                                    monkeypatch):
+    """"Retain all previously published clips, preserve the last valid checkpoint and attempt
+    bounded finalization." All three, in one case, because they are one requirement."""
+    run = _run_batch(tmp_path, monkeypatch,
+                     sources=tuple(f"s{i:02d}.mp4" for i in range(1, 9)),
+                     checkpoint_storage=2)
+    # Two sources finished, so their clips are on disk and still there afterwards.
+    assert run.outcomes[:2] == [batch.OUTCOME_COMPLETED] * 2
+    assert len(run.clips) == run.manifest["totals"]["clips_written"] > 0
+    # The first checkpoint succeeded and was never discarded, because the FINAL write is what
+    # discards it and this run's final write is the only one that happened.
+    assert len(run.checkpoints) == 2, "the second attempt is the one that met the full volume"
+    # Finalisation was attempted exactly once -- bounded, not retried.
+    assert len([e for e in run.events if e == "manifest"]) == 1
+    assert os.path.exists(os.path.join(run.batch_dir, batch.MANIFEST_FILENAME))
+
+
+def test_exactly_one_notification_for_a_checkpoint_storage_stop(tmp_path, monkeypatch):
+    """One per run, keyed off the terminal class, never one per boundary that detected it."""
+    run = _run_batch(tmp_path, monkeypatch,
+                     sources=tuple(f"s{i:02d}.mp4" for i in range(1, 9)),
+                     checkpoint_storage=1, ui=True)
+    assert len(run.published) == 1, run.published
+    assert run.notification == (notify.JOB_RAW_CUTTER_BATCH, notify.OUTCOME_PARTIAL)
+
+
+def test_a_full_volume_BEFORE_the_batch_directory_exists_names_the_drive(tmp_path, monkeypatch):
+    """[FORK] R4-D R2 (F2): the boundary with no source and no directory yet.
+
+    The candidate answered this with `prepare_batch_directory`'s ordinary refusal string, so the
+    operator read ``"Could not create the batch folder: [Errno 28] No space left on device"``. The
+    handler now has a clause for it, so the drive is named and every source is honestly
+    `not_attempted`.
+    """
+    run = _run_batch(tmp_path, monkeypatch, batch_dir_storage=True, ui=True)
+    assert run.escaped == [], "a diagnosed stop must not escape as a crash"
+    assert run.status == _ui_strings()["CUT_BATCH_STORAGE_FULL_STATUS"]
+    assert "output drive is full" in run.headline
+    assert "ran out of space" in run.summary
+    assert "No clips were finished" in run.summary, "there were none, and it must not invent any"
+    assert run.clips == []
+    assert run.handoff is None, "nothing was written, so nothing is offered for review"
+    assert run.panel.get("title") == _ui_strings()["CUT_BATCH_STORAGE_FULL_TITLE"]
+    assert len(run.published) == 1
+    assert run.notification == (notify.JOB_RAW_CUTTER_BATCH, notify.OUTCOME_FAILED)
+
+
+# --- [FORK] R4-D R2, finding F3: whole-batch preserved-clip accounting -----------------------
+
+@pytest.mark.parametrize("seam,kwargs", [
+    ("export", {"storage_at": (2, 0)}),
+    ("item_directory", {"item_dir_storage": 1}),
+    ("checkpoint", {"checkpoint_storage": 1}),
+])
+def test_the_storage_STOP_reports_the_WHOLE_BATCHS_preserved_clips(tmp_path, monkeypatch, seam,
+                                                                    kwargs):
+    """The F3 defect, at all three seams that can stop a batch.
+
+    Each case runs a batch whose FIRST source finishes and whose SECOND stops the run without
+    publishing anything. The shipped candidate passed the exception's or the current source's own
+    count -- zero in every one of these -- so the operator was told **"No clips were finished
+    before it stopped"** while the summary table directly above it listed every clip the first
+    source had written, sitting safely on disk. Two numbers from two authorities, and the wrong one
+    is the one that makes a run look lost.
+
+    The count now comes from `summarise(items, total).clips_written`: the same fold the table, the
+    manifest totals, the progress bar, the handoff and the notification all read.
+    """
+    run = _run_batch(tmp_path, monkeypatch, ui=True, **kwargs)
+    kept = run.manifest["totals"]["clips_written"]
+    assert kept > 0, f"the {seam} fixture must leave the first source's clips on disk"
+    assert len(run.clips) == kept, "and they are really there"
+    assert f"{kept} clip(s) were finished before it stopped" in run.summary, run.summary
+    assert "No clips were finished" not in run.summary
+    # The same number the handoff offers, so the two cannot disagree.
+    assert run.handoff["clips"] == kept
+
+
+def test_a_checkpoint_never_lands_on_the_authoritative_filename(tmp_path, monkeypatch):
+    """Had it, the final write's no-replace `os.rename` would have found it there and every
+    checkpointed batch would have ended by reporting its own record as lost."""
+    run = _run_batch(tmp_path, monkeypatch, manifest_error="injected")
+    assert os.path.exists(os.path.join(run.batch_dir, batch.MANIFEST_CHECKPOINT_FILENAME))
+    assert not os.path.exists(os.path.join(run.batch_dir, batch.MANIFEST_FILENAME))
+
+
+# --- the regressions this must not have broken ------------------------------------------------
+
+def test_a_clean_batch_is_untouched_by_r4d(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] * 3
+    assert run.manifest["terminal_status"] == batch.TERMINAL_COMPLETED
+    assert run.manifest["output_storage_full"] is False
+    assert run.manifest["complete"] is True
+    assert run.panel.get("state") == "done"
+    assert run.status == _ui_strings()["CUT_BATCH_DONE_STATUS"]
+    assert run.notification == (notify.JOB_RAW_CUTTER_BATCH, notify.OUTCOME_SUCCESS)
+
+
+def test_a_cancelled_batch_is_still_reported_as_cancelled(tmp_path, monkeypatch):
+    """`storage_full` outranks `cancelled` in the classifier, so the one case that could have
+    regressed is a plain cancellation with no storage stop at all."""
+    def _cancel(source, plan, run_directory, job, on_complete, naming):
+        raise _FakeCancelled("stopped")
+
+    run = _run_batch(tmp_path, monkeypatch, export_hook=_cancel, ui=True)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_CANCELLED
+    assert run.manifest["cancelled"] is True
+    assert run.manifest["output_storage_full"] is False
+    assert run.status == _ui_strings()["CUT_BATCH_CANCELLED_STATUS"]

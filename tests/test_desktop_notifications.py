@@ -1056,12 +1056,31 @@ def test_the_two_batch_tables_cover_the_whole_terminal_vocabulary_exactly_once(t
     ns = _notify_namespace(tmp_path)
     translated = set(ns["_CUT_BATCH_RUN_OUTCOMES"])
     folded = set(ns["_CUT_BATCH_RAN_TO_END"])
+    # [FORK] R4-D: a THIRD rule, and it is deliberately not a table. `TERMINAL_STORAGE_FULL` is
+    # neither a flat translation (only the counts can tell a stop after twelve good sources from
+    # one before the first) nor a run that reached the end of its list (that fold can answer
+    # SUCCESS, which a run stopped part-way must never be announced as), so it is an explicit
+    # branch in `_notify_cut_batch`. It is named here rather than inferred, and the partition
+    # assertion below still covers it, so a *fourth* class with no rule at all still fails.
+    storage = {fork_cutter_batch.TERMINAL_STORAGE_FULL}
+    assert f"fork_cutter_batch.{'TERMINAL_STORAGE_FULL'}" in ast.unparse(
+        _func(_tree(_GUI), "_notify_cut_batch")), "the storage branch is gone"
     vocabulary = {getattr(fork_cutter_batch, name) for name in dir(fork_cutter_batch)
-                  if name.startswith("TERMINAL_")}
+                  if name.startswith("TERMINAL_")
+                  # `TERMINAL_IN_PROGRESS` is the checkpoint-only marker and is never a terminal
+                  # answer -- `terminal_status` cannot return it, so `sink['terminal']` cannot
+                  # hold it and no notification rule may claim it. Asserted, not assumed.
+                  and name != "TERMINAL_IN_PROGRESS"}
 
     assert vocabulary, "the batch module declares no TERMINAL_* constants"
-    assert translated | folded == vocabulary, vocabulary - (translated | folded)
-    assert not (translated & folded)
+    assert fork_cutter_batch.TERMINAL_IN_PROGRESS not in {
+        fork_cutter_batch.terminal_status([], 0, False),
+        fork_cutter_batch.terminal_status([], 0, True),
+        fork_cutter_batch.terminal_status([], 0, False, "boom"),
+        fork_cutter_batch.terminal_status([], 0, False, storage_full=True)}
+    assert translated | folded | storage == vocabulary, \
+        vocabulary - (translated | folded | storage)
+    assert not (translated & folded) and not (storage & (translated | folded))
     assert set(ns["_CUT_BATCH_RUN_OUTCOMES"].values()) <= set(dn.OUTCOMES)
 
 
@@ -1451,8 +1470,10 @@ _PRODUCER_CALLS = {
     "process_video_guarded": ("_notify_render", 1),
     # One for the whole 2-4-candidate batch, after its outcome object is built.
     "render_selected_variants_guarded": ("_notify_render_batch", 1),
-    # Three: finished, cancelled, crashed. Every `refuse(...)` path performed no work.
-    "_on_cut_run": ("_notify_cut", 3),
+    # Four: finished, cancelled, crashed, and -- since R4-D -- the output drive filling up. Every
+    # `refuse(...)` path performed no work and is deliberately not a notification site, which
+    # includes R4-D's own capacity preflight: a refused job created nothing and encoded nothing.
+    "_on_cut_run": ("_notify_cut", 4),
     "_on_cut_batch_run_ui": ("_notify_cut_batch", 1),
     # Four: the export terminal, plus the three failures that follow the analysis.
     "_on_audio_cut": ("_notify_audio_cut", 4),

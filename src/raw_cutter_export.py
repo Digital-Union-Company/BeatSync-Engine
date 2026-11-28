@@ -12,6 +12,7 @@ Cutting raw footage is not a render and must not acquire a render's machinery.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -19,6 +20,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+from beatsync_fork import disk_guard as fork_disk
 from beatsync_fork import raw_cutter as fork_cutter
 from ffmpeg_processing import (
     FFMPEG_PATH,
@@ -60,6 +62,124 @@ class CutterCancelled(Exception):
     broad ``except Exception`` on this path must name it first if it wants to distinguish a stop
     from a failure.
     """
+
+
+class StorageExhausted(Exception):
+    """[FORK] R4-D: the output volume ran out of space, so no further clip will be attempted.
+
+    An ordinary ``Exception``, deliberately -- the same choice `CutterCancelled` and
+    `RenderCancelled` make -- so **a broad ``except Exception`` on this path must name it first if
+    it wants to distinguish a full drive from a crash.** It is neither: the tool worked, detected a
+    condition it cannot work around, and stopped. Reporting it through the generic handler would
+    reproduce the 2026-11-16 incident one level up, where "the batch stopped on an unexpected
+    error" would be printed over a correctly diagnosed and correctly handled stop.
+
+    It carries the facts rather than only a sentence, so each caller composes its own wording from
+    structure: `free_bytes` (``None`` when the volume could not be measured -- never zero, which
+    would be a measurement nobody took), the `path` whose volume filled, `detail` as FFmpeg or the
+    OS reported it, and `clips_written`, which the exporter fills in because it is the only layer
+    that knows how many of this source's clips were published before it stopped.
+    """
+
+    def __init__(self, message: str = "", *, free_bytes: int | None = None, path: str = "",
+                 detail: str = "", clips_written: int = 0) -> None:
+        super().__init__(message or fork_disk.CLIP_STORAGE_FULL_REASON)
+        self.free_bytes = free_bytes
+        self.path = path
+        self.detail = detail
+        self.clips_written = clips_written
+
+
+def measure_free_space(path: str) -> int | None:
+    """Free bytes on the volume that actually holds ``path``, or ``None`` if it cannot be read.
+
+    [FORK] R4-D. Three properties, each of which something in this repository has previously got
+    wrong somewhere:
+
+    * **The volume is resolved, never assumed from a drive letter.** `realpath` runs first, so a
+      junction or symlink is followed and the measurement describes where the bytes really land.
+      An ``output\\`` that is a junction onto a larger drive is a legitimate, measured-working
+      setup here (see the share-publication rule), and measuring the letter the operator typed
+      would report the wrong volume's headroom for exactly that configuration.
+    * **A destination that does not exist yet is measured at its nearest existing ancestor**, so a
+      brand-new output folder can be judged before it is created -- which is what lets a doomed
+      batch be refused without first creating the folder it would have written into.
+    * **Unreadable is ``None``, never ``0``.** A removed drive, a permission or a path that
+      resolves to nothing is *unknown* free space. Returning zero would turn every such case into a
+      refusal, which is the opposite of what absent evidence means.
+
+    **And a path that names nothing is tested for emptiness BEFORE `abspath`**, which is the same
+    trap `_normalize_folder_text` was written for: ``os.path.abspath("")`` returns the **current
+    working directory**, which for this application is its own install folder. A blank destination
+    would therefore have been measured on the install volume and reported as this job's headroom --
+    quietly answering about the wrong drive, and able to admit a job that should have been refused.
+    ``""`` is *unknown*, so it answers ``None``.
+
+    Reads nothing but one ``shutil.disk_usage``: no walk, no enumeration, no file is opened. It is
+    cheap enough to call before every clip, which is what the between-clip re-check does.
+    """
+    if not isinstance(path, str):
+        return None
+    trimmed = path.strip().strip('"').strip()
+    if not trimmed:
+        return None
+    try:
+        probe = os.path.abspath(os.path.expandvars(os.path.expanduser(trimmed)))
+    except (TypeError, ValueError):
+        return None
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    if not probe:
+        return None
+    try:
+        return int(shutil.disk_usage(os.path.realpath(probe)).free)
+    except (OSError, ValueError):
+        return None
+
+
+def capacity_for_export(destination: str, source: "fork_cutter.SourceInfo | None" = None,
+                        plan: "fork_cutter.SegmentPlan | None" = None
+                        ) -> fork_disk.CapacityVerdict:
+    """[FORK] R4-D: measure the destination volume and classify it against this job.
+
+    The split is the usual one: this performs the one measurement and
+    `beatsync_fork.disk_guard.evaluate` owns every rule, so the whole policy stays testable with no
+    disk to fill. `source` and `plan` are optional because the two callers legitimately ask at
+    different times -- a folder batch checks before it has looked at any source, a single cut checks
+    with a finished plan in hand -- and an estimate nobody can compute is reported as absent rather
+    than as zero.
+
+    **Staging needs no separate measurement, and that is structural rather than an omission.**
+    `export_segments` writes its staging file *inside* ``run_directory``, which is why the
+    publication is a same-directory rename and ``EXDEV`` is impossible there; one volume therefore
+    holds the staged bytes, the published clip and the batch record alike. If staging ever moves
+    out of the run directory, this function needs a second measurement on the same day.
+    """
+    seconds = 0.0
+    longest = 0.0
+    if plan is not None:
+        for segment in plan.segments:
+            seconds += segment.duration
+            longest = max(longest, segment.duration)
+    size = getattr(source, "size_bytes", 0) if source is not None else 0
+    duration = getattr(source, "duration", 0.0) if source is not None else 0.0
+    return fork_disk.evaluate(
+        measure_free_space(destination),
+        fork_disk.estimate_bytes(size, duration, seconds),
+        fork_disk.estimate_bytes(size, duration, longest),
+        volume=_volume_label(destination))
+
+
+def _volume_label(path: str) -> str:
+    """The drive the operator would recognise (``E:\\``), for a message only. ``''`` if unknown."""
+    try:
+        resolved = os.path.realpath(os.path.abspath(str(path or "")))
+        return os.path.splitdrive(resolved)[0] or ""
+    except (OSError, TypeError, ValueError):
+        return ""
 
 
 class CutterJob:
@@ -285,6 +405,11 @@ class SegmentResult:
     ok: bool = False
     error: str = ""
     size_bytes: int = 0
+    #: [FORK] R4-D: did THIS clip's failure prove the output volume is full? APPENDED with a
+    #: default, so every existing construction and every existing reader keeps working untouched.
+    #: It exists so a caller can tell the one clip that diagnosed the drive from the ordinary
+    #: encoder failures that may sit beside it in the same list, without reading `error` as prose.
+    storage_full: bool = False
 
 
 def build_segment_command(source_path: str, destination: str, start: float, duration: float,
@@ -509,6 +634,24 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
     add a fallible step between publication and ``on_complete``, which the R4 contract forbids.
     Nothing else changes: same argv, same VFR options, same audio handling, same encoder, same
     staged no-replace publication, same containment check.
+
+    **[FORK] R4-D: a confirmed full output volume raises `StorageExhausted` instead of failing
+    every remaining clip.** Two triggers, both positive, and nothing else:
+
+    * the free-space re-check at the top of each iteration falls below
+      `disk_guard.MIN_FREE_EXPORT_BYTES`; or
+    * a clip's own failure is classified as a full volume -- FFmpeg's own wording, or an `OSError`
+      the OS marked `ENOSPC`.
+
+    An **ordinary** encoder failure is untouched: it is recorded and the loop carries on to the
+    next clip exactly as before, which is the behaviour a single bad passage in an otherwise usable
+    source depends on. The difference between the two is the whole feature, so it is decided by
+    `beatsync_fork.disk_guard` from evidence rather than from a return code.
+
+    Nothing is deleted to recover, no clip is retried, and already-published clips are not touched
+    -- `results` and every `on_complete` already fired remain exactly what they were. No child
+    process is running when this raises, either: both triggers sit between clips, and
+    `_run_media_command` has already reaped the one it ran.
     """
     results: list[SegmentResult] = []
     total = plan.count
@@ -519,9 +662,33 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
         if on_complete is not None:
             on_complete(result)
 
+    def published_count() -> int:
+        return sum(1 for result in results if result.ok)
+
     for segment in plan.segments:
         if job is not None and job.cancelled:
             raise CutterCancelled()
+
+        # [FORK] R4-D: the between-clip capacity re-check, and it runs before the FIRST clip too.
+        #
+        # One `shutil.disk_usage` per clip, which is microseconds against an encode measured in
+        # seconds, so there is no cost argument for sampling it less often. It fires BEFORE
+        # `on_progress`, so a clip that will not be attempted is never announced as starting.
+        #
+        # Deliberately a refusal rather than an attempt. Below the floor an MP4's trailer and
+        # `moov` atom have nowhere to go, and a clip whose tail is lost still exists, still has
+        # non-zero size and still probes as having a video stream -- which is precisely the shape
+        # of damage `_validate_output` is least able to see. See
+        # `disk_guard.MIN_FREE_EXPORT_BYTES` for the trade-off this accepts in exchange.
+        #
+        # An UNMEASURED volume does not refuse: `measure_free_space` answers `None` for a drive it
+        # cannot read, and refusing on absent evidence would stop jobs that are fine.
+        free_now = measure_free_space(root)
+        if free_now is not None and free_now < fork_disk.MIN_FREE_EXPORT_BYTES:
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=free_now, path=root,
+                clips_written=published_count())
+
         name = fork_cutter.segment_filename(source.path, segment.index, total, naming=naming)
         destination = os.path.abspath(os.path.join(root, name))
         if os.path.commonpath([root, destination]) != root:
@@ -562,14 +729,24 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
                                         remove_audio, encoder, source.has_audio,
                                         output_profile)
         failure = ""
+        # [FORK] R4-D: set only by a POSITIVE classification -- FFmpeg's own wording, or an
+        # `OSError` the OS marked `ENOSPC`. It is never inferred from a return code, a missing
+        # file or an empty output, because all three are also what an ordinary encoder failure
+        # looks like, and misreading one of those as a full drive would stop a healthy run.
+        storage_full = False
         try:
             result = _run_media_command(command, timeout=EXPORT_TIMEOUT_SECONDS)
             if result.returncode != 0:
                 failure = _short_ffmpeg_error(result.stderr, max_chars=400) or "FFmpeg failed."
+                # Both encoders arrive here. NVENC and libx264 differ in the argv above and in
+                # nothing below it: the return code and stderr are read at this one boundary, so
+                # the classification covers both paths without knowing which ran.
+                storage_full = fork_disk.reports_disk_full(result.stderr)
         except subprocess.TimeoutExpired:
             failure = "FFmpeg timed out on this segment."
         except OSError as exc:
             failure = f"Could not run FFmpeg: {exc}"
+            storage_full = fork_disk.is_disk_full_error(exc)
 
         if not failure:
             valid, message = _validate_output(staging)
@@ -610,12 +787,32 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
                            "refused rather than replacing it.")
             except OSError as exc:
                 failure = f"Could not publish the finished clip: {exc}"
+                # [FORK] R4-D: a rename needs a directory entry, and a volume with no room for one
+                # fails here rather than in FFmpeg. Rare, and the same stop either way.
+                storage_full = storage_full or fork_disk.is_disk_full_error(exc)
 
         if failure:
             # ONLY our own staging artifact. The destination is never removed -- if it exists it
             # belongs to somebody else, and this run has no claim on it.
             _discard_staging(staging)
-            record(SegmentResult(index=segment.index, path=destination, error=failure))
+            # [FORK] R4-D: the reason names the DRIVE and keeps FFmpeg's own words after it, so the
+            # operator gets the diagnosis and the manifest still carries the evidence.
+            record(SegmentResult(
+                index=segment.index, path=destination, storage_full=storage_full,
+                error=fork_disk.clip_failure_text(failure) if storage_full else failure))
+            # [FORK] R4-D: STOP. Recorded first -- `record()` fires `on_complete`, which is the
+            # only evidence a caller interrupted by this exception will have -- and only then
+            # raised, which is the ordering the R2 (F-3) fatal-export path already established.
+            #
+            # This is the whole correction. Before it, a confirmed full volume produced one
+            # ordinary clip failure and the loop went straight on to the next clip, so the owner's
+            # 15-source batch attempted every one of its 557 remaining clips and reported nine
+            # sources as broken footage. Measured on the pristine tree with FFmpeg's real disk-full
+            # stderr injected at clip 3 of 6: **6 attempts, 4 identical failures.**
+            if storage_full:
+                raise StorageExhausted(
+                    fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                    path=root, detail=failure, clips_written=published_count())
         else:
             # No filesystem call between the rename above and this record(). That is the R3-F6
             # invariant; do not reintroduce one.
@@ -806,6 +1003,14 @@ def prepare_batch_directory(output_root: str, timestamp: str) -> tuple[str, str]
     single run: the creation IS the test, so a batch can never adopt a directory that already holds
     somebody else's clips. Intermediate parents are created normally -- an output root the operator
     typed but has not made yet is a convenience, not a collision risk.
+
+    **[FORK] R4-D R2 (F2): a confirmed full volume RAISES `StorageExhausted`**, exactly as
+    `prepare_item_directory` and `write_batch_checkpoint` do; every other `OSError` still returns
+    ``(path, error)`` unchanged. Nothing is scheduled after this point, so the gap here is not a
+    batch that keeps going -- it is the *cause* being reported wrongly. The shipped candidate
+    answered a full drive with ``"Could not create the batch folder: [Errno 28] No space left on
+    device"``, which is the one sentence from the 2026-11-16 incident report that nobody could act
+    on, reproduced at the one boundary where the condition is cheapest to state plainly.
     """
     from beatsync_fork import raw_cutter_batch as fork_batch
 
@@ -819,6 +1024,10 @@ def prepare_batch_directory(output_root: str, timestamp: str) -> tuple[str, str]
         os.makedirs(root, exist_ok=True)
         os.makedirs(destination, exist_ok=False)
     except OSError as exc:
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
         return "", f"Could not create the batch folder:\n{destination}\n{exc}"
     return destination, ""
 
@@ -835,6 +1044,14 @@ def prepare_item_directory(batch_directory: str,
     Containment is **measured** with `commonpath`, not assumed from the string the caller passed:
     a prefix test would accept ``output-evil`` for ``output``, and these components are derived from
     operator-supplied folder names.
+
+    **[FORK] R4-D: a full volume RAISES `StorageExhausted` here instead of returning an error
+    string.** Everything else still returns ``(path, error)`` exactly as before, including every
+    other `OSError`, so no existing refusal changes shape. The asymmetry is the point: an error
+    string is a statement about *this source* and the caller rightly carries on to the next one,
+    which for a full drive means it carries on to fail identically on every remaining source. A
+    directory entry needs space too, so this is a real way for a batch to meet the condition --
+    with the smallest possible write, which also makes it the most likely place to meet it last.
     """
     root = os.path.abspath(batch_directory)
     if not relative_parts:
@@ -850,6 +1067,10 @@ def prepare_item_directory(batch_directory: str,
         os.makedirs(parent, exist_ok=True)
         os.makedirs(destination, exist_ok=False)
     except OSError as exc:
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
         return "", f"Could not create the clip folder:\n{destination}\n{exc}"
     return destination, ""
 
@@ -864,6 +1085,12 @@ def write_batch_manifest(batch_directory: str, payload: dict) -> str:
 
     It never raises: a batch that wrote clips successfully must not be reported as failed because
     its bookkeeping file could not be saved.
+
+    [FORK] R4-D: when the write fails because the **volume is full**, the returned message says so
+    in plain words instead of quoting ``[Errno 28]`` at the operator. That is the exact wording the
+    2026-11-16 incident report ended on, and it is the one sentence in it that nobody could act on.
+    Nothing else about this function changes -- same unique temp, same `fsync`, same no-replace
+    rename, same "never raises" contract, same returned-string shape.
     """
     import json
 
@@ -881,7 +1108,98 @@ def write_batch_manifest(batch_directory: str, payload: dict) -> str:
         return ""
     except (OSError, TypeError, ValueError) as exc:
         _discard_staging(staging)
+        if fork_disk.is_disk_full_error(exc):
+            return (f"the output drive is full, so {fork_batch.MANIFEST_FILENAME} could not be "
+                    f"saved ({exc})")
         return f"Could not write {fork_batch.MANIFEST_FILENAME}: {exc}"
+
+
+def write_batch_checkpoint(batch_directory: str, payload: dict) -> str:
+    """[FORK] R4-D: publish one bounded in-progress checkpoint. Returns ``''`` or an error string.
+
+    The recoverable-progress half of R4-D, and deliberately **not** a second manifest coordinator:
+    the payload comes from `raw_cutter_batch.manifest_payload` with ``in_progress=True``, so there
+    is one builder, one schema and one set of totals. All this adds is a second filename and a
+    different final step.
+
+    Two deliberate differences from `write_batch_manifest`, each with a reason:
+
+    * **It writes `MANIFEST_CHECKPOINT_FILENAME`, not the authoritative name.** The authoritative
+      record therefore never holds an incomplete document, and -- just as importantly -- the final
+      write's no-replace `os.rename` is left untouched. Had the checkpoint used the real name, that
+      rename would have found the checkpoint sitting there and every checkpointed batch would have
+      ended by reporting its own record as lost.
+    * **`os.replace`, not `os.rename`.** Each checkpoint supersedes the previous one, and both are
+      this run's own file inside a batch directory that was exclusively created
+      (`prepare_batch_directory` uses ``exist_ok=False``), so there is no other writer whose work
+      could be replaced. This is the one place in Raw Cutter that replaces a file, and it replaces
+      only a file this same batch wrote.
+
+    A failure is final rather than retried: a full volume does not empty itself while a batch
+    waits, and the caller stops checkpointing after the first failure rather than paying for one
+    per remaining source.
+
+    **[FORK] R4-D R2 (F2): a confirmed full volume RAISES `StorageExhausted`; every other failure
+    still returns an ordinary error string.** The shipped candidate returned a string for both, and
+    that was the demonstrated gap: the caller could only read "something went wrong writing the
+    checkpoint", so it switched checkpointing off and carried on scheduling sources onto a volume
+    that had just proved it could not absorb a few kilobytes of JSON. Every one of those sources
+    then failed, which is the 2026-11-16 incident reproduced through a different boundary. The
+    asymmetry mirrors `prepare_item_directory` exactly, and for the same reason: an error string is
+    a statement about *this write*, while a full volume is a statement about *the run*.
+
+    The classification is structural -- `disk_guard.is_disk_full_error` on the caught exception --
+    so the caller never has to read a rendered sentence to learn the cause. **An ordinary failure
+    (a permission, a serialisation fault, a vanished directory) stays an ordinary failure** and must
+    not stop the batch: those are reasons this one file could not be written, not reasons the next
+    source cannot be cut.
+
+    `free_bytes` is measured at the moment of the failure rather than assumed, and `path` is the
+    batch directory, so the caller composes its own wording from facts. **The previous checkpoint
+    survives**: the failure happened on the temp file or on the `os.replace`, and `_discard_staging`
+    removes only the temp -- so whatever `MANIFEST_CHECKPOINT_FILENAME` already held is still the
+    last valid record.
+    """
+    import json
+
+    from beatsync_fork import raw_cutter_batch as fork_batch
+
+    root = os.path.abspath(batch_directory)
+    destination = os.path.join(root, fork_batch.MANIFEST_CHECKPOINT_FILENAME)
+    staging = os.path.join(
+        root, f".{fork_batch.MANIFEST_CHECKPOINT_FILENAME}.{uuid.uuid4().hex[:12]}.part")
+    try:
+        with open(staging, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staging, destination)
+        return ""
+    except (OSError, TypeError, ValueError) as exc:
+        _discard_staging(staging)
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
+        return f"Could not write {fork_batch.MANIFEST_CHECKPOINT_FILENAME}: {exc}"
+
+
+def discard_batch_checkpoint(batch_directory: str) -> None:
+    """[FORK] R4-D: remove the checkpoint once the authoritative record has been saved.
+
+    Only ever called after `write_batch_manifest` returned success, which is the whole condition:
+    the checkpoint existed so that a run which never reached its final write would still have a
+    record, so a run that *did* reach it has no further use for one. If the final write failed --
+    the full-volume case this feature is for -- the checkpoint is **kept**, and that is the point.
+
+    Narrow by construction, in the same way `_discard_staging` is: one fixed filename inside the
+    batch's own exclusively created directory, no glob, no sweep, no pattern match. It removes a
+    file this batch wrote and nothing else, and it never raises.
+    """
+    from beatsync_fork import raw_cutter_batch as fork_batch
+
+    _discard_staging(os.path.join(os.path.abspath(batch_directory),
+                                  fork_batch.MANIFEST_CHECKPOINT_FILENAME))
 
 
 def prepare_run_directory(output_root: str, source_path: str, timestamp: str, *,
@@ -894,6 +1212,11 @@ def prepare_run_directory(output_root: str, source_path: str, timestamp: str, *,
     [FORK] R4-C: `naming` only changes the NAME `run_directory_name` proposes -- the refusal, the
     containment of the folder inside the operator's own output root, and the one-step create-is-
     the-test rule are all unchanged. A synthetic run never adopts or overwrites a previous one.
+
+    [FORK] R4-D R2 (F2): a confirmed full volume RAISES `StorageExhausted`, for the same reason
+    `prepare_batch_directory` does -- the single-cut handler already knows how to report a full
+    drive truthfully, and an ``[Errno 28]`` folder-creation string bypassed that entirely. Every
+    other `OSError` still returns ``(path, error)``.
     """
     if not isinstance(output_root, str) or not output_root.strip():
         return "", "Choose an output folder."
@@ -907,5 +1230,9 @@ def prepare_run_directory(output_root: str, source_path: str, timestamp: str, *,
     try:
         os.makedirs(destination, exist_ok=False)
     except OSError as exc:
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
         return "", f"Could not create the output folder:\n{destination}\n{exc}"
     return destination, ""
