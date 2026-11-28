@@ -20,6 +20,31 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Released — 2026-11-28 (R16 Music Playlist Mode V1 merged and installed as `ff3a5ba9`)
+
+PR #116 (head `271f6b43`) merged into `main` as the ordinary two-parent merge commit
+**`ff3a5ba9`**, and installed as the current production release. The merged tree is `961b6486` —
+byte-for-byte the tree the owner tested.
+
+The owner completed the attended playtest on `271f6b43` with **7 / 7 checks passing**: the native
+Windows **Add tracks** dialog, the playlist editing controls, Single Track mode, Playlist 1×
+rendering, Repeat Playlist 2× rendering, Source Input Gate preservation, and the empty-playlist
+refusal. The first of those is the path no automation could reach — an OS modal cannot be clicked
+by browser automation, and every pre-release record said so.
+
+Installed by fast-forwarding `runtime/digitalunion-main` from `13cdfa48` to `ff3a5ba9`. Verified
+unchanged across the install: preferences (`sha256 624181BB…`, mtime untouched), all nine saved
+folders, the `suffix` collision policy, 10 rendered outputs (217 302 020 bytes), the portable
+runtime, and **both** analysis caches — 14 151 local and 11 798 shared records, none added and
+none removed. The served GUI reports build `ff3a5ba9` with no `(modified)` suffix, Single Track as
+the default, and the Repeat Music / Repeat Playlist headings switching with Music Source.
+
+Limitations accepted by the owner for this release: playlist audio analysis repeats per render
+(the temporary soundtrack has a fresh identity); 200 tracks maximum; the playlist WAV-format and
+scratch-capacity limits remain enforced as refusals; no crossfade, DJ mixing, loudness mastering,
+per-track repeat or CLI expansion; and the pre-existing Single Track **Repeat Music** capacity
+limitation remains outside R16's scope.
+
 ### Fixed — 2026-11-28 (R16 R2 final hardening: three ways the playlist preparation was quietly wrong)
 
 A focused pass over the R16 V1 candidate `f8d6aa0a`, closing three findings. **Each was reproduced
