@@ -124,27 +124,106 @@ def test_an_unmeasured_volume_is_not_refused():
 
 
 def test_a_volume_below_the_floor_is_refused():
+    """The measured floor is the policy R2 (F1) deliberately PRESERVES while removing the
+    estimate-derived refusal beside it. If this ever stops refusing, the feature is gone."""
     verdict = dg.evaluate(1024, volume="E:")
     assert not verdict.ok
-    assert "full" in verdict.refusal
     assert "E:" in verdict.refusal
+    assert verdict.refusal_kind == dg.REFUSAL_INSUFFICIENT_HEADROOM
 
 
-def test_a_volume_with_no_room_for_the_largest_clip_is_refused():
+def test_a_volume_reporting_zero_free_is_called_full_and_a_volume_with_space_is_not():
+    """[FORK] R4-D R2 (F1): the operator-facing distinction, which the shipped candidate collapsed.
+
+    Both are refusals and both are measured; they are not the same fact. "The drive is full" sends
+    someone looking at their hardware. "There is space, but less than this tool will start a clip
+    with" sends them to free 64 MiB. The candidate said the first in both cases -- including when
+    the drive held 63 MiB and was plainly not full.
+    """
+    full = dg.evaluate(0, volume="E:")
+    assert not full.ok
+    assert full.refusal_kind == dg.REFUSAL_VOLUME_FULL
+    assert "is full" in full.refusal
+
+    nearly = dg.evaluate(dg.MIN_FREE_EXPORT_BYTES - 1, volume="E:")
+    assert not nearly.ok
+    assert nearly.refusal_kind == dg.REFUSAL_INSUFFICIENT_HEADROOM
+    # The one thing it must not say about a drive that has 64 MiB less one byte on it.
+    assert "drive is full" not in nearly.refusal
+    assert "not full" in nearly.refusal
+    assert rc.format_size(dg.MIN_FREE_EXPORT_BYTES) in nearly.refusal
+
+
+def test_the_refusal_cause_is_published_as_a_VALUE_so_nobody_has_to_read_the_sentence():
+    """R2 asked that the terminal cause never be derived from rendered text. The same argument
+    applies to a refusal, so the kind is a field and the two kinds are distinct constants."""
+    assert dg.REFUSAL_VOLUME_FULL != dg.REFUSAL_INSUFFICIENT_HEADROOM
+    assert dg.evaluate(10 ** 12).refusal_kind == ""
+    assert dg.evaluate(None).refusal_kind == ""
+    assert dg.evaluate(10 ** 12, estimated_bytes=10 ** 18).refusal_kind == "", \
+        "an advisory note is not a refusal and must carry no refusal kind"
+
+
+def test_a_largest_clip_estimate_that_does_not_fit_is_ADVISORY_and_never_a_refusal():
+    """[FORK] R4-D R2, finding F1 -- the defect this case exists for.
+
+    The shipped candidate refused when the measured free space would not hold
+    ``largest_clip_bytes + floor``. That number comes from the SOURCE's average bitrate, while the
+    clips are re-encoded and may be downscaled, so for a high-bitrate source it routinely
+    overstates the output several-fold -- and the refusal it produced said "Not enough room for
+    even one clip", which is far more confident than the arithmetic behind it.
+
+    Here the drive holds ~69 MiB and the largest clip is ESTIMATED at 200 MiB: the candidate
+    refused, this starts, warns, and says why the estimate may be wrong.
+    """
     free = dg.MIN_FREE_EXPORT_BYTES + 5 * 1024 * 1024
     verdict = dg.evaluate(free, estimated_bytes=10 ** 9, largest_clip_bytes=200 * 1024 * 1024)
-    assert not verdict.ok
-    assert "even one clip" in verdict.refusal
+    assert verdict.ok, "an estimate must not be able to refuse a job"
+    assert verdict.refusal == ""
+    assert verdict.refusal_kind == ""
+    assert verdict.advisory
+    assert "may stop almost immediately" in verdict.note
+    assert "re-encoded" in verdict.note, "the note must say why the estimate may be off"
+    assert "finished clips are always kept" in verdict.note.lower()
+    assert dg.HEADROOM_QUALIFIER in verdict.note
+
+
+@pytest.mark.parametrize("estimated,largest", [
+    (10 ** 9, 10 ** 9),
+    (10 ** 12, 10 ** 12),
+    (10 ** 18, 10 ** 18),
+    (None, 10 ** 15),
+    (10 ** 15, None),
+    (10 ** 15, 1),
+])
+def test_NO_estimate_at_ANY_size_can_refuse_a_measured_volume_above_the_floor(estimated, largest):
+    """The general form of F1, so a future change cannot reintroduce the refusal through a
+    different arm. One rule: above the floor, only a MEASUREMENT may refuse -- and an estimate is
+    not a measurement however large it is."""
+    verdict = dg.evaluate(dg.MIN_FREE_EXPORT_BYTES, estimated_bytes=estimated,
+                          largest_clip_bytes=largest)
+    assert verdict.ok, (estimated, largest)
+    assert verdict.refusal_kind == ""
 
 
 def test_a_total_estimate_that_does_not_fit_is_a_WARNING_and_never_a_refusal():
     """The estimate comes from the source's own bitrate and is not reliable enough to cancel a job
-    the operator asked for. They are told it will probably stop part-way, and it starts."""
+    the operator asked for. They are told it may stop part-way, and it starts."""
     free = dg.MIN_FREE_EXPORT_BYTES + 500 * 1024 * 1024
     verdict = dg.evaluate(free, estimated_bytes=10 ** 10, largest_clip_bytes=1024)
     assert verdict.ok
     assert "stop part-way" in verdict.note
     assert verdict.refusal == ""
+
+
+def test_the_largest_clip_warning_outranks_the_total_warning():
+    """Both estimates are advisory, so when both have something to say the operator gets the one
+    that describes the sooner failure. Ordering, not a second rule."""
+    free = dg.MIN_FREE_EXPORT_BYTES + 5 * 1024 * 1024
+    verdict = dg.evaluate(free, estimated_bytes=10 ** 10, largest_clip_bytes=10 ** 9)
+    assert verdict.ok
+    assert "almost immediately" in verdict.note
+    assert "stop part-way" not in verdict.note
 
 
 def test_every_headroom_figure_carries_the_not_a_guarantee_qualifier():
@@ -378,6 +457,9 @@ def _adapter_namespace(run_media):
               "export_segments", "_discard_staging", "_validate_output",
               "build_segment_command", "write_batch_manifest", "write_batch_checkpoint",
               "discard_batch_checkpoint", "prepare_item_directory", "prepare_batch_directory",
+              # [FORK] R4-D R2 (F2): the fourth output-creation boundary, so the same
+              # error-classification question can be asked of every one of them.
+              "prepare_run_directory",
               "EXPORT_TIMEOUT_SECONDS", "PROBE_TIMEOUT_SECONDS")
     nodes = [n for n in tree.body
              if (isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted)
@@ -778,19 +860,209 @@ def test_an_ordinary_manifest_failure_keeps_its_existing_wording(tmp_path):
     assert "output drive is full" not in message
 
 
-def test_a_checkpoint_write_failure_never_raises(tmp_path):
+def _patched_os(namespace, **members):
+    """Replace named `os` members for the body under test, leaving every other one real."""
+    namespace["os"] = type("_OS", (), {
+        **{name: getattr(os, name) for name in dir(os) if not name.startswith("__")},
+        **{name: staticmethod(value) for name, value in members.items()}})
+    return namespace
+
+
+def _enospc(*_a, **_k):
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def _denied(*_a, **_k):
+    raise OSError(errno.EACCES, "Permission denied")
+
+
+def test_a_confirmed_full_volume_at_the_CHECKPOINT_raises_rather_than_returning_a_string(tmp_path):
+    """[FORK] R4-D R2, finding F2 -- the defect this case exists for.
+
+    The shipped candidate returned an ordinary error string here, so its caller could only learn
+    "the checkpoint write failed". It therefore switched checkpointing off and **carried on
+    scheduling sources** onto a volume that had just proved it could not absorb a few kilobytes of
+    JSON. Every one of those sources then failed -- the 2026-11-16 incident, reached through a
+    different boundary.
+    """
     namespace = _adapter_namespace(_Runner())
     directory = tmp_path / "B"
     directory.mkdir()
+    namespace["open"] = _enospc
 
-    def _full(*_a, **_k):
-        raise OSError(errno.ENOSPC, "No space left on device")
+    with pytest.raises(namespace["StorageExhausted"]) as caught:
+        namespace["write_batch_checkpoint"](str(directory), _payload(in_progress=True))
 
-    namespace["open"] = _full
-    message = namespace["write_batch_checkpoint"](str(directory), _payload(in_progress=True))
-    assert message
-    assert not (directory / batch.MANIFEST_CHECKPOINT_FILENAME).exists()
+    # Structure, not a sentence: the caller composes its own wording from these.
+    assert caught.value.path == os.path.abspath(str(directory))
+    assert "No space left on device" in caught.value.detail
+    assert caught.value.free_bytes is None or caught.value.free_bytes >= 0
+    # And it still leaves nothing behind -- the staging file is discarded on the way out.
     assert os.listdir(directory) == []
+
+
+def test_an_ORDINARY_checkpoint_failure_still_returns_a_string_and_never_raises(tmp_path):
+    """The negative control for F2, and the half that must not regress: a permission, a vanished
+    directory or a serialisation fault is a statement about THIS WRITE, not about the run. None of
+    them is a reason the next source cannot be cut, so none of them may stop the batch."""
+    namespace = _adapter_namespace(_Runner())
+    directory = tmp_path / "B"
+    directory.mkdir()
+    namespace["open"] = _denied
+    message = namespace["write_batch_checkpoint"](str(directory), _payload(in_progress=True))
+    assert message.startswith(f"Could not write {batch.MANIFEST_CHECKPOINT_FILENAME}")
+    assert os.listdir(directory) == []
+
+
+def test_a_non_serialisable_payload_is_an_ordinary_checkpoint_failure(tmp_path):
+    """Not every failure here is an `OSError` at all. A `TypeError` out of `json.dump` must stay
+    an ordinary returned string -- it is a bug in the payload, not a full drive."""
+    namespace = _adapter_namespace(_Runner())
+    directory = tmp_path / "B"
+    directory.mkdir()
+    message = namespace["write_batch_checkpoint"](str(directory), {"bad": {1, 2, 3}})
+    assert message.startswith(f"Could not write {batch.MANIFEST_CHECKPOINT_FILENAME}")
+    assert not (directory / batch.MANIFEST_CHECKPOINT_FILENAME).exists()
+
+
+def test_a_failed_checkpoint_PRESERVES_the_last_good_one(tmp_path):
+    """"Preserve the last valid checkpoint." The failure lands on the temp file or on the
+    `os.replace`, and `_discard_staging` removes only the temp -- so whatever the checkpoint
+    filename already held is still the last valid record, whichever way the write failed."""
+    namespace = _adapter_namespace(_Runner())
+    directory = tmp_path / "B"
+    directory.mkdir()
+    assert namespace["write_batch_checkpoint"](str(directory), _payload(in_progress=True)) == ""
+    good = (directory / batch.MANIFEST_CHECKPOINT_FILENAME).read_bytes()
+    assert good
+
+    namespace["open"] = _enospc
+    with pytest.raises(namespace["StorageExhausted"]):
+        namespace["write_batch_checkpoint"](str(directory), _payload(in_progress=True))
+    assert (directory / batch.MANIFEST_CHECKPOINT_FILENAME).read_bytes() == good
+
+    # And the same for the rename half of the write, which is the other way it can fail.
+    _patched_os(namespace, replace=_enospc)
+    namespace.pop("open", None)
+    with pytest.raises(namespace["StorageExhausted"]):
+        namespace["write_batch_checkpoint"](str(directory), _payload(in_progress=True))
+    assert (directory / batch.MANIFEST_CHECKPOINT_FILENAME).read_bytes() == good
+    assert sorted(os.listdir(directory)) == [batch.MANIFEST_CHECKPOINT_FILENAME]
+
+
+def test_the_FINAL_manifest_write_still_never_raises_even_on_a_full_volume(tmp_path):
+    """[FORK] R4-D R2 (F2): the boundary that was VERIFIED and deliberately left alone.
+
+    It is called from the caller's `finally`, and nothing is scheduled after it, so there is no
+    "keeps going" gap to close -- and raising there would mask whatever terminal path was already
+    being reported. Its message already names the full drive in plain words, and the caller keys
+    off its truthiness rather than its text. So: unchanged, and pinned so it stays that way.
+    """
+    namespace = _adapter_namespace(_Runner())
+    directory = tmp_path / "B"
+    directory.mkdir()
+    namespace["open"] = _enospc
+    message = namespace["write_batch_manifest"](str(directory), _payload())
+    assert "the output drive is full" in message
+    assert batch.MANIFEST_FILENAME in message
+
+
+@pytest.mark.parametrize("boundary,args", [
+    ("prepare_batch_directory", ("20261127_120000",)),
+    ("prepare_run_directory", ("C:/footage/take.mp4", "20261127_120000")),
+])
+def test_a_confirmed_full_volume_at_every_OUTPUT_CREATION_boundary_raises(tmp_path, boundary,
+                                                                          args):
+    """[FORK] R4-D R2 (F2): "verify other relevant output-creation and publication boundaries for
+    the same demonstrated error-classification gap."
+
+    Nothing is scheduled after either of these, so the gap here is not a run that keeps going --
+    it is the CAUSE being reported wrongly. The candidate answered a full drive with
+    ``"Could not create the batch folder: [Errno 28] No space left on device"``, which is the one
+    sentence from the incident report nobody could act on.
+    """
+    namespace = _adapter_namespace(_Runner())
+    root = tmp_path / "out"
+    root.mkdir()
+    _patched_os(namespace, makedirs=_enospc)
+    with pytest.raises(namespace["StorageExhausted"]) as caught:
+        namespace[boundary](str(root), *args)
+    assert "No space left on device" in caught.value.detail
+    assert not list(root.iterdir()), "a refused creation must leave nothing behind"
+
+
+@pytest.mark.parametrize("boundary,args,wording", [
+    ("prepare_batch_directory", ("20261127_120000",), "Could not create the batch folder"),
+    ("prepare_run_directory", ("C:/footage/take.mp4", "20261127_120000"),
+     "Could not create the output folder"),
+])
+def test_every_other_output_creation_failure_keeps_its_existing_refusal(tmp_path, boundary, args,
+                                                                        wording):
+    """Unchanged: only the disk-full case changed shape, so no existing refusal moved."""
+    namespace = _adapter_namespace(_Runner())
+    root = tmp_path / "out"
+    root.mkdir()
+    _patched_os(namespace, makedirs=_denied)
+    path, error = namespace[boundary](str(root), *args)
+    assert path == ""
+    assert wording in error
+
+
+def test_every_storage_classification_in_the_adapter_reads_the_EXCEPTION_not_its_text():
+    """[FORK] R4-D R2 (F2): "do not derive the terminal cause from rendered error text."
+
+    Structural, over the real `src/raw_cutter_export.py`: every site that decides something is a
+    storage stop must do it through `disk_guard`'s two classifiers. A substring test against a
+    rendered message would be a different and much worse rule -- it would match an operator's
+    folder name, and it is exactly what `DISK_FULL_MARKERS` is kept long to survive.
+    """
+    with open(_EXPORT, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=_EXPORT)
+    def _raises_storage(statements):
+        return any(isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+                   and getattr(node.exc.func, "id", "") == "StorageExhausted"
+                   for node in statements)
+
+    raisers = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Raise)
+               and isinstance(node.exc, ast.Call)
+               and getattr(node.exc.func, "id", "") == "StorageExhausted"]
+    assert len(raisers) == 6, (
+        "expected six storage boundaries -- the between-clip gate, the clip failure, both "
+        f"directory preparations, the item directory and the checkpoint; found {len(raisers)}")
+
+    # The IMMEDIATE guard of each raise -- the `if` whose own body holds it, not every enclosing
+    # one. Each must be an explicit classification and never a test against a rendered message.
+    guarding = [node for node in ast.walk(tree)
+                if isinstance(node, ast.If) and _raises_storage(node.body)]
+    assert len(guarding) == len(raisers), (
+        f"{len(raisers)} raises but {len(guarding)} immediate guards -- an unguarded "
+        "`raise StorageExhausted` would stop a healthy job")
+    for guard in {ast.unparse(node.test) for node in guarding}:
+        assert ("fork_disk.is_disk_full_error" in guard
+                or "fork_disk.reports_disk_full" in guard
+                or "MIN_FREE_EXPORT_BYTES" in guard
+                # `export_segments` classifies into a local first, because it must RECORD the clip
+                # before it raises. The loop below proves that local is itself only ever assigned
+                # from the two classifiers, so this is not a weaker rule -- just an indirect one.
+                or guard == "storage_full"), guard
+
+    # ...and that local cannot be set from anything else. Without this, `or guard == "storage_full"`
+    # above would be a hole wide enough to drive a substring test through.
+    export = next(node for node in tree.body
+                  if isinstance(node, ast.FunctionDef) and node.name == "export_segments")
+    sources = [ast.unparse(node.value) for node in ast.walk(export)
+               if isinstance(node, (ast.Assign, ast.AugAssign))
+               and any(getattr(target, "id", "") == "storage_full"
+                       for target in ([node.target] if isinstance(node, ast.AugAssign)
+                                      else node.targets))]
+    assert sources, "`storage_full` must be assigned inside export_segments"
+    for value in sources:
+        # `False` is the initialiser. A bare `True` is deliberately NOT allowed: positive evidence
+        # only, which is what keeps an ordinary encoder failure from stopping the run.
+        assert ("fork_disk.reports_disk_full" in value
+                or "fork_disk.is_disk_full_error" in value
+                or value == "False"), value
 
 
 def test_discarding_a_checkpoint_that_is_not_there_is_harmless(tmp_path):

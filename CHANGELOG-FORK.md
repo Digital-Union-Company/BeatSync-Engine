@@ -20,6 +20,87 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-28 (Raw Cutter R4-D R2: three ways the disk-full protection was still telling the operator something untrue)
+
+A focused remediation pass over the R4-D candidate `45957e7c`, closing three findings. Each was
+reproduced against that candidate first; **21 of the cases below fail there**, each on its own
+assertion.
+
+**F1 — an ESTIMATE could refuse a job, and the refusal sounded certain.** `disk_guard.evaluate`
+declined a job when the measured free space would not hold `largest_clip_bytes` plus the floor, and
+said *"Not enough room for even one clip"*. That figure comes from the **source's** average
+bitrate, while the clips are re-encoded (`libx264 -crf 20` / `h264_nvenc -cq 21`) and may be
+downscaled by the output profile — so it is not a bound in either direction. Measured on real
+media rather than argued: a high-bitrate source estimated **16,560,966 bytes** and the four clips
+actually written came to **5,306,740** — the estimate overstating by **3.1×**. On the candidate
+that job was refused; it now runs, warns, and says why the estimate may be off.
+
+So the rule is now **only a measurement can refuse**. Both estimates are advisory. The 64 MiB floor
+is unchanged and still refuses — and the two refusal *causes* are no longer the same sentence: a
+volume reporting **zero** free is `REFUSAL_VOLUME_FULL` and is told it is full; anything between
+zero and the floor is `REFUSAL_INSUFFICIENT_HEADROOM` and is told, in so many words, that the drive
+is **not** full and this tool simply will not start a clip that close to the edge. The cause is
+also published as a value on the verdict, so no caller has to read the sentence to learn it — the
+same rule R2 applies to the terminal cause.
+
+**F2 — a confirmed full volume at the CHECKPOINT was read as an ordinary write failure.**
+`write_batch_checkpoint` returned an error string for every failure, so the batch could only learn
+"the checkpoint write failed": it switched checkpointing off and **carried on scheduling sources**
+onto a volume that had just failed to absorb a few kilobytes of JSON. Every one of those sources
+then failed — the 2026-11-16 incident, reached through a boundary the first pass did not cover.
+
+The defect was in the *composition*, not in either half: an adapter reporting a failed write as a
+string is defensible, and a handler that reacts to a string by disabling checkpointing is
+defensible. So the test that proves it stubs **neither** — the real `write_batch_checkpoint` runs
+against a real directory and a real `OSError(ENOSPC)`, the real `_on_cut_batch_run` reacts to
+whatever it does, and the assertion is how many sources reached FFmpeg: **8 before, 1 after.**
+
+A confirmed full volume now raises `StorageExhausted` there, exactly as `prepare_item_directory`
+already did; **every other failure still returns a string and still leaves the batch cutting**,
+because a permission, a vanished directory or a serialisation fault is a statement about that one
+write and not about the run. The same gap was found and closed at `prepare_batch_directory` and
+`prepare_run_directory`, which answered a full drive with `"Could not create the batch folder:
+[Errno 28] No space left on device"` — the one sentence from the incident report nobody could act
+on. `write_batch_manifest` was examined and deliberately **left alone**: nothing is scheduled after
+it, it is called from a `finally` where raising would mask the terminal path being reported, and
+its message already names the drive. Six boundaries now raise, every one guarded by
+`disk_guard`'s classifiers and never by a substring of a message — asserted structurally.
+
+The handler catches the checkpoint's stop inside `record` rather than letting it propagate, because
+`record` is also called from inside both of the loop's own `except` clauses, where an escaping
+exception would either re-report a stop already being reported or discard the fatal error that
+clause exists to re-raise. It sets a flag the loop honours at the **top** of the next iteration —
+provably before the next source is probed, detected, planned, given a folder or handed to FFmpeg.
+
+**F3 — the stop told the operator how many clips THIS SOURCE had written, not the batch.** The
+wording was composed at each raise site, before the current source had been recorded, so the only
+count in scope was the current one — zero, in the case that matters. A batch whose first source
+wrote 11 clips and whose second filled the drive before publishing anything therefore reported
+**"No clips were finished before it stopped"** directly beneath a summary table reading *"Clips
+exported 11 of 11 planned"* and a button offering *"11 clip(s) written"*. Two authorities, and the
+wrong one was the one that makes a finished run look lost.
+
+The facts are now carried as structure and rendered **once**, after every outcome is in `items`,
+from `summarise(items, total).clips_written` — the same fold the table, the manifest totals, the
+progress bar, the handoff and the notification already read. Not a second counter: the existing one
+asked one more question. Fixed at all three seams that can stop a batch, and the ordering that
+caused it is now the thing under test.
+
+**Also:** a storage stop met before the batch has a directory at all now publishes its terminal
+class, so the panel, the activity strip and the notification name the drive instead of falling back
+to the generic "Batch did not run". An *ordinary* refusal with no directory still lands on that
+panel, unchanged.
+
+**Verification.** A real-browser smoke (Chrome, isolated instance, production untouched) drove
+Analyze → Cut Video with one injected disk-full attempt **after** a real publication: 2 real FFmpeg
+children and 1 injected failure, **no attempt 4, 5 or 6**; the kept clip verified by FFprobe frame
+count and a full decode; Review these clips enabled and landing on the right folder while scanning
+nothing; Cancel disabled; Cut Video available for a retry; exactly one terminal notification,
+`partial`. Real FFmpeg executions are logged separately from injected failures, and notification
+constructor calls separately from OS delivery, which was suppressed — so neither is overstated.
+
+---
+
 ### Added / Fixed — 2026-11-27 (Raw Cutter R4-D: the output drive filling up is now a diagnosis, not fifteen hundred broken videos)
 
 **The incident this is for, 2026-11-16.** A Folder Batch attempted 15 sources; 5 completed, 1 was

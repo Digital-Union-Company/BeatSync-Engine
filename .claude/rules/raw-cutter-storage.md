@@ -82,19 +82,32 @@ close to full is where a clip stops being a clip and becomes a file that exists,
 and is not playable — which is precisely the shape of damage `_validate_output`'s stream-header
 probe is least able to see.
 
-Three rules, in order, and only the first two may refuse:
+**ONLY A MEASUREMENT MAY REFUSE. An estimate may only ever warn.** (R2, finding F1 — the shipped
+R1 candidate refused when free space would not hold `largest_clip_bytes + floor`, and said so far
+more confidently than the arithmetic supported.)
 
-| condition | answer |
-|---|---|
-| free space unreadable (`None`) | **proceed**, with a note. Absence of evidence is not evidence |
-| free `<` floor | **refuse** — nothing can be written safely |
-| free `<` largest planned clip + floor | **refuse** — that clip can never be produced |
-| free `<` total estimate + floor | **warn**, never refuse |
+| condition | answer | `refusal_kind` |
+|---|---|---|
+| free space unreadable (`None`) | **proceed**, with a note. Absence of evidence is not evidence | — |
+| free `== 0` | **refuse** — physically full, measured | `REFUSAL_VOLUME_FULL` |
+| `0 <` free `<` floor | **refuse** — and say the drive is **not** full | `REFUSAL_INSUFFICIENT_HEADROOM` |
+| free `<` largest planned clip + floor | **warn**, never refuse | — |
+| free `<` total estimate + floor | **warn**, never refuse | — |
 
-**The total estimate may not refuse a job.** It is the source's own average bytes per second applied
-to the exported footage, and the clips are re-encoded, so it is neither a floor nor a ceiling. An
-estimate nobody can compute is `None`, **never 0** — zero would read as "this job needs no space",
-the one answer that could turn a refusal into an admission.
+**Neither estimate may refuse a job.** `estimate_bytes` is the source's own average bytes per second
+applied to the exported footage, and the clips are re-encoded (`libx264 -crf 20` / `h264_nvenc
+-cq 21`) and may be downscaled by the output profile, so it is neither a floor nor a ceiling.
+Measured on real media rather than asserted: a high-bitrate source estimated 16,560,966 bytes and
+the clips actually written came to 5,306,740 — **3.1× overstatement**, i.e. a refusal of a job that
+finished fine. There is no symmetric risk in admitting: if the drive truly cannot hold the clip, the
+floor gate and the between-clip gate stop the job for a *measured* reason and every clip already
+written is kept. An estimate nobody can compute is `None`, **never 0** — zero would read as "this
+job needs no space", the one answer that could turn a refusal into an admission.
+
+**The two refusal causes are different facts and are worded differently.** "The drive is full" sends
+an operator to look at their hardware; "there is space, but less than this tool will start a clip
+with" sends them to free 64 MiB. The cause is also published as a **value** (`refusal_kind`) so no
+caller has to match on the sentence — the same rule this feature applies to the terminal cause.
 
 **Every headroom figure carries `HEADROOM_QUALIFIER`**, composed into the note by the module rather
 than by each call site, so no screen can show the number without also saying it was measured just
@@ -133,9 +146,33 @@ measurement on the same day.**
   as a crash, which is the incident reproduced one layer up.
 - **The clip is recorded BEFORE the raise.** `record()` fires `on_complete`, which is the only
   evidence a caller interrupted by the exception has — the exception discards `export_segments`'
-  return value, exactly as cancellation does. There are deliberately **two** raise sites, and only
-  one records: the between-clip gate refuses a clip that was never attempted, so there is nothing
-  to report for it.
+  return value, exactly as cancellation does. There are deliberately **two** raise sites in
+  `export_segments`, and only one records: the between-clip gate refuses a clip that was never
+  attempted, so there is nothing to report for it.
+- **SIX boundaries raise, and an ordinary failure at any of them does not** (R2, finding F2). The
+  between-clip gate, the clip failure, `prepare_item_directory`, `write_batch_checkpoint`,
+  `prepare_batch_directory` and `prepare_run_directory`. Each returns its ordinary `(path, error)`
+  or error string for every *other* `OSError`, because a permission, a vanished directory or a
+  serialisation fault is a statement about **that one operation** and not about the run — and
+  stopping a batch for one would be a regression dressed as a feature. Every raise is guarded by
+  `fork_disk.is_disk_full_error` / `reports_disk_full` (or the measured floor), **never** by a
+  substring of a rendered message; a structural test counts the raises, finds each one's immediate
+  guard, and additionally proves `export_segments`' `storage_full` local is only ever assigned from
+  those two classifiers.
+- **`write_batch_manifest` deliberately does NOT raise.** Verified, not overlooked: nothing is
+  scheduled after it, it runs from the caller's `finally` where raising would mask the terminal path
+  already being reported, and its message already names a full drive in plain words. Its caller keys
+  off truthiness, never text.
+- **The checkpoint's stop is caught inside `record`, not propagated.** `record` is also called from
+  inside both of `_on_cut_batch_run`'s own `except` clauses, where an escaping exception would
+  either re-report a stop already being reported or discard the fatal error that clause exists to
+  re-raise. So `record` stays total and sets a flag the loop honours at the **top** of the next
+  iteration — provably before that source is probed, detected, planned, given a folder or handed to
+  FFmpeg.
+- **A storage stop met before the batch has a directory still publishes its terminal class.** The
+  general rule is "no directory means no terminal class", which lands on the honest *Batch did not
+  run* panel; a confirmed full volume is the exception, because its cause is known and measured and
+  is already in the status line and the summary. An ordinary no-directory refusal is unchanged.
 - **The between-clip gate runs before the FIRST clip too**, and before `on_progress`, so a clip
   that will not be attempted is never announced as starting. It costs one `disk_usage` per clip —
   microseconds against an encode measured in seconds, so there is no case for sampling it less
@@ -150,6 +187,24 @@ measurement on the same day.**
   every other `OSError`. The asymmetry is the point: an error string is a statement about *this
   source*, so the caller rightly carries on — which for a full drive means carrying on to fail
   identically on every remaining source.
+
+## The preserved-clip count is the WHOLE batch's
+
+The operator-facing stop sentence is composed **once, after every outcome is in `items`**, from
+`summarise(items, total).clips_written` — the same fold `publish`, the manifest totals, the summary
+table, the handoff and the notification already read. Not a second counter authority: the existing
+one asked one more question.
+
+**The ordering is the rule, not an incidental detail** (R2, finding F3). The R1 candidate composed
+the wording at each raise site, which runs *before* `record(...)`, so the only count in scope was
+the **current source's** — zero in exactly the case that matters. A batch whose first source wrote
+11 clips and whose second filled the drive therefore printed *"No clips were finished before it
+stopped"* directly beneath a table reading *"Clips exported 11 of 11 planned"*. So: raise sites
+record **facts** (`note_storage_stop`: it happened, the measured free bytes, what the OS or FFmpeg
+said) and render nothing; `storage_report()` renders them lazily at each terminal site.
+
+`note_storage_stop` keeps the **first** stop's measurement. A later re-measurement, on a volume
+another process may meanwhile have freed, would quietly contradict the stop it is describing.
 
 ## The vocabulary: five terminal classes, and one that is not terminal
 
@@ -250,6 +305,25 @@ be slow, machine-specific and would prove nothing the injection does not.
   from its own fixture bug. And the reproduction clears its scratch directory first: a leftover
   clip from the previous run is **refused without an encode**, which silently removed two attempts
   from the count and made a clean before/after look like a behaviour change.
+- **A COMPOSITION defect needs a test that stubs neither side.** R2's F2 lived entirely in the seam:
+  an adapter reporting a failed checkpoint write as an error string was defensible, and a handler
+  that reacted to an error string by disabling checkpointing was defensible, and every test that
+  stubbed either half passed on the broken tree. So
+  `test_the_REAL_adapter_and_the_REAL_handler_together_stop_on_a_real_ENOSPC` runs the real
+  `write_batch_checkpoint` against a real directory and a real `OSError(ENOSPC)`, lets the real
+  handler react, and asserts only how many sources reached FFmpeg — **8 on the candidate, 1 after.**
+  When you extract a function that way, **inject the shared `StorageExhausted` rather than exec'ing
+  the class statement again**: a second exec produces a different class object, the handler's
+  `except` will not match it, and the stop escapes as an unhandled exception that looks like a
+  product failure and is not one.
+- **A browser smoke must keep its categories apart.** Log real FFmpeg children separately from
+  injected failures (otherwise "3 attempts" hides that only 2 ran), and notification *constructor*
+  calls separately from OS delivery. Suppress delivery and say so: proving one notification was
+  constructed with the right outcome is a different and weaker claim than proving a toast appeared,
+  and only the first is being made.
+- **Scene detection consumes an FFmpeg attempt.** `detect_scenes` runs the binary too, so an
+  injection keyed on "attempt N" in a UI-driven run fires one clip earlier than a plan-only count
+  suggests. Count from the log, not from the plan.
 
 ## What R4-D is not
 

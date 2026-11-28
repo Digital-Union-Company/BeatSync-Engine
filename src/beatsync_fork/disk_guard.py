@@ -91,6 +91,20 @@ CLIP_STORAGE_FULL_REASON = "The output drive ran out of space while writing this
 #: The ceiling on how much of a reason string is carried alongside it.
 MAX_DETAIL_CHARS = 240
 
+#: Why a job was refused, as a value rather than as a sentence. Two causes, and conflating them is
+#: exactly what R2's F1 was about: one is a **measurement of the volume**, the other is a
+#: **policy margin this module chose**, and an operator who is told the first when the second is
+#: true goes looking for a hardware problem that does not exist.
+#:
+#: :data:`REFUSAL_VOLUME_FULL` -- the volume reported **zero** bytes free. Physically full, measured,
+#: nothing to argue with.
+REFUSAL_VOLUME_FULL = "volume_full"
+
+#: :data:`REFUSAL_INSUFFICIENT_HEADROOM` -- the volume has space, just less than
+#: :data:`MIN_FREE_EXPORT_BYTES`. The drive is *not* full; this tool declines to write that close to
+#: the edge, and the wording says so in those terms.
+REFUSAL_INSUFFICIENT_HEADROOM = "insufficient_headroom"
+
 
 # ---------------------------------------------------------------------------------------------
 # Classification
@@ -174,6 +188,12 @@ class CapacityVerdict:
     refusal: str = ""
     note: str = ""
     volume: str = ""
+    #: [FORK] R4-D R2 (F1): which of the two refusal causes this is, as a value --
+    #: :data:`REFUSAL_VOLUME_FULL`, :data:`REFUSAL_INSUFFICIENT_HEADROOM`, or ``''`` when the job
+    #: was not refused. Published so that a caller, a manifest or a test can tell the two apart
+    #: **without matching on the rendered sentence**, which is the habit R2 asked to be removed
+    #: from the terminal-cause path and is no more defensible here.
+    refusal_kind: str = ""
 
     @property
     def ok(self) -> bool:
@@ -184,6 +204,17 @@ class CapacityVerdict:
     def measured(self) -> bool:
         """Was free space actually read? ``False`` is *unknown*, never *zero*."""
         return self.free_bytes is not None
+
+    @property
+    def advisory(self) -> bool:
+        """Does this verdict carry an estimate-derived warning the operator should read?
+
+        An estimate can only ever warn (R2 F1), so this is never a reason to stop -- it is the
+        answer to "did the arithmetic have something to say?", which the panel asks and the
+        admission gate deliberately does not.
+        """
+        return bool(self.note) and (self.estimated_bytes is not None
+                                    or self.largest_clip_bytes is not None)
 
 
 def evaluate(free_bytes: Any, estimated_bytes: Any = None, largest_clip_bytes: Any = None, *,
@@ -198,22 +229,37 @@ def evaluate(free_bytes: Any, estimated_bytes: Any = None, largest_clip_bytes: A
     changed the gate's answer and left the preflight on the old value, so the job was admitted and
     then stopped three clips later instead of being refused. One floor, read in one way.
 
-    Three rules, in order, and only the first two can refuse:
+    **[FORK] R4-D R2 (F1): only a MEASUREMENT can refuse. An ESTIMATE can only ever warn.**
+    This replaces the shipped candidate's third rule, which refused a job when the measured free
+    space would not hold ``largest_clip_bytes`` plus the floor. That rule was wrong on its own
+    stated terms. :func:`estimate_bytes` derives its number from the **source's** average bitrate,
+    and the clips are *re-encoded* (``libx264 -crf 20`` / ``h264_nvenc -cq 21``) and may be
+    downscaled by the output profile -- so the figure is not a bound in either direction, and the
+    common case for a high-bitrate source is that it overstates the output by a wide margin. A
+    refusal built on it declines jobs that would have finished, and does so with a sentence
+    (``"Not enough room for even one clip"``) stated far more confidently than the arithmetic
+    behind it. There is no corresponding risk in letting it proceed: if the drive really cannot
+    hold the clip, the floor gate and the between-clip gate stop the job for a *measured* reason,
+    and every clip already written is kept.
 
-    1. **Unmeasured is not refused.** ``free_bytes is None`` means the volume could not be read —
+    So: two rules can refuse, and both read the measurement alone.
+
+    1. **Unmeasured is not refused.** ``free_bytes is None`` means the volume could not be read --
        a removed drive, a permission, a path that resolved to nothing. The job proceeds with a note
        saying so. Refusing on absent evidence would fail jobs that are fine, and absence of
        evidence is not evidence here any more than anywhere else in this repository.
-    2. **Below the floor: refuse.** Nothing can be written safely, so nothing is attempted. This is
-       the "obviously unwritable job" the accepted scope asks to be refused before minutes are
-       spent analysing footage for it.
-    3. **Not even room for the largest planned clip: refuse.** Same argument one step out — a job
-       whose biggest single clip cannot fit cannot produce that clip, however long it runs.
+    2. **Below the floor: refuse** -- and say *which* of the two things is true, because they are
+       not the same fact and the operator acts differently on each:
 
-    Anything else proceeds. When the *total* estimate does not fit, that is a **note and not a
-    refusal**, deliberately: the estimate comes from the source's own bitrate (see
-    :func:`estimate_bytes`) and is not reliable enough to cancel a job the operator asked for. They
-    are told what was measured, what it was compared against, and that it may stop part-way.
+       * ``free == 0`` is :data:`REFUSAL_VOLUME_FULL`. The volume is **physically full**, measured,
+         and the message says the drive is full.
+       * ``0 < free < floor`` is :data:`REFUSAL_INSUFFICIENT_HEADROOM`. The drive is **not** full
+         and the message does not claim it is; this tool declines to write that close to the edge,
+         names the margin it wants, and says how much is actually there.
+
+    Everything else proceeds, with a note. Both estimates are advisory and neither can refuse: the
+    largest-clip figure warns that the job may stop almost immediately, the total warns that it may
+    stop part-way, and both carry :data:`HEADROOM_QUALIFIER` so no note can be read as a promise.
     """
     free = _whole(free_bytes)
     estimate = _whole(estimated_bytes)
@@ -228,25 +274,37 @@ def evaluate(free_bytes: Any, estimated_bytes: Any = None, largest_clip_bytes: A
                   "without a capacity check."))
 
     measured = f"{cutter.format_size(free)} free{where}"
+    if free <= 0:
+        return CapacityVerdict(
+            free_bytes=free, estimated_bytes=estimate, largest_clip_bytes=largest, volume=volume,
+            refusal_kind=REFUSAL_VOLUME_FULL,
+            refusal=(f"The output drive is full: {measured}. "
+                     f"Nothing can be written to it. Free some space and start the job again."))
+
     if free < floor:
         return CapacityVerdict(
             free_bytes=free, estimated_bytes=estimate, largest_clip_bytes=largest, volume=volume,
-            refusal=(f"The output drive is full: only {measured}. "
-                     f"At least {cutter.format_size(floor)} is needed before any clip can be "
-                     f"written safely. Free some space and start the job again."))
+            refusal_kind=REFUSAL_INSUFFICIENT_HEADROOM,
+            refusal=(f"Not enough free space to write safely: {measured}. The drive is not full, "
+                     f"but this tool needs at least {cutter.format_size(floor)} free before it "
+                     f"will start a clip, so that a clip cannot be left half-written. Free some "
+                     f"space and start the job again."))
 
+    # Both of the following are ADVISORY. See the rule above: an estimate never refuses.
     if largest is not None and free < largest + floor:
         return CapacityVerdict(
             free_bytes=free, estimated_bytes=estimate, largest_clip_bytes=largest, volume=volume,
-            refusal=(f"Not enough room for even one clip: {measured}, and the largest planned "
-                     f"clip is estimated at about {cutter.format_size(largest)}. "
-                     f"Free some space and start the job again."))
+            note=(f"{measured}; the largest planned clip alone is estimated at about "
+                  f"{cutter.format_size(largest)}, so this job may stop almost immediately. "
+                  f"The estimate is based on the source's own bitrate and the clips are "
+                  f"re-encoded, so it may be well off. Starting anyway; finished clips are always "
+                  f"kept. {HEADROOM_QUALIFIER}"))
 
     if estimate is not None and free < estimate + floor:
         return CapacityVerdict(
             free_bytes=free, estimated_bytes=estimate, largest_clip_bytes=largest, volume=volume,
             note=(f"{measured}; this job is estimated at about {cutter.format_size(estimate)}, so "
-                  f"it will probably stop part-way. Finished clips are always kept. "
+                  f"it may stop part-way. Finished clips are always kept. "
                   f"{HEADROOM_QUALIFIER}"))
 
     if estimate is not None:
@@ -308,6 +366,8 @@ __all__ = [
     "HEADROOM_QUALIFIER",
     "MAX_DETAIL_CHARS",
     "MIN_FREE_EXPORT_BYTES",
+    "REFUSAL_INSUFFICIENT_HEADROOM",
+    "REFUSAL_VOLUME_FULL",
     "WINDOWS_DISK_FULL_ERRORS",
     "CapacityVerdict",
     "clip_failure_text",

@@ -1003,6 +1003,14 @@ def prepare_batch_directory(output_root: str, timestamp: str) -> tuple[str, str]
     single run: the creation IS the test, so a batch can never adopt a directory that already holds
     somebody else's clips. Intermediate parents are created normally -- an output root the operator
     typed but has not made yet is a convenience, not a collision risk.
+
+    **[FORK] R4-D R2 (F2): a confirmed full volume RAISES `StorageExhausted`**, exactly as
+    `prepare_item_directory` and `write_batch_checkpoint` do; every other `OSError` still returns
+    ``(path, error)`` unchanged. Nothing is scheduled after this point, so the gap here is not a
+    batch that keeps going -- it is the *cause* being reported wrongly. The shipped candidate
+    answered a full drive with ``"Could not create the batch folder: [Errno 28] No space left on
+    device"``, which is the one sentence from the 2026-11-16 incident report that nobody could act
+    on, reproduced at the one boundary where the condition is cheapest to state plainly.
     """
     from beatsync_fork import raw_cutter_batch as fork_batch
 
@@ -1016,6 +1024,10 @@ def prepare_batch_directory(output_root: str, timestamp: str) -> tuple[str, str]
         os.makedirs(root, exist_ok=True)
         os.makedirs(destination, exist_ok=False)
     except OSError as exc:
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
         return "", f"Could not create the batch folder:\n{destination}\n{exc}"
     return destination, ""
 
@@ -1123,9 +1135,30 @@ def write_batch_checkpoint(batch_directory: str, payload: dict) -> str:
       could be replaced. This is the one place in Raw Cutter that replaces a file, and it replaces
       only a file this same batch wrote.
 
-    Like the final write it never raises, and a failure is final rather than retried: a full volume
-    does not empty itself while a batch waits, and the caller stops checkpointing after the first
-    failure rather than paying for one per remaining source.
+    A failure is final rather than retried: a full volume does not empty itself while a batch
+    waits, and the caller stops checkpointing after the first failure rather than paying for one
+    per remaining source.
+
+    **[FORK] R4-D R2 (F2): a confirmed full volume RAISES `StorageExhausted`; every other failure
+    still returns an ordinary error string.** The shipped candidate returned a string for both, and
+    that was the demonstrated gap: the caller could only read "something went wrong writing the
+    checkpoint", so it switched checkpointing off and carried on scheduling sources onto a volume
+    that had just proved it could not absorb a few kilobytes of JSON. Every one of those sources
+    then failed, which is the 2026-11-16 incident reproduced through a different boundary. The
+    asymmetry mirrors `prepare_item_directory` exactly, and for the same reason: an error string is
+    a statement about *this write*, while a full volume is a statement about *the run*.
+
+    The classification is structural -- `disk_guard.is_disk_full_error` on the caught exception --
+    so the caller never has to read a rendered sentence to learn the cause. **An ordinary failure
+    (a permission, a serialisation fault, a vanished directory) stays an ordinary failure** and must
+    not stop the batch: those are reasons this one file could not be written, not reasons the next
+    source cannot be cut.
+
+    `free_bytes` is measured at the moment of the failure rather than assumed, and `path` is the
+    batch directory, so the caller composes its own wording from facts. **The previous checkpoint
+    survives**: the failure happened on the temp file or on the `os.replace`, and `_discard_staging`
+    removes only the temp -- so whatever `MANIFEST_CHECKPOINT_FILENAME` already held is still the
+    last valid record.
     """
     import json
 
@@ -1144,6 +1177,10 @@ def write_batch_checkpoint(batch_directory: str, payload: dict) -> str:
         return ""
     except (OSError, TypeError, ValueError) as exc:
         _discard_staging(staging)
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
         return f"Could not write {fork_batch.MANIFEST_CHECKPOINT_FILENAME}: {exc}"
 
 
@@ -1175,6 +1212,11 @@ def prepare_run_directory(output_root: str, source_path: str, timestamp: str, *,
     [FORK] R4-C: `naming` only changes the NAME `run_directory_name` proposes -- the refusal, the
     containment of the folder inside the operator's own output root, and the one-step create-is-
     the-test rule are all unchanged. A synthetic run never adopts or overwrites a previous one.
+
+    [FORK] R4-D R2 (F2): a confirmed full volume RAISES `StorageExhausted`, for the same reason
+    `prepare_batch_directory` does -- the single-cut handler already knows how to report a full
+    drive truthfully, and an ``[Errno 28]`` folder-creation string bypassed that entirely. Every
+    other `OSError` still returns ``(path, error)``.
     """
     if not isinstance(output_root, str) or not output_root.strip():
         return "", "Choose an output folder."
@@ -1188,5 +1230,9 @@ def prepare_run_directory(output_root: str, source_path: str, timestamp: str, *,
     try:
         os.makedirs(destination, exist_ok=False)
     except OSError as exc:
+        if fork_disk.is_disk_full_error(exc):
+            raise StorageExhausted(
+                fork_disk.CLIP_STORAGE_FULL_REASON, free_bytes=measure_free_space(root),
+                path=root, detail=str(exc)) from exc
         return "", f"Could not create the output folder:\n{destination}\n{exc}"
     return destination, ""

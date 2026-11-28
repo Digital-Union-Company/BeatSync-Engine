@@ -8837,9 +8837,64 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     # fact rather than off five readings of a message. `checkpointing` is turned off for good by
     # the first checkpoint failure: a full volume does not empty itself while a batch waits, and
     # one failed write per remaining source is the unbounded retry R4-D forbids.
+    #
+    # [FORK] R4-D R2 (F2/F3): the stop is carried as STRUCTURE, not as a rendered sentence. The
+    # shipped candidate composed `storage_detail` at each raise site, which caused both of the
+    # findings at once: the wording was built before the current source had been recorded, so the
+    # only clip count available there was *this source's* (F3), and a second boundary that could
+    # only return an error string had no way to set the flag at all (F2). Now each site records
+    # three facts -- it happened, how much was free, what the OS or FFmpeg said -- and
+    # `storage_report()` renders them ONCE, after every outcome is in `items`.
     storage_full = False
-    storage_detail = ''
+    storage_free = None
+    storage_evidence = ''
+    # Set when a confirmed storage stop was detected somewhere that cannot itself break the loop --
+    # today that is the checkpoint write inside `record`. The loop honours it at the TOP of the next
+    # iteration, which is before that source is probed, detected, planned or exported.
+    storage_stop_requested = False
     checkpointing = True
+
+    def storage_report():
+        """[FORK] R4-D R2 (F3): the operator-facing storage stop, composed from RECORDED outcomes.
+
+        `summarise(items, total).clips_written` is the sum of every source's `clips_written` -- the
+        same fold `publish`, the manifest totals, the summary text and the notification all read,
+        so this is not a second counter authority but the existing one asked one more question.
+
+        That is the finding. The shipped candidate passed the CURRENT source's published count, so
+        a batch whose first source wrote 40 clips and whose second filled the drive before writing
+        any told the operator "0 clip(s) were finished before it stopped" -- while 40 clips sat in
+        the batch folder, and while the summary table above it correctly listed all 40. Two numbers
+        from two authorities, one of them wrong in the direction that makes an operator think the
+        run was lost.
+
+        Rendered lazily, at each terminal site, so it cannot be composed before the records exist:
+        that ordering WAS the defect, not an incidental detail of it.
+        """
+        if not storage_full:
+            return ''
+        # `volume` is deliberately left empty: the summary already names the output folder on its
+        # own line, and repeating a long batch path inside this sentence buys nothing.
+        return fork_disk.exhaustion_text(
+            storage_free,
+            clips_written=fork_cutter_batch.summarise(items, total).clips_written,
+            detail=storage_evidence)
+
+    def note_storage_stop(exc):
+        """[FORK] R4-D R2 (F2): record the three facts a storage stop carries. Renders nothing.
+
+        Called from every boundary that can confirm a full volume. Idempotent in the way that
+        matters -- the FIRST stop keeps its measurement, because that is the one that describes the
+        moment the run actually stopped, and a later re-measurement on a volume another process may
+        meanwhile have freed would quietly overwrite the evidence with a number that contradicts
+        the stop itself.
+        """
+        nonlocal storage_full, storage_free, storage_evidence
+        if storage_full:
+            return
+        storage_full = True
+        storage_free = getattr(exc, 'free_bytes', None)
+        storage_evidence = getattr(exc, 'detail', '')
 
     def publish(**extra):
         """[FORK] Digital-Union (P19-R4, finding F-1): write the sink from RECORDED outcomes.
@@ -8930,7 +8985,17 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         # `not_attempted` is in neither `_FAILED` nor `attempted`, so appending those rows moves
         # neither `terminal_status` nor the count. Doing it first means no fault inside the `try`
         # can leave the operator looking at a stale panel.
-        started = bool(batch_directory)
+        #
+        # [FORK] R4-D R2 (F2): a CONFIRMED storage stop counts as a terminal state even with no
+        # directory, and that is the one addition to the rule above. The reasoning for "no
+        # directory means no terminal class" is about a run whose non-start has no diagnosis -- an
+        # ordinary `prepare_batch_directory` refusal, which still lands on "Batch did not run",
+        # unchanged. A full volume is the opposite case: the cause is known, measured and already
+        # being reported in the status line and the summary, so letting the panel, the activity
+        # strip and the notification fall back to "Batch did not run" would leave three of the six
+        # renderings silent about the one fact that matters. The handoff needs no special case --
+        # `sink['directory']` is still absent, and `fork_handoff.build('')` answers `None`.
+        started = bool(batch_directory) or storage_full
         if started:
             sink['terminal'] = fork_cutter_batch.terminal_status(
                 items, total, is_cancelled, fatal_error=fatal, storage_full=storage_full)
@@ -9007,6 +9072,14 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
             if job.cancelled:
                 cancelled = True
                 break
+            # [FORK] R4-D R2 (F2): STOP SCHEDULING, for a storage stop confirmed somewhere that
+            # could not break the loop itself. Checked here, at the top, because here is provably
+            # before this source is probed, its scenes detected, its plan built, its folder created
+            # or any FFmpeg process started -- so no later source is attempted, which is the whole
+            # of the requirement. The `not_attempted` backfill in `finalise` then describes every
+            # remaining source honestly, exactly as it does for the in-export stop below.
+            if storage_stop_requested:
+                break
             parts = layout[position - 1]
             basename = os.path.basename(source_path)
             file_clock = time.perf_counter()
@@ -9026,7 +9099,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                                                 batch_directory)
 
             def record(outcome, **extra):
-                nonlocal recorded, checkpointing
+                nonlocal recorded, checkpointing, storage_stop_requested
                 items.append(fork_cutter_batch.BatchItem(
                     index=position, source_path=source_path, relative_parts=parts,
                     outcome=outcome, seconds=round(time.perf_counter() - file_clock, 3), **extra))
@@ -9051,12 +9124,34 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     return
                 if not fork_cutter_batch.should_checkpoint(position, total):
                     return
-                if cutter_export.write_batch_checkpoint(
+                # [FORK] R4-D R2 (F2): the two outcomes are NOT the same, and the shipped candidate
+                # treated them as one. A confirmed full volume raises, and that is a statement about
+                # the RUN: a batch directory that cannot absorb a few KiB of JSON cannot absorb the
+                # next source's clips either, so scheduling stops. Any other failure returns a
+                # string and is a statement about THIS WRITE only -- a permission, a serialisation
+                # fault, a vanished directory -- and must leave the batch cutting, because none of
+                # those is a reason the next source cannot be exported.
+                #
+                # Caught here rather than allowed to propagate, deliberately: `record` is also
+                # called from inside both of the loop's own `except` clauses, where an escaping
+                # exception would either re-report a stop that is already being reported or
+                # discard the fatal error that clause exists to re-raise. So `record` stays total,
+                # and the loop is asked to stop by a flag it checks where stopping is safe.
+                try:
+                    failed = cutter_export.write_batch_checkpoint(
                         batch_directory,
                         fork_cutter_batch.manifest_payload(
                             items, total, settings, batch_directory, found.root,
                             started_at.isoformat(timespec='seconds'), '',
-                            time.perf_counter() - clock_started, False, in_progress=True)):
+                            time.perf_counter() - clock_started, False, in_progress=True))
+                except cutter_export.StorageExhausted as exc:
+                    # Structural classification -- `is_disk_full_error` on the real exception, one
+                    # layer down. Nothing here parses a message.
+                    checkpointing = False
+                    note_storage_stop(exc)
+                    storage_stop_requested = True
+                    return
+                if failed:
                     # One failure is final. See `checkpointing`'s declaration.
                     checkpointing = False
 
@@ -9145,14 +9240,10 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     # batch knows how to report, so it records the source, breaks out of the loop
                     # and lets the backfill mark every later source `not_attempted`.
                     storage_stop = True
-                    storage_full = True
-                    # `volume` is deliberately left empty: the summary already names the output
-                    # folder on its own line, and repeating a long batch path inside this sentence
-                    # buys nothing.
-                    storage_detail = fork_disk.exhaustion_text(
-                        getattr(exc, 'free_bytes', None),
-                        clips_written=sum(1 for r in written if r.ok),
-                        detail=getattr(exc, 'detail', ''))
+                    # [FORK] R4-D R2 (F3): facts only. The wording is composed by
+                    # `storage_report()` after `record(...)` below has put this source into
+                    # `items`, so its clip count is the whole batch's and not just this source's.
+                    note_storage_stop(exc)
                 except Exception as exc:                  # noqa: BLE001 - re-raised below
                     # [FORK] R2 (F-3): `written` is the truth here for exactly the same reason,
                     # and an unexpected fault is precisely when it matters most. The clips it
@@ -9226,11 +9317,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                 # Recorded (unless the export already recorded it) and then BROKEN out of, never
                 # re-raised: the batch knows how to report this, and the backfill marks every later
                 # source `not_attempted`.
-                storage_full = True
-                storage_detail = fork_disk.exhaustion_text(
-                    getattr(exc, 'free_bytes', None),
-                    clips_written=getattr(exc, 'clips_written', 0),
-                    detail=getattr(exc, 'detail', ''))
+                note_storage_stop(exc)
                 if not recorded:
                     record(fork_cutter_batch.OUTCOME_STORAGE_FULL,
                            error=fork_disk.CLIP_STORAGE_FULL_REASON)
@@ -9253,7 +9340,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
             items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
             manifest_error=manifest_error,
             # [FORK] R4-D: the same two values the terminal class was derived from.
-            storage_full=storage_full, storage_detail=storage_detail)
+            storage_full=storage_full, storage_detail=storage_report())
         # [FORK] R4-D: a storage stop is NOT a finished batch, so it may not reach the normal-end
         # status line. It is checked before `cancelled` here for the same reason
         # `terminal_status` orders them that way: the drive filling is what stopped the run.
@@ -9273,7 +9360,25 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         yield CUT_BATCH_CANCELLED_STATUS, fork_cutter_batch.summary_text(
             items, total, settings, batch_directory, elapsed, True, input_root=found.root,
             manifest_error=manifest_error,
-            storage_full=storage_full, storage_detail=storage_detail)
+            storage_full=storage_full, storage_detail=storage_report())
+    except cutter_export.StorageExhausted as exc:
+        # [FORK] R4-D R2 (F2): named BEFORE the generic clause, for the third time on this path and
+        # for the same reason each time -- `StorageExhausted` is an ordinary `Exception`, so a
+        # generic clause listed first headlines a correctly diagnosed stop as a crash.
+        #
+        # The in-loop clauses handle every stop met while cutting a source. THIS clause covers the
+        # stop met where there is no source yet: `prepare_batch_directory`, which now raises rather
+        # than returning ``"Could not create the batch folder: [Errno 28]"``. `items` is empty and
+        # `batch_directory` is still `''` there, which is correct and needs no special case -- the
+        # backfill marks all `total` sources `not_attempted`, `storage_report()` folds an empty
+        # `items` to zero preserved clips, and `finalise` skips a manifest it has nowhere to write.
+        note_storage_stop(exc)
+        manifest_error = finalise(cancelled)
+        elapsed = time.perf_counter() - clock_started
+        yield CUT_BATCH_STORAGE_FULL_STATUS, fork_cutter_batch.summary_text(
+            items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
+            manifest_error=manifest_error,
+            storage_full=storage_full, storage_detail=storage_report())
     except Exception as exc:
         # Total: a batch that raised must report rather than vanish behind Gradio's generic error,
         # and it must still say what it had already written.
@@ -9291,7 +9396,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         partial = fork_cutter_batch.summary_text(
             items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
             fatal_error=fatal, manifest_error=manifest_error,
-            storage_full=storage_full, storage_detail=storage_detail)
+            storage_full=storage_full, storage_detail=storage_report())
         yield (f"❌ The batch stopped on an unexpected error.\n  {fatal}"), partial
     finally:
         # [FORK] R2: the terminal paths above already finalised, each one before its own yield.

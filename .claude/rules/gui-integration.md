@@ -921,6 +921,14 @@ automatically.
   offered for review, because a full drive is a reason to stop writing and never a reason to
   withhold footage the operator already has. Full contract:
   `.claude/rules/raw-cutter-storage.md`.
+
+  **R2 added a THIRD storage clause to `_on_cut_batch_run`** — an outer one, for a stop met before
+  the batch has a directory or a source (`prepare_batch_directory`). Both in-loop clauses and this
+  one call `note_storage_stop(exc)`, which records facts only; the operator-facing sentence is
+  rendered by `storage_report()` at each terminal site, **after** every outcome is in `items`, so
+  its clip count is the whole batch's. Composing it at the raise site was the R2 F3 defect. A stop
+  detected inside `record` (the checkpoint write) cannot break the loop from there — it sets a flag
+  the loop honours at the top of the next iteration, which is before that source is touched at all.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 

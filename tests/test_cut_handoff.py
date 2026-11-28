@@ -603,7 +603,9 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
              # volume does -- by raising the shipped `StorageExhausted` out of `export_segments`,
              # after the clips before it have already fired `on_complete`. `refuse_capacity` drives
              # the preflight instead, by handing the handler a REAL refusing `CapacityVerdict`.
-             storage_at=None, refuse_capacity=""):
+             # [FORK] R4-D R2 (F2): `run_dir_storage` meets the full volume one step earlier --
+             # at the run folder, before a single clip has been attempted.
+             storage_at=None, refuse_capacity="", run_dir_storage=False):
     """Execute the REAL `_on_cut_run` against a synthesised adapter and a real filesystem.
 
     There was no executable harness for the single-video handler before R11. It is built the way
@@ -669,6 +671,13 @@ def _run_cut(tmp_path, monkeypatch, *, clip_results=None, raise_after=None, faul
         return _Res(ok=True, error="", source=source_info)
 
     def prepare_run_directory(output_folder, source_path, timestamp, naming=None):
+        if run_dir_storage:
+            # [FORK] R4-D R2 (F2): the shipped adapter RAISES here on a confirmed full volume
+            # rather than returning `"Could not create the output folder: [Errno 28] ..."`, so the
+            # single-video handler's own storage clause reports it instead of its refusal path.
+            raise _StorageExhausted(
+                disk_guard.CLIP_STORAGE_FULL_REASON, free_bytes=0, path=str(out_root),
+                detail="[Errno 28] No space left on device")
         if run_dir_error:
             return "", run_dir_error
         target = os.path.join(str(out_root), "RawCutter_" + str(timestamp))
@@ -1249,11 +1258,37 @@ def test_a_refused_capacity_preflight_announces_nothing(tmp_path, monkeypatch):
     assert run.published == []
 
 
+def test_a_full_volume_at_the_RUN_FOLDER_is_reported_as_a_full_drive(tmp_path, monkeypatch):
+    """[FORK] R4-D R2 (F2): the single-video equivalent of the batch-directory boundary.
+
+    **A regression pin, NOT a reproduction, and the distinction is worth stating.** The R1
+    candidate's defect at this boundary was entirely in the adapter: `prepare_run_directory`
+    returned ``"Could not create the output folder: [Errno 28] No space left on device"`` instead
+    of raising, so the handler's storage clause was never reached. That half is reproduced in
+    `tests/test_raw_cutter_disk_full.py`, which fails against the candidate. The single-video
+    handler, unlike the batch one, ALREADY named `StorageExhausted` before its generic clause -- so
+    this case passes on both trees, and it is here to keep that true now that a second boundary can
+    reach it.
+    """
+    run = _run_cut(tmp_path, monkeypatch, run_dir_storage=True)
+    report = run.report
+    assert _UI["CUT_CUT_STORAGE_FULL_TITLE"] in report
+    assert "ran out of space" in report
+    assert "Errno 28" not in report.splitlines()[0], "the headline names the drive, not an errno"
+    assert "No clips were finished" in report, "none were, and it must not invent any"
+    assert "your source files were not modified" in report.lower()
+    assert run.handoff is None, "nothing was written, so nothing is offered for review"
+    assert run.review_enabled is False
+    # One notification, and a total loss is a FAILURE rather than a partial one.
+    assert len(run.published) == 1
+    assert run.published[0][1] == notify.OUTCOME_FAILED
+
+
 def test_every_storage_frame_is_as_wide_as_the_handler_declares(tmp_path, monkeypatch):
     """Gradio matches `outputs` by position, so a new terminal path that emits a different number
     of values misaligns every update on that frame."""
     cases = {"mid_cut": {"storage_at": 2}, "first_clip": {"storage_at": 0},
-             "refused": {"refuse_capacity": "E:"}}
+             "refused": {"refuse_capacity": "E:"}, "run_folder": {"run_dir_storage": True}}
     for name, kwargs in cases.items():
         run = _run_cut(tmp_path / name, monkeypatch, **kwargs)
         assert run.widths == {7}, (name, run.widths)
