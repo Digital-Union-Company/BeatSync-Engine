@@ -95,7 +95,23 @@ SUPPORTED_TRACK_EXTENSIONS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", "
 
 #: An upper bound on the queue, so one mis-click in a multi-select dialog cannot ask for a decode of
 #: ten thousand files. Generous: a 60-track playlist is a legitimate four-hour soundtrack.
+#:
+#: **The limit is VISIBLE, which means it is enforced where the operator can see it** — Add tracks
+#: refuses past it and says so. It is deliberately *not* applied silently at the render-admission
+#: freeze: a queue that somehow arrives longer than this is a tampered or corrupted state, and
+#: quietly rendering the first 200 of it would be exactly the silent omission this feature refuses
+#: everywhere else. See :func:`freeze_queue`.
 MAX_TRACKS = 200
+
+#: A WAV ``data`` chunk size is a 32-bit field, so one WAV cannot hold more than 4 GiB of samples.
+#: At the canonical 288 kB/s that is about 4.1 hours. This ceiling sits just below it: a master
+#: above it would be written with a wrapped header, every later measurement would read a wrong
+#: frame count, and the operator would get an hours-long render that desynchronises.
+#:
+#: It lives here rather than in the runtime sibling because it is **format arithmetic**, and
+#: because R16 R2 needs the same number for two different artifacts — the joined playlist master
+#: and the repeated master R10 builds from it.
+MAX_MASTER_BYTES = 3_900_000_000
 
 #: Bytes per second of the canonical soundtrack master: 48 kHz, stereo, `pcm_s24le`. The same format
 #: `music_repeater` and `audio_mixdown` already write, so no stage downstream has resampling or
@@ -231,10 +247,15 @@ def _usable_seconds(value: Any) -> float | None:
 
 
 def _usable_int(value: Any) -> int:
-    """A non-negative whole number, or `0`. Identity fields must never raise on a stale state."""
+    """A non-negative whole number, or `0`. Identity fields must never raise on a stale state.
+
+    `OverflowError` is caught alongside the usual two because `int(float("inf"))` raises it and
+    neither of the others — a `gr.State` really can hold an infinity, and a totality helper that
+    raises is not one.
+    """
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return number if number >= 0 else 0
 
@@ -297,23 +318,87 @@ def entries_of(playlist: Any) -> tuple:
     return playlist_from_entries(playlist).as_entries()
 
 
-def freeze_entries(mode: Any, entries: Any) -> tuple:
-    """**The render-admission freeze.** `()` unless the operator is declaring a playlist.
+def count_rows(entries: Any) -> int:
+    """How many rows the state actually held, **without judging any of them**.
+
+    Deliberately separate from :func:`playlist_from_entries`, which is a *projection* and skips
+    what it cannot read. Comparing the two is the only way to notice that a row went missing, which
+    is why the freeze below returns both numbers rather than just the usable ones.
+    """
+    if not isinstance(entries, Iterable) or isinstance(entries, (str, bytes)):
+        return 0
+    try:
+        return sum(1 for _ in entries)
+    except TypeError:
+        return 0
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenQueue:
+    """What the render-admission freeze saw, including **what it could not use**.
+
+    `entries` alone would be a lie by omission: a malformed row is skipped by the projection, so a
+    three-row queue can freeze as two and render a soundtrack the operator never asked for. That is
+    the exact failure this feature refuses everywhere else — a shorter soundtrack that looks
+    deliberate — so the freeze reports the discrepancy and the gate refuses on it.
+    """
+
+    entries: tuple = ()
+    submitted: int = 0
+    over_limit: bool = False
+
+    @property
+    def usable(self) -> int:
+        return len(self.entries)
+
+    @property
+    def dropped(self) -> int:
+        return max(0, self.submitted - self.usable)
+
+    @property
+    def is_lossless(self) -> bool:
+        """True only when every submitted row survived and none was truncated away."""
+        return not self.over_limit and self.dropped == 0
+
+    def refusal(self) -> str:
+        """The operator-facing reason this queue cannot be rendered, or `''` when it can."""
+        if self.over_limit:
+            return (f"The playlist holds {self.submitted} tracks, which is more than the "
+                    f"{MAX_TRACKS}-track limit. Remove some tracks and try again.")
+        if self.dropped:
+            # The noun agrees with `submitted`, which is what it is counting -- "1 of the 3 track"
+            # is the kind of small wrongness that makes an operator doubt the number beside it.
+            word = "track" if self.submitted == 1 else "tracks"
+            return (f"{self.dropped} of the {self.submitted} {word} in the playlist could not be "
+                    f"read. Clear the playlist and add the tracks again rather than rendering a "
+                    f"soundtrack that is missing some of them.")
+        if not self.entries:
+            return EMPTY_PLAYLIST_MESSAGE
+        return ""
+
+
+def freeze_queue(mode: Any, entries: Any) -> FrozenQueue:
+    """**The render-admission freeze.** An empty queue unless the operator declares a playlist.
 
     Called once, at the render boundary, beside the creative profile and both mix configs — the
-    same seam :func:`music_repeat.normalize_repeat` is called at. What comes back is a tuple of
-    4-tuples of primitives: immutable, deep-copyable, and nameable inside `_process_video_impl`
-    without that function resolving a single fork module. (The same reason Freestyle crosses the
-    render wrappers as a plain tuple rather than as a `FreestyleDeclaration`: several suites
-    AST-extract those bodies and execute them against synthesised namespaces.)
+    same seam :func:`music_repeat.normalize_repeat` is called at. `entries` is a tuple of 4-tuples
+    of primitives: immutable, deep-copyable, and nameable inside `_process_video_impl` without that
+    function resolving a single fork module. (The same reason Freestyle crosses the render wrappers
+    as a plain tuple rather than as a `FreestyleDeclaration`: several suites AST-extract those
+    bodies and execute them against synthesised namespaces.)
 
     Total by contract: it runs on live widget values, and nothing here may raise mid-render. An
     empty result in playlist mode is a **refusal** for the gate to report, never a fall back to the
-    Single Track picker.
+    Single Track picker — and so, since R2, is a queue that lost a row to the projection or that
+    arrived longer than :data:`MAX_TRACKS`. The 200-track limit is still enforced; what changed is
+    that it is enforced **visibly**, by refusing, rather than by silently rendering the first 200.
     """
     if not is_playlist(mode):
-        return ()
-    return entries_of(entries)
+        return FrozenQueue()
+    submitted = count_rows(entries)
+    return FrozenQueue(entries=entries_of(entries),
+                       submitted=submitted,
+                       over_limit=submitted > MAX_TRACKS)
 
 
 # ---------------------------------------------------------------------------
@@ -649,16 +734,167 @@ def repeat_estimate_markdown(playlist: Any, count: Any) -> str:
         return (f"**{current.count} {word} · {clock}** x 1 = **{clock}** - the playlist plays "
                 f"once (no repeat).")
 
-    total = repeat * current.total_seconds
+    total = total_seconds_for(current.total_seconds, repeat)
     lines = [f"**{current.count} {word} · {clock}** x {repeat} = **{format_clock(total)}** of "
              f"finished video. The **whole playlist** repeats, in order - not each song."]
-    if total >= LONG_OUTPUT_WARNING_SECONDS:
+    # [R2 / F3] The format ceiling is not a warning, it is a refusal the render will make -- so the
+    # operator must see it on the slider rather than after a long wait. The arithmetic is the one
+    # `capacity_verdict` uses, so the read-out and the refusal cannot disagree.
+    verdict = capacity_verdict(current.total_seconds, repeat)
+    if verdict.reason == REFUSAL_FORMAT:
+        lines.append(f"❌ **This will be refused.** {verdict.message}")
+    elif total >= LONG_OUTPUT_WARNING_SECONDS:
         lines.append(
-            f"⚠️ That is a long render. It needs about **{format_bytes(master_bytes(total))}** of "
-            f"temporary disk space for the repeated soundtrack master, plus about "
-            f"**{format_bytes(master_bytes(current.total_seconds))}** for the playlist master it "
-            f"is built from (and the usual per-clip scratch).")
+            f"⚠️ That is a long render. At the worst moment it needs about "
+            f"**{format_bytes(repeat_peak_bytes(current.total_seconds, repeat))}** of temporary "
+            f"disk space — the playlist master, the repeat's own copy of it and the repeated "
+            f"master all exist at once — plus the usual per-clip scratch.")
     return "  \n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# capacity and format limits (R2 / F3)
+# ---------------------------------------------------------------------------
+
+#: Refusal codes. Each is a different fact about the request, and the GUI classifies them
+#: differently: a format refusal is about what was asked for and every candidate of a batch would
+#: hit it identically; a space refusal is about this volume at this instant and is not.
+REFUSAL_NONE = ""
+REFUSAL_FORMAT = "format_ceiling"
+REFUSAL_SPACE = "insufficient_space"
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityVerdict:
+    """Whether a requested soundtrack — repeated or not — can actually be written.
+
+    **`guaranteed` is the whole point of this record.** Before anything is decoded the only figures
+    available are the source containers' own durations, which are an *estimate*: a VBR MP3's
+    container duration is routinely a few milliseconds out, and the decode is what settles it. Once
+    the playlist master exists its cycle length is a **measurement**. The same arithmetic serves
+    both, and the verdict says which it was given, so a refusal can be honest about its own
+    certainty and an *estimated* pass is never reported as a promise.
+
+    Nothing here is a reservation either. Free space is one instant on a volume any other process
+    may fill a moment later; this can refuse an impossible job, never promise a possible one.
+    """
+
+    reason: str = REFUSAL_NONE
+    message: str = ""
+    guaranteed: bool = False
+    repeat: int = 1
+    cycle_seconds: float = 0.0
+    output_seconds: float = 0.0
+    output_bytes: int = 0
+    peak_bytes: int = 0
+    free_bytes: int = -1
+
+    @property
+    def ok(self) -> bool:
+        return self.reason == REFUSAL_NONE
+
+
+def repeat_output_bytes(cycle_seconds: Any, count: Any) -> int:
+    """How large the finished (possibly repeated) audio master will be, in bytes."""
+    return master_bytes(total_seconds_for(cycle_seconds, count))
+
+
+def total_seconds_for(cycle_seconds: Any, count: Any) -> float:
+    """`repeat × cycle`, with the repeat normalised through the one normaliser."""
+    duration = _usable_seconds(cycle_seconds)
+    if duration is None:
+        return 0.0
+    return normalize_repeat(count) * duration
+
+
+def repeat_peak_bytes(cycle_seconds: Any, count: Any) -> int:
+    """Peak temporary bytes for a **repeated** playlist render, counting what overlaps.
+
+    Three artifacts coexist at the worst moment, and leaving any of them out is how a check passes
+    and the write then fails:
+
+    * the joined **playlist master**, which is already on disk and is R10's input — `1 × cycle`;
+    * R10's own decoded **cycle copy**, which it makes from that master — `1 × cycle`;
+    * the **repeated master** it concatenates — `N × cycle`.
+
+    So `(N + 2) × cycle`. At 1x R10 is never entered, so the repeat stage contributes nothing and
+    the playlist build's own `2 ×` peak (see :func:`music_playlist_builder.estimate_scratch_bytes`)
+    is the binding figure instead.
+    """
+    repeat = normalize_repeat(count)
+    if repeat <= MIN_REPEAT:
+        return 0
+    one = master_bytes(cycle_seconds)
+    return one * (repeat + 2)
+
+
+def capacity_verdict(cycle_seconds: Any, count: Any, free_bytes: Any = None, *,
+                     guaranteed: bool = False, min_free_bytes: int = 0,
+                     ceiling_bytes: int = MAX_MASTER_BYTES) -> CapacityVerdict:
+    """Can this repeat request be written? Refuse the impossible; never promise the possible.
+
+    Two independent impossibilities, deliberately distinguished because they are different facts
+    with different fixes and different batch semantics:
+
+    * **the format's own ceiling** — `N × cycle` above `ceiling_bytes` cannot be one WAV at all, on
+      any volume, ever. Lowering the repeat count is the fix, and every candidate of a batch would
+      hit it identically;
+    * **this volume, right now** — the overlapping peak plus the caller's reserve against the free
+      space actually measured. Freeing space or lowering the repeat is the fix, and it may be
+      transient.
+
+    `free_bytes` of `None` or a negative value means **unmeasured**, which is never a refusal: the
+    format check still runs, and the space check is simply not performed. That is the same rule the
+    sample-count verification follows — an instrument that could not read must not become a verdict.
+    """
+    repeat = normalize_repeat(count)
+    duration = _usable_seconds(cycle_seconds) or 0.0
+    output_seconds = total_seconds_for(duration, repeat)
+    output = master_bytes(output_seconds)
+    peak = repeat_peak_bytes(duration, repeat)
+    free = _usable_int(free_bytes) if _as_measured(free_bytes) else -1
+    common = dict(guaranteed=bool(guaranteed), repeat=repeat, cycle_seconds=float(duration),
+                  output_seconds=float(output_seconds), output_bytes=int(output),
+                  peak_bytes=int(peak), free_bytes=int(free))
+
+    if output > ceiling_bytes:
+        qualifier = "" if guaranteed else "about "
+        return CapacityVerdict(
+            reason=REFUSAL_FORMAT,
+            message=(f"Repeat Playlist {repeat}x of a {format_clock(duration)} playlist is "
+                     f"{qualifier}{format_clock(output_seconds)} of audio "
+                     f"({format_bytes(output)}), which is more than one WAV soundtrack file can "
+                     f"hold ({format_bytes(ceiling_bytes)}). Lower the repeat count to "
+                     f"{max(1, int(ceiling_bytes // max(1, master_bytes(duration))))}x or less, "
+                     f"or shorten the playlist."),
+            **common)
+
+    if free >= 0 and peak and free < peak + max(0, int(min_free_bytes)):
+        needed = peak + max(0, int(min_free_bytes))
+        qualifier = "needs" if guaranteed else "needs about"
+        return CapacityVerdict(
+            reason=REFUSAL_SPACE,
+            message=(f"Not enough temporary space for Repeat Playlist {repeat}x: it {qualifier} "
+                     f"{format_bytes(needed)} while the playlist master, the repeat's own copy of "
+                     f"it and the repeated master all exist at once, and {format_bytes(free)} is "
+                     f"free. Lower the repeat count, shorten the playlist, or free some space."),
+            **common)
+
+    return CapacityVerdict(**common)
+
+
+def _as_measured(value: Any) -> bool:
+    """True only for a real, non-negative byte count. `None` is *unmeasured*, not zero.
+
+    `OverflowError` is caught for the same reason :func:`_usable_int` catches it: an infinity is
+    not a measurement, and finding that out must not raise in the middle of a render.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return int(value) >= 0
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def bus_record(beat_info: Any) -> Mapping | None:
@@ -712,23 +948,31 @@ __all__ = [
     "EMPTY_PLAYLIST_MESSAGE",
     "LONG_OUTPUT_WARNING_SECONDS",
     "MASTER_BYTES_PER_SECOND",
+    "MAX_MASTER_BYTES",
     "MAX_TRACKS",
     "MODE_PLAYLIST",
     "MODE_SINGLE",
     "MODE_VALUES",
+    "REFUSAL_FORMAT",
+    "REFUSAL_NONE",
+    "REFUSAL_SPACE",
     "SUPPORTED_TRACK_EXTENSIONS",
     "WAV_HEADER_PROBE_BYTES",
+    "CapacityVerdict",
+    "FrozenQueue",
     "Playlist",
     "PlaylistTrack",
     "WavGeometry",
     "add_tracks",
     "bus_record",
+    "capacity_verdict",
     "choice_labels",
     "clear",
+    "count_rows",
     "describe_identity_change",
     "entries_of",
     "format_bytes",
-    "freeze_entries",
+    "freeze_queue",
     "has_supported_extension",
     "is_playlist",
     "master_bytes",
@@ -739,9 +983,12 @@ __all__ = [
     "playlist_from_entries",
     "remove_tracks",
     "repeat_estimate_markdown",
+    "repeat_output_bytes",
+    "repeat_peak_bytes",
     "shuffle",
     "sort_by_name",
     "summary_line",
     "summary_markdown",
+    "total_seconds_for",
     "track_from_entry",
 ]

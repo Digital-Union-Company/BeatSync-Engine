@@ -111,6 +111,9 @@ from beatsync_fork.render_worker import RenderCancelled
 TRACK_SAMPLE_RATE = 48_000
 TRACK_CHANNELS = 2
 TRACK_CODEC = "pcm_s24le"
+#: Stated so `probe_frame_count` can report a geometry without re-deriving the width from the
+#: codec name. The decode asks for `pcm_s24le`, so this is what every artifact here carries.
+TRACK_BITS = 24
 
 #: How far the produced master's probed duration may differ from the sum of the decoded tracks'.
 #: One PCM sample at 48 kHz is 0.021 ms; 1 ms is generous against ffprobe's reporting precision and
@@ -140,12 +143,20 @@ _STDERR_TAIL = 1200
 #: cutter's whole vocabulary with it.
 MIN_FREE_SCRATCH_BYTES = 256 * 1024 * 1024
 
-#: A WAV's `data` chunk size is a 32-bit field, so a single master cannot exceed 4 GiB. At the
-#: canonical 288 kB/s that is about 4.1 hours of soundtrack. Refusing above a safe bound is the
-#: point: FFmpeg would write a file whose header wrapped, the verification would read a wrong frame
-#: count, and the operator would get an hours-long render that desynchronises. (The same ceiling
-#: applies to a 30x Repeat Playlist, which is why the read-out states the figure.)
-MAX_MASTER_BYTES = 3_900_000_000
+#: The WAV format ceiling. **One definition**, in the pure module, because R2 needs the same number
+#: for two different artifacts — the joined playlist master and the repeated master R10 builds from
+#: it — and two copies of a limit are two limits waiting to disagree. Re-exported here because this
+#: is the module whose refusals cite it.
+MAX_MASTER_BYTES = fork_playlist.MAX_MASTER_BYTES
+
+#: How a track's geometry was established. A **measurement**, always — R2 removed the estimated
+#: path entirely. `read_wav_geometry` is free and usually enough; when a header is shaped so the
+#: `data` chunk sits past the bounded read, ffprobe measures the same file exactly
+#: (`duration_ts` in a `1/sample_rate` time base IS the sample count, verified against a real
+#: 288 000-frame WAV). If neither instrument can read it, the render is **refused** rather than
+#: proceeding on container durations dressed up as boundaries.
+MEASURED_BY_HEADER = "header"
+MEASURED_BY_PROBE = "probe"
 
 
 class PlaylistError(Exception):
@@ -164,6 +175,33 @@ class PlaylistInputError(PlaylistError):
 
 class PlaylistBuildError(PlaylistError):
     """Producing or verifying the soundtrack master failed."""
+
+
+@dataclass(frozen=True)
+class ValidatedTrack:
+    """One queued track that passed the preflight, **carrying the identity that was validated**.
+
+    [R2 / F2] The preflight runs before Stage 1 and the decode runs after Stage 5 — minutes apart
+    on a cold library. A `(path, duration)` pair carried nothing the consumption boundary could
+    re-check, so a track replaced in that window was decoded without comment and the operator got a
+    soundtrack they did not ask for. Carrying the size and `mtime_ns` the preflight actually saw is
+    what lets :func:`build_playlist_master` re-stat each file immediately before it decodes it.
+    """
+
+    path: str
+    size: int
+    mtime_ns: int
+    source_duration_seconds: float
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path.replace("\\", "/")) or self.path
+
+    def as_playlist_track(self):
+        """The pure module's record, so one identity comparison serves the preflight and the decode."""
+        return fork_playlist.PlaylistTrack(
+            path=self.path, size=self.size, mtime_ns=self.mtime_ns,
+            duration_seconds=self.source_duration_seconds)
 
 
 @dataclass(frozen=True)
@@ -225,7 +263,10 @@ class PlaylistMaster:
     sample_rate: int
     total_seconds: float
     prepare_seconds: float
-    measured: bool = True
+    #: Which instrument established the geometry -- :data:`MEASURED_BY_HEADER` or
+    #: :data:`MEASURED_BY_PROBE`. Never absent: R2 removed the estimated path, so a master that
+    #: exists was measured, and the only question left is by what.
+    measurement: str = MEASURED_BY_HEADER
 
     @property
     def count(self) -> int:
@@ -248,7 +289,7 @@ class PlaylistMaster:
             "total_frames": int(self.total_frames),
             "sample_rate": int(self.sample_rate),
             "total_seconds": float(self.total_seconds),
-            "measured": bool(self.measured),
+            "measurement": str(self.measurement),
         }
 
 
@@ -381,9 +422,8 @@ def read_wav_geometry(path: str):
     """The PCM geometry of a canonical WAV from its header, or ``None`` when it cannot be read.
 
     Header-only and bounded: it reads :data:`music_playlist.WAV_HEADER_PROBE_BYTES` and hands the
-    bytes to the pure parser. ``None`` means **unmeasured**, which is a genuine third answer and is
-    never read as zero frames — the same rule ``frame_lock.FrameCountVerdict`` records, for the same
-    reason: an unmeasured count must not become a refusal.
+    bytes to the pure parser. ``None`` means *this instrument could not read it* — the **first**
+    of two, not the last word; see :func:`measure_frames`.
     """
     try:
         with open(path, "rb") as handle:
@@ -391,6 +431,71 @@ def read_wav_geometry(path: str):
     except OSError:
         return None
     return fork_playlist.parse_wav_header(header)
+
+
+def probe_frame_count(path: str, lifecycle=None):
+    """The exact sample count of one PCM file, from ffprobe. ``None`` when it cannot be measured.
+
+    [R2 / F2] The **secondary** measurement, and the reason R16 no longer has an estimated path.
+    For a PCM WAV the stream's ``time_base`` is ``1/sample_rate`` and ``duration_ts`` is therefore
+    the sample count itself — not a duration in seconds that would have to be multiplied back out
+    and rounded. Verified against a real 288 000-frame 48 kHz master: the header said 288 000 and
+    so did ffprobe, including on a file whose ``data`` chunk sat past the bounded header read.
+
+    The time base is **checked, not assumed**: a stream whose ``time_base`` is anything other than
+    ``1/sample_rate`` is reported as unmeasured rather than silently converted, because the
+    conversion would reintroduce exactly the rounding this function exists to avoid.
+
+    Never raises for a measurement failure — an instrument that cannot read must not become a
+    verdict. It is the *caller* that decides a double failure is fatal.
+    """
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
+    command = [FFPROBE_PATH, "-v", "error", "-select_streams", "a:0",
+               "-show_entries", "stream=duration_ts,time_base,sample_rate,channels",
+               "-of", "default=noprint_wrappers=1", path]
+    try:
+        result = _run(command, _PROBE_TIMEOUT_SECONDS, lifecycle=lifecycle)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    fields: dict = {}
+    for line in (result.stdout or "").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+    try:
+        duration_ts = int(fields["duration_ts"])
+        sample_rate = int(fields["sample_rate"])
+        channels = int(fields["channels"])
+        numerator, _, denominator = fields["time_base"].partition("/")
+        numerator, denominator = int(numerator), int(denominator)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if duration_ts <= 0 or sample_rate <= 0 or channels <= 0:
+        return None
+    if numerator != 1 or denominator != sample_rate:
+        return None                                # not a sample-accurate time base; say so
+    return fork_playlist.WavGeometry(channels=channels, sample_rate=sample_rate,
+                                     bits_per_sample=TRACK_BITS, frames=duration_ts)
+
+
+def measure_frames(path: str, lifecycle=None):
+    """``(geometry, instrument)`` for one PCM artifact, or ``(None, '')`` if neither could read it.
+
+    The header parse is free and answers for every file FFmpeg normally writes; ffprobe is the
+    fallback and is exact. Two independent instruments is what lets R16 require a **real**
+    measurement — the scope asked for the produced audio to be verified against the actual decoded
+    tracks, and an estimated geometry presented as a verified one would not be that.
+    """
+    geometry = read_wav_geometry(path)
+    if geometry is not None:
+        return geometry, MEASURED_BY_HEADER
+    geometry = probe_frame_count(path, lifecycle=lifecycle)
+    if geometry is not None:
+        return geometry, MEASURED_BY_PROBE
+    return None, ""
 
 
 def probe_duration(path: str, lifecycle=None) -> float:
@@ -458,8 +563,10 @@ def prepare_playlist_tracks(entries, lifecycle=None) -> tuple:
       a file *replaced* between queueing and rendering is reported rather than silently rendered;
     * **ffprobe reports a usable duration** — a positive, finite number.
 
-    Returns ``(path, source_duration_seconds)`` pairs in playlist order. Durations are the source
-    containers'; the authority on the soundtrack geometry is the measured decode.
+    Returns :class:`ValidatedTrack` records in playlist order, **each carrying the identity this
+    function actually saw** so :func:`build_playlist_master` can re-check it at the moment of use.
+    Durations are the source containers'; the authority on the soundtrack geometry is the measured
+    decode.
     """
     playlist = fork_playlist.playlist_from_entries(entries)
     if not playlist.count:
@@ -492,8 +599,29 @@ def prepare_playlist_tracks(entries, lifecycle=None) -> tuple:
             raise PlaylistInputError(
                 f"{where}: {changed}. Remove it and add it again, or press Add tracks to "
                 f"re-measure the playlist.")
-        prepared.append((path, probe_duration(path, lifecycle=lifecycle)))
+        # The identity recorded here is the one the CONSUMPTION boundary re-checks. Taken from the
+        # `stat` above rather than from the queued entry, so a track added with no recorded
+        # identity (a bare path) still gains one to be held to.
+        prepared.append(ValidatedTrack(
+            path=path,
+            size=int(stat.st_size),
+            mtime_ns=int(stat.st_mtime_ns),
+            source_duration_seconds=probe_duration(path, lifecycle=lifecycle)))
     return tuple(prepared)
+
+
+def _as_validated(track) -> ValidatedTrack:
+    """Accept only a :class:`ValidatedTrack`. A bare pair would carry no identity to re-check.
+
+    R2 deliberately tightened this rather than accepting both shapes: two accepted shapes is two
+    interpretations of "a track that passed the preflight", and the one without an identity is the
+    one that silently skips the consumption-boundary check.
+    """
+    if isinstance(track, ValidatedTrack):
+        return track
+    raise PlaylistBuildError(
+        "The playlist soundtrack was asked to build from an unvalidated track record. "
+        "prepare_playlist_tracks() must produce the tracks build_playlist_master() consumes.")
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +630,7 @@ def prepare_playlist_tracks(entries, lifecycle=None) -> tuple:
 
 
 def build_playlist_master(tracks, session_dir: str, lifecycle=None,
-                          on_track=None) -> PlaylistMaster:
+                          on_track=None, repeat=1) -> PlaylistMaster:
     """Produce the one continuous soundtrack master. Raises :class:`PlaylistError` on any failure.
 
     ``tracks`` is what :func:`prepare_playlist_tracks` returned — an already-validated, already-
@@ -514,6 +642,13 @@ def build_playlist_master(tracks, session_dir: str, lifecycle=None,
     callable rather than a progress object because this module must know nothing about
     ``ProgressEvent`` or Gradio: the GUI decides what a decode means on screen.
 
+    ``repeat`` is the Repeat Playlist count the render will apply **after** this function returns.
+    It changes nothing about what is built here — the master is always one cycle — and exists for
+    one reason: so the pre-admission check can refuse an impossible *total* before paying for the
+    decode. That is an **estimate**, from the source containers' durations; the guaranteed check
+    runs afterwards against the measured cycle, in
+    :func:`playlist_repeat_capacity`.
+
     Every intermediate this function creates is its own and is removed before it returns, on every
     path. The master it returns is the caller's to discard; :func:`discard_playlist_master` is the
     one way to do that.
@@ -522,7 +657,7 @@ def build_playlist_master(tracks, session_dir: str, lifecycle=None,
     Partial output is discarded on that path too, so a cancelled preparation leaves no truncated
     WAV behind for anything to read.
     """
-    ordered = [(str(path), duration) for path, duration in tracks]
+    ordered = [_as_validated(track) for track in tracks]
     if not ordered:
         raise PlaylistInputError(fork_playlist.EMPTY_PLAYLIST_MESSAGE)
     if lifecycle is not None:
@@ -531,55 +666,97 @@ def build_playlist_master(tracks, session_dir: str, lifecycle=None,
         raise PlaylistBuildError(
             "The render session folder is unavailable, so no playlist soundtrack can be written.")
 
-    estimated_total = sum(duration for _path, duration in ordered)
-    _refuse_impossible_sizes(estimated_total, session_dir)
+    estimated_total = sum(track.source_duration_seconds for track in ordered)
+    _refuse_impossible_sizes(estimated_total, session_dir, repeat=repeat)
 
     started = time.perf_counter()
     stem = uuid.uuid4().hex
-    list_path = os.path.join(session_dir, f"beatsync_playlist_list_{stem}.txt")
     master_path = master_path_for(session_dir)
-    decoded: list = []
+
+    # [R2 / F1] **Every invocation-owned temporary path is registered BEFORE anything can create
+    # it.** The pre-R2 code appended a decode target to its cleanup list only *after* the decode
+    # had succeeded and been validated — but FFmpeg creates its output the moment it starts
+    # writing, so a decoder that failed, timed out or was cancelled left a partial WAV that nothing
+    # ever removed. Measured on all four paths. `_owned` makes forgetting structurally harder than
+    # remembering: a path that is not registered is a path that was never constructed here.
+    #
+    # The master is tracked separately because it is the one artifact a SUCCESS keeps.
+    scratch: list = []
+
+    def _owned(path: str) -> str:
+        scratch.append(path)
+        return path
+
+    list_path = _owned(os.path.join(session_dir, f"beatsync_playlist_list_{stem}.txt"))
+    succeeded = False
 
     try:
         # ---- 1. decode every queued track to one canonical PCM representation ------------
+        decoded: list = []
         measured_frames: list = []
+        instruments: set = set()
         # The canonical rate this module asks FFmpeg for, replaced by the first real measurement so
         # the offsets are derived from the artifact rather than from what was requested.
         sample_rate = TRACK_SAMPLE_RATE
-        unmeasured = False
-        for position, (path, source_duration) in enumerate(ordered, start=1):
+        for position, track in enumerate(ordered, start=1):
+            path = track.path
             if on_track is not None:
-                on_track(position, len(ordered), os.path.basename(path))
-            target = os.path.join(session_dir,
-                                  f"beatsync_playlist_{stem}_{position:03d}.wav")
+                on_track(position, len(ordered), track.name)
+            where = f"track {position} of {len(ordered)}"
+
+            # [R2 / F2] The CONSUMPTION boundary. The preflight may have run minutes ago, before a
+            # cold Stage 5; this is the instant the bytes are actually read, so the identity it
+            # validated is re-checked here rather than trusted. A track replaced in that window
+            # must not silently become part of the soundtrack.
+            try:
+                now = os.stat(path)
+            except OSError as exc:
+                raise PlaylistInputError(
+                    f"Could not read {where} ({track.name}) when the soundtrack was built: "
+                    f"{path}") from exc
+            changed = fork_playlist.describe_identity_change(
+                track.as_playlist_track(), now.st_size, now.st_mtime_ns)
+            if changed:
+                # The pure module's sentence verbatim -- capitalising its first character would
+                # capitalise the FILENAME it starts with, turning `victim.wav` into `Victim.wav`
+                # and inventing a file the operator does not have.
+                raise PlaylistInputError(
+                    f"{where.capitalize()}: {changed}. It changed while this render was being "
+                    f"prepared, so nothing was rendered. Add the track again and retry.")
+
+            target = _owned(os.path.join(
+                session_dir, f"beatsync_playlist_{stem}_{position:03d}.wav"))
+            decoded.append(target)
             try:
                 result = _run(build_decode_command(path, target),
                               _DECODE_TIMEOUT_SECONDS, lifecycle=lifecycle)
             except subprocess.TimeoutExpired:
-                raise PlaylistBuildError(
-                    f"Timed out decoding track {position} of {len(ordered)} "
-                    f"({os.path.basename(path)})")
+                raise PlaylistBuildError(f"Timed out decoding {where} ({track.name})")
             if result.returncode != 0:
                 # Deliberately an INPUT error: a non-zero decode of a file the operator chose is
                 # overwhelmingly a problem with that file (a truncated download, a DRM-wrapped
                 # M4A, a container FFmpeg cannot demux), and naming the track is what lets them
                 # fix it. The join below is where a generated-artifact failure is a build error.
                 raise PlaylistInputError(
-                    f"Could not decode track {position} of {len(ordered)} "
-                    f"({os.path.basename(path)}): {_tail(result.stderr) or 'FFmpeg failed'}")
+                    f"Could not decode {where} ({track.name}): "
+                    f"{_tail(result.stderr) or 'FFmpeg failed'}")
             if not os.path.isfile(target) or os.path.getsize(target) <= 0:
                 raise PlaylistInputError(
-                    f"Track {position} of {len(ordered)} ({os.path.basename(path)}) produced no "
-                    f"audio to add to the playlist")
-            decoded.append(target)
+                    f"Decoding {where} ({track.name}) produced no audio to add to the playlist")
 
-            geometry = read_wav_geometry(target)
+            geometry, instrument = measure_frames(target, lifecycle=lifecycle)
             if geometry is None:
-                unmeasured = True
-                measured_frames.append(None)
-            else:
-                sample_rate = geometry.sample_rate or sample_rate
-                measured_frames.append(geometry.frames)
+                # [R2 / F2] Both instruments failed on an artifact THIS function just produced.
+                # Pre-R2 this fell through to container durations and reported them as boundaries;
+                # that is estimated geometry presented as verified, which is the one thing the
+                # scope's "verify against the actual decoded tracks" rules out. Refuse instead.
+                raise PlaylistBuildError(
+                    f"Could not measure the decoded audio for {where} ({track.name}): neither the "
+                    f"WAV header nor ffprobe reported a usable sample count, so the soundtrack "
+                    f"could not be verified against it.")
+            sample_rate = geometry.sample_rate or sample_rate
+            measured_frames.append(geometry.frames)
+            instruments.add(instrument)
 
         # ---- 2. join them, in order, into one continuous soundtrack ----------------------
         with open(list_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -602,15 +779,16 @@ def build_playlist_master(tracks, session_dir: str, lifecycle=None,
 
         # ---- 3. verify the soundtrack against the tracks that actually went into it ------
         produced = probe_master_duration(master_path, lifecycle=lifecycle)
-        master_geometry = read_wav_geometry(master_path)
-        total_frames, measured = _verify_sample_counts(
-            master_geometry, measured_frames, unmeasured, len(ordered))
-        if total_frames is not None and master_geometry is not None:
-            total_seconds = total_frames / (master_geometry.sample_rate or sample_rate)
-            sample_rate = master_geometry.sample_rate or sample_rate
-        else:
-            total_seconds = produced
-            total_frames = int(round(produced * sample_rate))
+        master_geometry, master_instrument = measure_frames(master_path, lifecycle=lifecycle)
+        if master_geometry is None:
+            raise PlaylistBuildError(
+                "Could not measure the joined playlist soundtrack: neither the WAV header nor "
+                "ffprobe reported a usable sample count, so it could not be verified against the "
+                "tracks that went into it.")
+        instruments.add(master_instrument)
+        total_frames = _verify_sample_counts(master_geometry, measured_frames, len(ordered))
+        sample_rate = master_geometry.sample_rate or sample_rate
+        total_seconds = total_frames / sample_rate
         drift = abs(produced - total_seconds)
         if drift > DURATION_TOLERANCE_SECONDS:
             # Load-bearing: the frame-locked cut timeline is derived from this file's duration, and
@@ -620,17 +798,25 @@ def build_playlist_master(tracks, session_dir: str, lifecycle=None,
                 f"The playlist soundtrack measures {total_seconds:.3f}s by sample count but "
                 f"{produced:.3f}s by probe ({drift * 1000:.1f} ms apart)")
 
-        prepared_tracks = _place_tracks(ordered, measured_frames, sample_rate, produced, measured)
-    except (PlaylistError, RenderCancelled):
-        # Both paths discard the partial master: a truncated WAV left in `session_dir` would be
-        # read by nothing today, and must not become readable by anything tomorrow. The exception
-        # itself is re-raised unchanged -- a cancellation stays a cancellation.
-        discard_playlist_master(master_path)
-        raise
+        prepared_tracks = _place_tracks(ordered, measured_frames, sample_rate)
+        succeeded = True
     finally:
-        discard_playlist_master(list_path)
-        for path in decoded:
+        # [R2 / F1] ONE cleanup, covering EVERY terminal path. There is deliberately no `except`
+        # clause: a typed failure, a cancellation, a `KeyboardInterrupt` and an unexpected
+        # `OSError` from the middle of the join all leave this function the same way, and all of
+        # them must leave the session folder as they found it.
+        #
+        # Not catching anything is also what preserves the two contracts above it — the
+        # `PlaylistInputError` / `PlaylistBuildError` split that `gui.py` classifies on, and
+        # `RenderCancelled` propagating unchanged so a Stop is never reported as a broken file.
+        #
+        # The children are already reaped: `_run` kills and `communicate()`s its own `Popen` in its
+        # own `finally`, so by the time control reaches here no FFmpeg still holds any of these
+        # files open — which on Windows is the difference between a delete and a sharing violation.
+        for path in scratch:
             discard_playlist_master(path)
+        if not succeeded:
+            discard_playlist_master(master_path)
 
     return PlaylistMaster(
         path=master_path,
@@ -639,7 +825,8 @@ def build_playlist_master(tracks, session_dir: str, lifecycle=None,
         sample_rate=int(sample_rate),
         total_seconds=float(total_seconds),
         prepare_seconds=time.perf_counter() - started,
-        measured=measured,
+        measurement=(MEASURED_BY_PROBE if MEASURED_BY_PROBE in instruments
+                     else MEASURED_BY_HEADER),
     )
 
 
@@ -656,18 +843,76 @@ def probe_master_duration(path: str, lifecycle=None) -> float:
         raise PlaylistBuildError(str(exc)) from exc
 
 
-def _refuse_impossible_sizes(total_seconds, session_dir: str) -> None:
+def free_space(session_dir: str):
+    """Free bytes on the scratch volume, or ``None`` when it cannot be measured.
+
+    Separated out so the capacity policy can be given a number — real or injected — rather than
+    reaching for a disk itself. That is what lets the regression suite drive every refusal without
+    generating multi-gigabyte fixtures or filling a physical drive.
+    """
+    try:
+        return shutil.disk_usage(session_dir).free
+    except OSError:
+        return None
+
+
+def playlist_repeat_capacity(cycle_seconds, repeat, session_dir: str, *,
+                             free_bytes=None, ceiling_bytes=None):
+    """The **guaranteed** capacity verdict, from the MEASURED cycle of a master that now exists.
+
+    [R2 / F3] Called after the playlist master has been built and before R10 is handed it, which
+    is the only moment both facts are available: the cycle is a measurement rather than a sum of
+    container durations, and the repeat count is known. The pre-admission check inside
+    :func:`build_playlist_master` has already refused the obviously impossible from an *estimate*;
+    this is the one that can be stated without a qualifier.
+
+    `free_bytes` and `ceiling_bytes` are injectable so the suite can drive both refusals with no
+    real disk and no real multi-gigabyte file. Passing nothing measures the volume for real.
+    """
+    measured_free = free_space(session_dir) if free_bytes is None else free_bytes
+    return fork_playlist.capacity_verdict(
+        cycle_seconds, repeat,
+        free_bytes=measured_free,
+        guaranteed=True,
+        min_free_bytes=MIN_FREE_SCRATCH_BYTES,
+        ceiling_bytes=(fork_playlist.MAX_MASTER_BYTES if ceiling_bytes is None
+                       else ceiling_bytes))
+
+
+def raise_for_capacity(verdict) -> None:
+    """Turn a refusing :class:`music_playlist.CapacityVerdict` into the right exception type.
+
+    The two refusals are classified differently and deliberately so, because `gui.py` maps the
+    types onto different batch semantics: a **format** refusal is a fact about what was requested,
+    frozen for the whole batch, so every candidate would hit it identically (`SHARED_FATAL`); a
+    **space** refusal is a fact about one volume at one instant, which a later candidate might not
+    hit (`UNKNOWN_FATAL`, fail-closed).
+    """
+    if verdict.ok:
+        return
+    if verdict.reason == fork_playlist.REFUSAL_FORMAT:
+        raise PlaylistInputError(verdict.message)
+    raise PlaylistBuildError(verdict.message)
+
+
+def _refuse_impossible_sizes(total_seconds, session_dir: str, repeat=1) -> None:
     """Refuse up front where the soundtrack cannot be written, rather than part-way through.
 
-    Two different impossibilities, deliberately distinguished:
+    Everything here is an **estimate** — it runs before any decode, so the only durations available
+    are the source containers', and a VBR MP3's is routinely a few milliseconds out. It exists to
+    stop an obviously impossible job before it costs a full decode; the guaranteed statement is
+    :func:`playlist_repeat_capacity`, after the master is measured.
 
-    * **the format's own ceiling** — a WAV `data` chunk size is 32 bits, so a soundtrack above
-      :data:`MAX_MASTER_BYTES` would be written with a wrapped header and would desynchronise;
-    * **this volume, right now** — the estimated peak plus headroom against the actual free space.
+    Three impossibilities, deliberately distinguished:
 
-    The second is a statement about one instant on a volume any other process may fill a moment
-    later. It can refuse an obviously impossible job; it cannot promise a possible one, and the
-    loud failures above are what cover the rest.
+    * **the joined master's own format ceiling** — one cycle above
+      :data:`MAX_MASTER_BYTES` cannot be one WAV;
+    * **the REPEATED master's format ceiling and its overlapping peak** (R2 / F3) — `N × cycle`
+      has its own ceiling, and at the worst moment the playlist master, R10's copy of it and the
+      repeated master all exist at once. Pre-R2 none of this was accounted for: a 20-minute
+      playlist at 30x reached R10, wrote 10.4 GB past a 3.9 GB ceiling, and failed only on R10's
+      own duration check — after the write;
+    * **this volume, right now** — the build's own `2 ×` peak plus headroom.
     """
     estimated_master = fork_playlist.master_bytes(total_seconds)
     if estimated_master > MAX_MASTER_BYTES:
@@ -675,104 +920,99 @@ def _refuse_impossible_sizes(total_seconds, session_dir: str) -> None:
             f"This playlist is about {fork_playlist.format_clock(total_seconds)} long, which is "
             f"more than one WAV soundtrack file can hold "
             f"({fork_playlist.format_bytes(MAX_MASTER_BYTES)}). Remove some tracks.")
-    needed = estimate_scratch_bytes(total_seconds) + MIN_FREE_SCRATCH_BYTES
-    try:
-        free = shutil.disk_usage(session_dir).free
-    except OSError:
+
+    measured_free = free_space(session_dir)
+    raise_for_capacity(fork_playlist.capacity_verdict(
+        total_seconds, repeat, free_bytes=measured_free, guaranteed=False,
+        min_free_bytes=MIN_FREE_SCRATCH_BYTES))
+
+    if measured_free is None:
         return                                      # unmeasured is not a refusal
-    if free < needed:
+    needed = estimate_scratch_bytes(total_seconds) + MIN_FREE_SCRATCH_BYTES
+    if measured_free < needed:
         raise PlaylistBuildError(
             f"Not enough temporary space to build the playlist soundtrack: it needs about "
             f"{fork_playlist.format_bytes(needed)} and "
-            f"{fork_playlist.format_bytes(free)} is free. Free some space, or remove tracks.")
+            f"{fork_playlist.format_bytes(measured_free)} is free. Free some space, or remove "
+            f"tracks.")
 
 
-def _verify_sample_counts(master_geometry, measured_frames, unmeasured: bool, count: int):
-    """``(total_frames, measured)`` — the exact verification, with an honest unmeasured answer.
+def _verify_sample_counts(master_geometry, measured_frames, count: int) -> int:
+    """The exact verification: the master's frame count **is** the sum of its inputs'.
 
-    The primary check, and the reason the decode is per-track: the master's own frame count must
-    equal the **sum** of the decoded tracks' frame counts, exactly. Not within a tolerance — a
-    stream copy of consecutive PCM runs either reproduced every sample or it did not, and a single
-    dropped or duplicated frame would put every later track at the wrong offset.
+    The primary check, and the reason the decode is per-track: not within a tolerance — a stream
+    copy of consecutive PCM runs either reproduced every sample or it did not, and a single dropped
+    or duplicated frame would put every later track at the wrong offset.
 
-    An **unmeasured** count is never a refusal. If any track's header or the master's could not be
-    parsed, this returns ``(None, False)`` and the caller falls back to the probed duration, with
-    ``measured=False`` recorded on the result and in the report. Refusing a render because a header
-    was shaped unusually would be a worse failure than reporting that the strongest check could not
-    run.
+    [R2 / F2] There is no longer an unmeasured answer to return. Every caller has already resolved
+    a real geometry through :func:`measure_frames` — the header first, ffprobe second — and a
+    double failure is refused at the point of measurement rather than carried here as `None`. That
+    removes the one path on which estimated geometry could reach the render report labelled as a
+    verified boundary.
     """
-    if unmeasured or master_geometry is None or any(f is None for f in measured_frames):
-        return None, False
     expected = sum(measured_frames)
     if master_geometry.frames != expected:
         raise PlaylistBuildError(
             f"The playlist soundtrack holds {master_geometry.frames} audio samples but the "
             f"{count} decoded tracks hold {expected} together "
             f"({abs(master_geometry.frames - expected)} apart)")
-    return expected, True
+    return expected
 
 
-def _place_tracks(ordered, measured_frames, sample_rate: int, produced: float,
-                  measured: bool) -> tuple:
-    """Where each track begins inside the finished soundtrack.
+def _place_tracks(ordered, measured_frames, sample_rate: int) -> tuple:
+    """Where each track begins inside the finished soundtrack — a cumulative SAMPLE offset.
 
-    From the **measured** frame counts when every track was measurable — a cumulative sample offset
-    is exact, and is the only honest way to say "track 4 starts at 11:02". When measurement was not
-    possible the offsets fall back to the source containers' own durations, scaled so the last one
-    still lands on the master's probed length, and ``measured`` on the result records which of the
-    two the report is showing.
+    Exact, and the only honest way to say "track 4 starts at 11:02".
+
+    [R2 / F2] The estimated branch this function used to carry is **gone**, not merely unused. It
+    scaled the source containers' durations so the last one landed on the master's probed length
+    and handed the result to the render report as track boundaries; that is an estimate wearing a
+    measurement's clothes, which is precisely what the scope's "verify against the actual decoded
+    tracks" rules out. A geometry that cannot be measured is now refused at the point of
+    measurement, so by the time control reaches here every frame count is real.
     """
-    if measured:
-        tracks: list = []
-        cursor = 0
-        for index, (path, source_duration) in enumerate(ordered):
-            frames = int(measured_frames[index])
-            tracks.append(PreparedTrack(
-                index=index, path=path,
-                name=os.path.basename(path.replace("\\", "/")) or path,
-                start_frame=cursor, frames=frames, sample_rate=int(sample_rate),
-                source_duration_seconds=float(source_duration)))
-            cursor += frames
-        return tuple(tracks)
-
-    estimated = sum(duration for _path, duration in ordered) or produced or 1.0
-    scale = (produced / estimated) if estimated else 1.0
-    tracks = []
-    cursor = 0.0
-    for index, (path, source_duration) in enumerate(ordered):
-        scaled = float(source_duration) * scale
+    tracks: list = []
+    cursor = 0
+    for index, track in enumerate(ordered):
+        frames = int(measured_frames[index])
         tracks.append(PreparedTrack(
-            index=index, path=path,
-            name=os.path.basename(path.replace("\\", "/")) or path,
-            start_frame=int(round(cursor * sample_rate)),
-            frames=int(round(scaled * sample_rate)),
-            sample_rate=int(sample_rate),
-            source_duration_seconds=float(source_duration)))
-        cursor += scaled
+            index=index, path=track.path, name=track.name,
+            start_frame=cursor, frames=frames, sample_rate=int(sample_rate),
+            source_duration_seconds=float(track.source_duration_seconds)))
+        cursor += frames
     return tuple(tracks)
 
 
 __all__ = [
     "DURATION_TOLERANCE_SECONDS",
     "MAX_MASTER_BYTES",
+    "MEASURED_BY_HEADER",
+    "MEASURED_BY_PROBE",
     "MIN_FREE_SCRATCH_BYTES",
     "PlaylistBuildError",
     "PlaylistError",
     "PlaylistInputError",
     "PlaylistMaster",
     "PreparedTrack",
+    "TRACK_BITS",
     "TRACK_CHANNELS",
     "TRACK_CODEC",
     "TRACK_SAMPLE_RATE",
+    "ValidatedTrack",
     "build_decode_command",
     "build_join_command",
     "build_join_list",
     "build_playlist_master",
     "discard_playlist_master",
     "estimate_scratch_bytes",
+    "free_space",
     "master_path_for",
+    "measure_frames",
+    "playlist_repeat_capacity",
     "prepare_playlist_tracks",
     "probe_duration",
+    "probe_frame_count",
     "probe_master_duration",
+    "raise_for_capacity",
     "read_wav_geometry",
 ]

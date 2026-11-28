@@ -96,6 +96,42 @@ and one audio PCM hash (`b79826cc…`) — **identical on both trees**. Do not u
 the instrument here; MP4/Matroska carry generated identifiers and two runs of the same tree differ
 from each other.
 
+## Scratch is registered before it can exist, and cleaned on every terminal path (R2 / F1)
+
+```
+scratch: list = []
+def _owned(path): scratch.append(path); return path     # register, then return, in one expression
+...
+succeeded = False
+try:   ...   succeeded = True
+finally:
+    for path in scratch: discard_playlist_master(path)
+    if not succeeded:    discard_playlist_master(master_path)
+```
+
+The R1 shape appended a decode target to its cleanup list **after** the decode had succeeded and
+been validated — but FFmpeg creates its output the moment it starts writing. Reproduced on all
+four paths: a failing, timing-out, cancelled or empty-output decoder each left a partial WAV in
+`session_dir` that nothing ever removed. And the master was discarded only inside
+`except (PlaylistError, RenderCancelled)`, so an **unexpected** fault after the join left it too.
+
+- **`_owned` makes forgetting harder than remembering.** It registers and returns in one
+  expression, so a constructed-but-unregistered path is not expressible. A test asserts every
+  `os.path.join(session_dir, …)` in the function goes through it.
+- **There is no `except` clause at all**, and that is what makes the guarantee total rather than
+  enumerated: a typed failure, a cancellation, a `KeyboardInterrupt` and an unexpected `OSError`
+  all leave the function the same way. It is also what preserves the two contracts above it — the
+  `PlaylistInputError` / `PlaylistBuildError` split `gui.py` classifies on, and `RenderCancelled`
+  propagating **unchanged** so a Stop is never reported as a broken file. Nothing is caught, so
+  nothing can be re-typed.
+- **The children are already reaped.** `_run` kills and `communicate()`s its own `Popen` in its
+  own `finally`, so by the time the cleanup runs no FFmpeg holds any of these files open — which
+  on Windows is the difference between a delete and a sharing violation.
+- **Only what this invocation built.** Every removable path is `os.path.join(session_dir, …)`
+  carrying this call's own uuid stem; the module contains one `os.remove`, inside the one
+  best-effort helper, and no `rmtree`, `rmdir`, `glob`, `listdir`, `scandir` or `walk`. A source
+  file, an existing output and another invocation's scratch are all unreachable from here.
+
 ## The audio master: decode each, join once, then verify the SAMPLE COUNT
 
 ```
@@ -115,12 +151,24 @@ from each other.
 - **Step 3 is exact, not a tolerance.** A stream copy of consecutive PCM runs either reproduced
   every sample or it did not; one dropped or duplicated frame would put every later track at the
   wrong offset. The ffprobe duration check is the independent cross-check, not the primary one.
-- **An UNMEASURED count is never a refusal.** `parse_wav_header` answers `None` for any shape it
-  does not recognise — including a `data` chunk beyond the bounded header read, and a streamed
-  WAV's `0`/`0xFFFFFFFF` placeholder size — and the builder then falls back to the probed duration
-  with `measured=False` recorded on the result. This is `frame_lock.FrameCountVerdict`'s rule,
-  restated: refusing a render because a header was shaped unusually is a worse failure than
-  reporting that the strongest check could not run.
+- **Two independent instruments, and a double failure is a REFUSAL (R2 / F2).** `parse_wav_header`
+  is free and answers for every file FFmpeg normally writes, but returns `None` for a `data` chunk
+  beyond the bounded header read and for a streamed WAV's `0`/`0xFFFFFFFF` placeholder size.
+  `probe_frame_count` then measures the same file exactly: for PCM the stream's `time_base` is
+  `1/sample_rate`, so `duration_ts` **is** the sample count — no seconds, no multiplying back out,
+  no rounding. Verified against a real 288 000-frame 48 kHz master: the header said 288 000, so did
+  ffprobe, **including on a file whose `data` chunk sat past the bounded read**. The time base is
+  checked rather than assumed; an unexpected one is reported as unmeasured instead of converted.
+- **The estimated path is gone, not merely unused.** R1 fell back to the source containers'
+  durations, scaled so the last landed on the probed length, and handed that to the render report
+  as track boundaries — estimated geometry wearing a measurement's clothes, which is exactly what
+  "verify the produced audio against the actual decoded tracks" rules out. `_place_tracks` has one
+  branch now and `_verify_sample_counts` has no `None` to return. `PlaylistMaster.measurement`
+  says *which* instrument answered (`header` or `probe`), never *whether* one did.
+  **This is a deliberate departure from `frame_lock`'s "an unmeasured count is never a refusal".**
+  The two cases differ in what is at stake: `frame_lock` would be discarding a clip that is
+  probably fine, while here an unmeasurable artifact means the soundtrack's own geometry — the
+  thing the whole analysis and the frame-locked timeline are derived from — is unknown.
 - **`-vn -map 0:a:0` is load-bearing**, not tidiness: an MP3 with cover art presents a video
   stream, and an M4A or MKV may carry several audio tracks.
 - **There is no gap between two tracks, by construction**, and nothing is faded, aligned, padded or
@@ -140,6 +188,49 @@ from each other.
   `data` size is a 32-bit field, so a longer one would be written with a wrapped header and would
   desynchronise.
 
+## Repeat Playlist capacity and format limits (R2 / F3)
+
+R1's capacity check knew only about the playlist: `build_playlist_master` had no `repeat`
+parameter and R10 has no capacity or format check of its own. So a **20-minute playlist at 30×**
+passed every gate, reached R10, wrote **10.4 GB past the 3.9 GB one-WAV ceiling**, and failed only
+on R10's own duration check — *after* the write. Reproduced.
+
+```
+output   = N x cycle                        must be <= MAX_MASTER_BYTES
+peak     = (N + 2) x cycle                  the playlist master + R10's copy of it + the repeated
+                                            master, all on disk at the same moment
+required = peak + MIN_FREE_SCRATCH_BYTES
+```
+
+- **`(N + 2)`, not `N`.** Counting only the repeated master is how a check passes and the write
+  then fails. At 1× R10 is never entered, so the repeat stage contributes nothing and the build's
+  own `2 ×` peak is the binding figure instead.
+- **Two gates, and the verdict says which it is.** `CapacityVerdict.guaranteed` is the whole point
+  of the record: before the decode the only figures are the source containers' durations, which
+  are an *estimate*; afterwards the cycle is a **measurement**. The estimate runs inside
+  `build_playlist_master` so an impossible job costs no decode; the guaranteed one runs in the
+  render body after the master exists and before R10 is handed it — the only moment both facts are
+  available. An estimated pass is never phrased as a promise.
+- **Nothing here is a reservation.** Free space is one instant on a volume any other process may
+  fill a moment later. It can refuse an impossible job; it cannot promise a possible one.
+- **Unmeasured free space is never a refusal** — the format ceiling is arithmetic and still runs.
+- **The two refusals carry different types on purpose.** A **format** refusal (`PlaylistInputError`
+  → `SHARED_FATAL`) is a fact about the request, and repeat and playlist are both batch-frozen, so
+  every candidate would hit it identically. A **space** refusal (`PlaylistBuildError` →
+  `UNKNOWN_FATAL`) is a fact about one volume at one instant, which a later candidate might not
+  hit.
+- **The message is actionable, and the read-out says it first.** It names the figure, the ceiling
+  or the free space, and the repeat count that *would* fit (`Lower the repeat count to 11x or
+  less`). `repeat_estimate_markdown` shows the same refusal on the slider, from the same
+  `capacity_verdict`, so the two cannot disagree and the operator learns before committing.
+- **One definition of the ceiling**, in the pure module, because R2 needs the same number for two
+  artifacts. Two copies of a limit are two limits waiting to disagree.
+- **R10's own module is deliberately untouched.** The task's instruction is to preserve Single
+  Track and Repeat Music behaviour, so the guard lives on the playlist path. **Known limitation,
+  recorded rather than fixed:** a 30× *single-track* render of a song longer than about 8¼ minutes
+  exceeds the same ceiling and is still unguarded. That is pre-existing R10 behaviour, out of R16's
+  scope, and fixing it belongs in a task that may change `music_repeater.py`.
+
 ## Validation is of the WHOLE selection, and never returns a subset
 
 `prepare_playlist_tracks` runs **before Stage 1 and before any decoding**, so a fixable input
@@ -154,6 +245,20 @@ it is not empty; **its recorded size and `mtime_ns` still match** (so a file *re
 queueing and rendering is reported rather than silently rendered); ffprobe reports a usable
 duration. A recorded identity of `0/0` means "never probed" rather than "probed as empty" and is
 not treated as a change, which is what lets a playlist restored from a bare path list still render.
+
+**And again at the CONSUMPTION boundary (R2 / F2).** The preflight runs before Stage 1; the decode
+runs after Stage 5, minutes later on a cold library. R1 handed the decode `(path, duration)` pairs,
+which carried nothing to re-check, so a track replaced in that window was decoded without comment —
+reproduced. `prepare_playlist_tracks` now returns `ValidatedTrack` records carrying the identity it
+actually saw (from its own `stat`, so a track queued as a bare path gains one to be held to), and
+`build_playlist_master` re-stats each file immediately before reading its bytes. A change there is
+`PlaylistInputError`, naming the track and saying nothing was rendered.
+
+`build_playlist_master` accepts **only** `ValidatedTrack`, deliberately rather than both shapes:
+two accepted shapes is two interpretations of "a track that passed the preflight", and the one
+without an identity is precisely the one that would skip this check. Because the Variant Lab batch
+re-enters the render core per candidate, every candidate re-runs both the preflight and this
+boundary check against the live files.
 
 **There is no fallback to a shorter soundtrack and none to the Single Track picker.** Two failure
 classes, because the render body classifies them differently and must not guess:
@@ -215,20 +320,32 @@ cannot reach it.
 ```
 playlist = ()
 if music_source != 'single':
-    playlist = fork_playlist.freeze_entries(music_source, playlist_state)
-    if not playlist:  ->  SHARED_FATAL refusal, BEFORE RENDER_STARTED_KEY is set
+    frozen_queue = fork_playlist.freeze_queue(music_source, playlist_state)
+    if frozen_queue.refusal():  ->  SHARED_FATAL, BEFORE RENDER_STARTED_KEY is set
+    playlist = frozen_queue.entries
 ```
+
+**The freeze reports what it could not use (R2 / F2).** `playlist_from_entries` is a projection and
+skips what it cannot read — that is what a projection is for — and it truncates past
+`MAX_TRACKS`. R1 took its output as the frozen queue, so a three-row state froze as two and
+rendered a soundtrack missing a song (`3 rows submitted -> 2 frozen`, reproduced), and a 205-row
+state rendered its first 200 in silence. `FrozenQueue` now carries `submitted`, `usable`,
+`dropped` and `over_limit`, and `refusal()` turns any of the three unrenderable shapes — empty,
+lossy, over-limit — into one operator-facing sentence that the gate refuses on. **The 200-track
+limit is still enforced; what changed is that it is enforced visibly.** One refusal branch covers
+all three, because the pure record decides *which* sentence applies and the gate only decides what
+to do about it.
 
 - The `!= 'single'` pre-check is the explicit legacy branch this repository prefers over "the new
   code with a neutral value". Every other value, valid or malformed, goes through the **one**
-  normaliser inside `freeze_entries`, which answers `()` for anything that is not a playlist
-  declaration — so there is no second interpretation of what Music Source means. A test asserts
-  `gui.py` contains exactly one `freeze_entries(` call.
+  normaliser inside `freeze_queue`, which answers an empty queue for anything that is not a
+  playlist declaration — so there is no second interpretation of what Music Source means. A test
+  asserts `gui.py` contains exactly one `freeze_queue(` call.
 - **What crosses into the pipeline is plain primitives**: a tuple of
   `(path, size, mtime_ns, duration)` tuples of `str`/`int`/`float`. Gradio deep-copies `gr.State`,
   and several suites execute `_process_video_impl` against a namespace holding no fork module —
   the same discipline Freestyle's eleven-value tuple follows, for the same measured reasons.
-- **An empty playlist in playlist mode is a refusal, never a fall back to the Single Track
+- **An unrenderable queue in playlist mode is a refusal, never a fall back to the Single Track
   picker**, which would render music the operator did not ask for, or nothing at all, without
   saying which. It happens before `RENDER_STARTED_KEY`, so a refused click raises no desktop
   notification — exactly as a source-gate refusal does not.
@@ -338,7 +455,34 @@ Real portable FFmpeg, real pipeline, real browser. Full logs and JSON in the tas
 | Variant Lab 2 candidates | identical audio bytes, 450 frames each, different video |
 | builder, 36 real-FFmpeg checks | 36/36 — exact sample counts, measured boundaries, heterogeneous inputs, six loud failures, three cancellations, no scratch left on any path |
 
-**Known limitation, measured and left open:** the L2 cache miss described above. **Not implemented
-and deliberately so:** crossfades, DJ mixing, automatic loudness mastering, per-song repeat, and a
-CLI flag — `video_processor.py`'s headless entry point renders a single audio file, exactly as it
-did, and R16 adds nothing to its argv.
+### R2 final hardening, measured
+
+Each finding was **reproduced against the R1 candidate `f8d6aa0a` first**, with a deterministic
+fake FFmpeg driving the decoder behaviours a real one shows only occasionally (a partial write then
+a non-zero exit; a partial write then a hang; a zero-byte output; a header past the bounded read;
+an artifact neither instrument can read). The same harness, pointed at the fixed tree, reproduces
+none of them.
+
+| | R1 candidate `f8d6aa0a` | after R2 |
+|---|---|---|
+| failing / empty / timed-out / cancelled decoder | **partial WAV left in `session_dir`**, four for four | scratch empty, four for four |
+| unexpected fault after the join | **master left on disk** | removed |
+| header past the bounded read | geometry **estimated**, reported as boundaries | measured by ffprobe (`measurement=probe`) |
+| neither instrument can read it | geometry **estimated** | `PlaylistBuildError`, refused |
+| malformed row in the queue | `3 submitted -> 2 frozen`, rendered | refused, naming `1 of the 3 tracks` |
+| 205-row queue | silently truncated to 200 | refused, naming the limit |
+| track replaced after the preflight | decoded without comment | `PlaylistInputError` at the consumption boundary |
+| 20-minute playlist at 30× | 10.4 GB written past a 3.9 GB ceiling, caught after the write | refused up front, `Lower the repeat count to 11x or less` |
+| peak larger than the volume | not checked at all | refused, naming both figures |
+
+**13 / 13 reproduced before, 0 / 15 after.** Plus 36/36 real-FFmpeg builder checks, 18/18 rendered
+measurements (including a 2× playlist publishing **900 of 900** frames with A/V 0.0 ms apart and
+the tone sequence **A B C A B C**), and 1 579 focused regression tests.
+
+**Known limitations, measured and left open:** the L2 cache miss described above; and a 30×
+**single-track** render of a song longer than about 8¼ minutes still exceeds the one-WAV ceiling
+unguarded — pre-existing R10 behaviour, outside R16's scope, and fixing it belongs in a task
+permitted to change `music_repeater.py`. **Not implemented and deliberately so:** crossfades, DJ
+mixing, automatic loudness mastering, per-song repeat, and a CLI flag — `video_processor.py`'s
+headless entry point renders a single audio file, exactly as it did, and R16 adds nothing to its
+argv.

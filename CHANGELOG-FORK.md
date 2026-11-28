@@ -20,6 +20,52 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-28 (R16 R2 final hardening: three ways the playlist preparation was quietly wrong)
+
+A focused pass over the R16 V1 candidate `f8d6aa0a`, closing three findings. **Each was reproduced
+against that candidate first** with a deterministic fake FFmpeg — 13 of 13 reproduce there, 0 of 15
+on the fixed tree.
+
+**F1 — a failed, timed-out or cancelled decode left its partial WAV behind.** The cleanup list was
+appended to *after* a decode had succeeded and been validated, but FFmpeg creates its output the
+moment it starts writing. All four paths leaked, and an unexpected fault after the join left the
+master too, because the master was discarded only inside `except (PlaylistError, RenderCancelled)`.
+Every invocation-owned path is now registered **before** anything can create it, through a helper
+that registers and returns in one expression, and one `finally` with a success flag covers every
+terminal path. The function now catches **nothing at all**, which is both simpler and stronger: no
+exception of any type can be re-typed, so the `PlaylistInputError` / `PlaylistBuildError` split and
+`RenderCancelled`'s unchanged propagation are preserved by construction rather than by enumeration.
+The children are already reaped by `_run`'s own `finally`, which on Windows is the difference
+between a delete and a sharing violation.
+
+**F2 — "verified" sometimes meant "estimated".** When a WAV's `data` chunk sat past the bounded
+header read, the builder fell back to the source containers' durations, scaled them, and handed
+them to the render report as track boundaries. There is now a **second instrument**: for PCM the
+stream's `time_base` is `1/sample_rate`, so ffprobe's `duration_ts` *is* the sample count — no
+rounding — verified against a real 288 000-frame master, including a file whose header exceeded the
+bounded read. If neither instrument can measure an artifact the render is **refused**. The
+estimated branch is deleted rather than left unused. Separately, the render-admission freeze used
+to lose rows in silence: a malformed entry made a three-track queue render as two, and a 205-track
+queue rendered its first 200. The freeze now reports `submitted` / `usable` / `over_limit` and the
+gate refuses on any of them — the 200-track limit is still enforced, now **visibly**. And the
+identity validated by the preflight is re-checked at the **consumption boundary**, minutes later,
+so a track replaced while Stage 5 ran can no longer become part of the soundtrack unannounced.
+
+**F3 — Repeat Playlist could ask for a file that cannot exist.** The capacity check knew nothing
+about the repeat count and R10 has no capacity or format check of its own, so a 20-minute playlist
+at 30× passed every gate, wrote **10.4 GB past the 3.9 GB one-WAV ceiling**, and failed only on
+R10's own duration check *after* the write. The peak now counts all three artifacts that coexist —
+the playlist master, R10's copy of it and the repeated master, `(N + 2) × cycle` — against the real
+free space, and the format ceiling is checked against `N × cycle`. Two gates: an **estimate** before
+the decode so an impossible job costs nothing, and a **guaranteed** one from the measured cycle
+before R10 is handed the file. The verdict records which it was, so an estimated pass is never
+phrased as a promise. Refusals are actionable (`Lower the repeat count to 11x or less`) and the
+slider's read-out shows the same verdict before the operator commits. `music_repeater.py` is
+untouched: Single Track and Repeat Music behave exactly as before, and a 30× single-track render of
+a very long song keeps its pre-existing, now-documented exposure to the same ceiling.
+
+36/36 real-FFmpeg builder checks, 18/18 rendered measurements, 1 579 focused regression tests.
+
 ### Added — 2026-11-28 (R16 Music Playlist Mode V1: several songs as one ordered soundtrack)
 
 Create Music Video can now take an **ordered playlist** instead of a single track and treat it as

@@ -455,23 +455,24 @@ def test_shuffle_is_the_only_place_the_feature_uses_randomness():
 
 def test_the_freeze_is_empty_for_anything_that_is_not_a_playlist_declaration():
     entries = [_entry("C:/m/a.mp3")]
-    assert P.freeze_entries("single", entries) == ()
-    assert P.freeze_entries(None, entries) == ()
-    assert P.freeze_entries("nonsense", entries) == ()
-    assert P.freeze_entries(True, entries) == ()
-    assert len(P.freeze_entries("playlist", entries)) == 1
+    for mode in ("single", None, "nonsense", True):
+        assert P.freeze_queue(mode, entries).entries == ()
+    assert P.freeze_queue("playlist", entries).usable == 1
 
 
 @pytest.mark.parametrize("entries", [None, "", 17, object(), [None], [17], []])
 def test_the_freeze_is_total_and_never_raises(entries):
-    assert isinstance(P.freeze_entries("playlist", entries), tuple)
+    frozen = P.freeze_queue("playlist", entries)
+    assert isinstance(frozen, P.FrozenQueue)
+    assert isinstance(frozen.entries, tuple)
+    assert isinstance(frozen.refusal(), str)
 
 
 def test_the_frozen_value_is_plain_primitives_only():
     """It crosses into `gr.State` (which deep-copies) and into `_process_video_impl` (which several
     suites execute against a namespace holding no fork module), so nothing but str/int/float may be
     in it."""
-    frozen = P.freeze_entries("playlist", [_entry("C:/m/a.mp3"), _entry("C:/m/b.mp3")])
+    frozen = P.freeze_queue("playlist", [_entry("C:/m/a.mp3"), _entry("C:/m/b.mp3")]).entries
     assert isinstance(frozen, tuple)
     for row in frozen:
         assert isinstance(row, tuple) and len(row) == 4
@@ -484,22 +485,77 @@ def test_the_frozen_value_is_plain_primitives_only():
 
 def test_the_freeze_preserves_order_and_duplicates_exactly():
     rows = [_entry("C:/m/b.mp3"), _entry("C:/m/a.mp3"), _entry("C:/m/b.mp3")]
-    assert [r[0] for r in P.freeze_entries("playlist", rows)] == [r[0] for r in rows]
+    frozen = P.freeze_queue("playlist", rows)
+    assert [r[0] for r in frozen.entries] == [r[0] for r in rows]
+    assert frozen.is_lossless and frozen.refusal() == ""
 
 
-def test_an_empty_playlist_in_playlist_mode_is_refused_before_the_render_body():
+# ---------------------------------------------------------------------------------------------
+# [R2 / F2] A row that cannot be read must not vanish from the queue in silence.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_malformed_row_is_REFUSED_at_the_freeze_rather_than_dropped():
+    """Reproduced on the R1 candidate as `3 rows submitted -> 2 frozen`, with the render then
+    proceeding over two tracks. The projection still skips what it cannot read — that is what a
+    projection is for — but the freeze now reports the discrepancy and the gate refuses on it,
+    because a soundtrack quietly missing a song is the exact failure this feature refuses
+    everywhere else."""
+    rows = [_entry("C:/m/a.mp3"), 17, _entry("C:/m/b.mp3")]
+    frozen = P.freeze_queue("playlist", rows)
+    assert frozen.submitted == 3 and frozen.usable == 2 and frozen.dropped == 1
+    assert not frozen.is_lossless
+    message = frozen.refusal()
+    assert "1 of the 3 tracks" in message
+    assert "could not be read" in message
+
+
+def test_the_refusal_noun_agrees_with_what_it_counts():
+    """"1 of the 3 track" is the kind of small wrongness that makes an operator doubt the number
+    beside it."""
+    assert "1 of the 1 track " in P.freeze_queue("playlist", [17]).refusal()
+    assert "1 of the 2 tracks" in P.freeze_queue(
+        "playlist", [_entry("C:/m/a.mp3"), 17]).refusal()
+
+
+def test_an_over_limit_queue_is_REFUSED_rather_than_silently_truncated():
+    """The 200-track limit is still enforced; what changed is that it is enforced **visibly**.
+    Reproduced on the R1 candidate as `205 rows submitted -> 200 frozen`, with no notice at all."""
+    rows = [_entry(f"C:/m/{i}.mp3") for i in range(P.MAX_TRACKS + 5)]
+    frozen = P.freeze_queue("playlist", rows)
+    assert frozen.over_limit and not frozen.is_lossless
+    assert str(P.MAX_TRACKS) in frozen.refusal()
+    assert "205" in frozen.refusal()
+    # exactly at the limit is fine -- the limit is a limit, not an off-by-one
+    exact = P.freeze_queue("playlist", [_entry(f"C:/m/{i}.mp3") for i in range(P.MAX_TRACKS)])
+    assert exact.is_lossless and exact.refusal() == ""
+
+
+def test_count_rows_judges_nothing_which_is_what_makes_the_comparison_work():
+    """It counts what the state held. If it filtered too, a dropped row would be invisible to the
+    very comparison that exists to notice it."""
+    assert P.count_rows([_entry("C:/m/a.mp3"), 17, None, "junk"]) == 4
+    for junk in (None, "", 17, object()):
+        assert P.count_rows(junk) == 0
+
+
+def test_an_unrenderable_playlist_is_refused_before_the_render_body():
     """A refusal, never a silent fall back to the Single Track picker -- which would render music
     the operator did not ask for, or nothing at all, without saying which."""
     body = _body(_GUI, "_process_video_guarded_unlocked")
-    assert "fork_playlist.EMPTY_PLAYLIST_MESSAGE" in body
-    assert "playlist = fork_playlist.freeze_entries(music_source, playlist_state)" in body
+    assert "frozen_queue = fork_playlist.freeze_queue(music_source, playlist_state)" in body
+    assert "refusal = frozen_queue.refusal()" in body
+    assert "playlist = frozen_queue.entries" in body
     # ...and it happens BEFORE the render body is marked as started, so a refused click raises no
     # desktop notification, exactly as a source-gate refusal does not.
-    assert body.index("EMPTY_PLAYLIST_MESSAGE") < body.index("RENDER_STARTED_KEY] = True")
+    assert body.index("frozen_queue.refusal()") < body.index("RENDER_STARTED_KEY] = True")
+    # the entries are taken ONLY after the refusal check, so a lossy queue cannot reach the render
+    assert body.index("refusal = frozen_queue.refusal()") < \
+        body.index("playlist = frozen_queue.entries")
     # exactly one freeze, so there is no second interpretation of what Music Source means
-    assert body.count("freeze_entries(") == 1
+    assert body.count("freeze_queue(") == 1
     with open(_GUI, "r", encoding="utf-8") as handle:
-        assert handle.read().count("freeze_entries(") == 1
+        assert handle.read().count("freeze_queue(") == 1
 
 
 def test_the_refusal_is_shared_fatal():
@@ -507,14 +563,17 @@ def test_the_refusal_is_shared_fatal():
     every candidate of a C3 batch, and no candidate recipe can put a track in an empty playlist."""
     core = _func(_GUI, "_process_video_guarded_unlocked")
     for node in ast.walk(core):
-        if (isinstance(node, ast.If)
-                and ast.unparse(node.test) == "not playlist"):
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "refusal":
             rendered = ast.unparse(node)
             assert "RenderOutcomeKind.SHARED_FATAL" in rendered
-            assert "EMPTY_PLAYLIST_MESSAGE" in rendered
+            assert "refusal" in rendered
             break
     else:
-        raise AssertionError("the empty-playlist refusal was not found")
+        raise AssertionError("the unrenderable-queue refusal was not found")
+    # [R2 / F2] One branch now covers all three unrenderable queues -- empty, lossy and
+    # over-limit -- because the pure record decides WHICH sentence applies and the gate only
+    # decides what to do about it. One refusal path is one place for that decision to be right.
+    assert P.freeze_queue("playlist", []).refusal() == P.EMPTY_PLAYLIST_MESSAGE
 
 
 # ===========================================================================
@@ -613,8 +672,13 @@ def _exec_builder_functions(names, classes=()) -> dict:
         "FFMPEG_PATH": "ffmpeg.exe", "FFPROBE_PATH": "ffprobe.exe",
         "TRACK_CODEC": "pcm_s24le", "TRACK_SAMPLE_RATE": 48_000, "TRACK_CHANNELS": 2,
         "fork_playlist": P, "os": os, "dataclass": dataclass,
-        "PlaylistBuildError": type("PlaylistBuildError", (Exception,), {}),
     }
+    # The real hierarchy, synthesised: `raise_for_capacity` picks between the two by type, so two
+    # unrelated stand-ins would let a wrong choice pass unnoticed.
+    error = type("PlaylistError", (Exception,), {})
+    namespace["PlaylistError"] = error
+    namespace["PlaylistInputError"] = type("PlaylistInputError", (error,), {})
+    namespace["PlaylistBuildError"] = type("PlaylistBuildError", (error,), {})
     tree = _tree(_BUILDER)
     wanted_classes = [node for node in tree.body
                       if isinstance(node, ast.ClassDef) and node.name in set(classes)]
@@ -669,13 +733,23 @@ def test_the_scratch_estimate_is_two_copies_of_the_soundtrack():
     assert namespace["estimate_scratch_bytes"](None) == 0
 
 
+def _validated(path, duration, size=10, mtime=1):
+    namespace = _exec_builder_functions([], classes=["ValidatedTrack"])
+    return namespace["ValidatedTrack"](path=path, size=size, mtime_ns=mtime,
+                                       source_duration_seconds=duration)
+
+
 def test_measured_track_placement_is_a_cumulative_SAMPLE_offset():
     """The whole reason the decode is per-track: 'track 4 starts at 11:02' is a measurement, not a
     sum of container metadata."""
-    namespace = _exec_builder_functions(["_place_tracks"], classes=["PreparedTrack"])
-    ordered = [("C:/m/a.mp3", 10.0), ("C:/m/b.mp3", 20.0), ("C:/m/c.mp3", 5.0)]
+    namespace = _exec_builder_functions(["_place_tracks"], classes=["PreparedTrack",
+                                                                    "ValidatedTrack"])
+    make = namespace["ValidatedTrack"]
+    ordered = [make(path="C:/m/a.mp3", size=1, mtime_ns=1, source_duration_seconds=10.0),
+               make(path="C:/m/b.mp3", size=1, mtime_ns=1, source_duration_seconds=20.0),
+               make(path="C:/m/c.mp3", size=1, mtime_ns=1, source_duration_seconds=5.0)]
     frames = [480_000, 960_123, 240_000]
-    placed = namespace["_place_tracks"](ordered, frames, 48_000, 35.0025625, True)
+    placed = namespace["_place_tracks"](ordered, frames, 48_000)
     assert [t.start_frame for t in placed] == [0, 480_000, 1_440_123]
     assert [t.frames for t in placed] == frames
     assert placed[1].start_seconds == pytest.approx(10.0)
@@ -685,13 +759,16 @@ def test_measured_track_placement_is_a_cumulative_SAMPLE_offset():
     assert [t.source_duration_seconds for t in placed] == [10.0, 20.0, 5.0]
 
 
-def test_unmeasured_placement_falls_back_to_the_containers_and_still_lands_on_the_master():
-    namespace = _exec_builder_functions(["_place_tracks"], classes=["PreparedTrack"])
-    ordered = [("C:/m/a.mp3", 10.0), ("C:/m/b.mp3", 30.0)]
-    placed = namespace["_place_tracks"](ordered, [None, None], 48_000, 44.0, False)
-    assert placed[0].start_frame == 0
-    total = placed[-1].start_frame + placed[-1].frames
-    assert total == pytest.approx(44.0 * 48_000, rel=1e-6)
+def test_the_estimated_placement_branch_is_GONE_not_merely_unused():
+    """[R2 / F2] It scaled the containers' durations so the last one landed on the probed length
+    and handed the result to the render report as track boundaries — an estimate wearing a
+    measurement's clothes. Dead code that still looks like a fallback is worse than none, because
+    the next reader will wire it back up."""
+    body = _code(_BUILDER, "_place_tracks")
+    for forbidden in ("scale", "produced", "estimated", "round("):
+        assert forbidden not in body, forbidden
+    node = _func(_BUILDER, "_place_tracks")
+    assert [a.arg for a in node.args.args] == ["ordered", "measured_frames", "sample_rate"]
 
 
 def test_the_sample_count_check_is_exact_equality_not_a_tolerance():
@@ -700,20 +777,54 @@ def test_the_sample_count_check_is_exact_equality_not_a_tolerance():
     namespace = _exec_builder_functions(["_verify_sample_counts"])
     verify = namespace["_verify_sample_counts"]
     good = P.WavGeometry(2, 48_000, 24, 300)
-    assert verify(good, [100, 200], False, 2) == (300, True)
+    assert verify(good, [100, 200], 2) == 300
     off_by_one = P.WavGeometry(2, 48_000, 24, 301)
     with pytest.raises(namespace["PlaylistBuildError"]) as excinfo:
-        verify(off_by_one, [100, 200], False, 2)
+        verify(off_by_one, [100, 200], 2)
     assert "301" in str(excinfo.value) and "300" in str(excinfo.value)
 
 
-def test_an_unmeasured_count_is_never_a_refusal():
-    namespace = _exec_builder_functions(["_verify_sample_counts"])
-    verify = namespace["_verify_sample_counts"]
-    good = P.WavGeometry(2, 48_000, 24, 300)
-    assert verify(good, [100, None], False, 2) == (None, False)
-    assert verify(good, [100, 200], True, 2) == (None, False)
-    assert verify(None, [100, 200], False, 2) == (None, False)
+def test_there_is_no_longer_an_unmeasured_ANSWER_to_carry():
+    """[R2 / F2] The verifier used to return `(None, False)` when a header could not be parsed, and
+    the caller then reported container durations as boundaries. Both instruments are tried at the
+    point of measurement now, and a double failure is refused there — so this function has no
+    `None` path left to be misread."""
+    body = _code(_BUILDER, "_verify_sample_counts")
+    assert "None" not in body
+    assert "unmeasured" not in body
+    node = _func(_BUILDER, "_verify_sample_counts")
+    assert [a.arg for a in node.args.args] == ["master_geometry", "measured_frames", "count"]
+
+
+def test_two_independent_instruments_and_a_double_failure_is_a_REFUSAL():
+    """The header parse is free and usually enough; ffprobe reads the same file exactly. Verified
+    against a real 288 000-frame master: the header said 288 000 and so did ffprobe, including on
+    a file whose `data` chunk sat past the bounded read."""
+    body = _code(_BUILDER, "measure_frames")
+    assert "read_wav_geometry" in body
+    assert "probe_frame_count" in body
+    assert body.index("read_wav_geometry") < body.index("probe_frame_count")
+    assert "MEASURED_BY_HEADER" in body and "MEASURED_BY_PROBE" in body
+    # and the builder refuses rather than estimating when both come back empty
+    build = _code(_BUILDER, "build_playlist_master")
+    assert build.count("measure_frames(") == 2            # each decoded track, and the master
+    assert "Could not measure the decoded audio" in build
+    assert "Could not measure the joined playlist soundtrack" in build
+
+
+def test_the_secondary_measurement_checks_its_time_base_rather_than_assuming_it():
+    """`duration_ts` is only the sample count when the time base IS `1/sample_rate`. Converting
+    from any other base would reintroduce exactly the rounding this measurement exists to avoid,
+    so an unexpected base is reported as unmeasured instead."""
+    body = _code(_BUILDER, "probe_frame_count")
+    assert "duration_ts" in body and "time_base" in body
+    assert "numerator != 1 or denominator != sample_rate" in body
+    # It never RAISES for a measurement failure -- that verdict belongs to the caller. Asserted
+    # over the AST rather than the text, because `lifecycle.raise_if_cancelled()` is a *call*
+    # whose name contains "raise" and a substring check would be satisfied by it.
+    node = _func(_BUILDER, "probe_frame_count")
+    assert not [n for n in ast.walk(node) if isinstance(n, ast.Raise)]
+    assert body.count("return None") >= 4
 
 
 def test_the_builder_validates_the_whole_selection_and_never_returns_a_subset():
@@ -788,21 +899,25 @@ def test_the_runner_defaults_to_the_unchanged_blocking_call():
 
 def test_a_cancellation_is_never_re_typed_and_the_partial_master_is_still_discarded():
     """Re-typing it would report a user's Stop as a broken music file, and in a batch would
-    describe a cancelled candidate as a problem with their playlist."""
+    describe a cancelled candidate as a problem with their playlist.
+
+    [R2 / F1] The pre-R2 shape caught `(PlaylistError, RenderCancelled)` and re-raised bare. That
+    worked for those two types and left the master on disk for every other one -- reproduced with
+    an unexpected fault after the join. The guarantee is now **stronger and simpler**: this
+    function catches nothing at all, so no exception of any type can be re-typed, and the single
+    `finally` discards the master on every terminal path, including the ones no clause could
+    have enumerated.
+    """
     node = _func(_BUILDER, "build_playlist_master")
     handlers = [ast.unparse(h.type) for h in ast.walk(node)
                 if isinstance(h, ast.ExceptHandler) and h.type is not None]
-    assert "(PlaylistError, RenderCancelled)" in handlers
-    for handler in ast.walk(node):
-        if (isinstance(handler, ast.ExceptHandler)
-                and ast.unparse(handler.type) == "(PlaylistError, RenderCancelled)"):
-            rendered = ast.unparse(handler)
-            assert "discard_playlist_master(master_path)" in rendered
-            raises = [n for n in handler.body if isinstance(n, ast.Raise)]
-            assert len(raises) == 1 and raises[0].exc is None
-            break
-    else:
-        raise AssertionError("the combined handler was not found")
+    # the only handlers left are the narrow conversions around the FFmpeg calls themselves
+    assert set(handlers) <= {"subprocess.TimeoutExpired", "OSError"}, handlers
+    assert "RenderCancelled" not in handlers
+    body = _code(_BUILDER, "build_playlist_master")
+    assert "except RenderCancelled" not in body
+    assert "except PlaylistError" not in body
+    assert "if not succeeded:" in body and "discard_playlist_master(master_path)" in body
 
 
 def test_no_handler_in_the_builder_is_a_bare_except_or_catches_everything():
@@ -818,13 +933,70 @@ def test_no_handler_in_the_builder_is_a_bare_except_or_catches_everything():
 
 
 def test_the_builder_cleans_up_every_intermediate_on_every_path():
+    """[R2 / F1] **One** `finally`, covering every terminal path, and no `except` at all.
+
+    The pre-R2 shape discarded the master inside `except (PlaylistError, RenderCancelled)`, so an
+    unexpected exception after the join left it on disk — reproduced. And it registered a decode
+    target for cleanup only *after* the decode succeeded, so a failed, timed-out or cancelled
+    decoder's partial WAV was never removed — reproduced on all four paths.
+    """
     node = _func(_BUILDER, "build_playlist_master")
     finals = [t for t in ast.walk(node) if isinstance(t, ast.Try) and t.finalbody]
-    assert finals
-    text = "\n".join(ast.unparse(s) for t in finals for s in t.finalbody)
-    assert "discard_playlist_master(list_path)" in text
+    assert len(finals) == 1, "one cleanup, not several that each cover part of the problem"
+    text = "\n".join(ast.unparse(s) for s in finals[0].finalbody)
+    assert "for path in scratch" in text
     assert "discard_playlist_master(path)" in text
-    assert "for path in decoded" in text
+    assert "if not succeeded" in text
+    assert "discard_playlist_master(master_path)" in text
+    # No `except` clause: a typed failure, a cancellation and an unexpected fault all leave this
+    # function the same way, which is what makes the cleanup total rather than enumerated.
+    assert not finals[0].handlers, [ast.unparse(h) for h in finals[0].handlers]
+
+
+def test_every_owned_path_is_registered_BEFORE_anything_can_create_it():
+    """The defect was an ordering one, so the fix is an ordering one and is asserted as such: in
+    the shipped source every temporary path is produced by `_owned(...)`, which appends to the
+    cleanup list and returns the path in the same expression — so a path that was constructed but
+    not registered is not expressible."""
+    body = _code(_BUILDER, "build_playlist_master")
+    joins = [line for line in body.splitlines() if "os.path.join(" in line]
+    assert joins, "no temporary paths at all?"
+    for line in joins:
+        assert "_owned(" in line or "session_dir" not in line, line
+    # the one artifact a SUCCESS keeps is tracked separately, not in the scratch list
+    assert "master_path = master_path_for(session_dir)" in body
+    assert "scratch.append" in _code(_BUILDER, "build_playlist_master") or \
+        "scratch.append" in body
+
+
+def test_the_children_are_reaped_before_the_cleanup_runs():
+    """On Windows, deleting a file an FFmpeg process still holds open fails with a sharing
+    violation, so "clean up on every path" is only true if the child is already gone. `_run` kills
+    and `communicate()`s its own `Popen` in its own `finally`, so by the time control reaches the
+    builder's cleanup no child is left holding anything."""
+    runner = _func(_BUILDER, "_run")
+    finals = [t for t in ast.walk(runner) if isinstance(t, ast.Try) and t.finalbody]
+    assert finals, "the runner has no finally"
+    text = "\n".join(ast.unparse(s) for t in finals for s in t.finalbody)
+    assert "proc.poll() is None" in text
+    assert "proc.kill()" in text
+    assert "proc.communicate(" in text
+
+
+def test_the_cleanup_can_only_ever_remove_what_this_invocation_built():
+    """Never a source file, never an existing output, never another invocation's scratch. Every
+    removable path is `os.path.join(session_dir, …)` with this call's own uuid stem in its name."""
+    node = _func(_BUILDER, "build_playlist_master")
+    for call in ast.walk(node):
+        if isinstance(call, ast.Call) and ast.unparse(call.func) == "os.path.join":
+            assert ast.unparse(call.args[0]) == "session_dir", ast.unparse(call)
+            assert "stem" in ast.unparse(call), ast.unparse(call)
+    code = _executable_source(_BUILDER)
+    for forbidden in ("shutil.rmtree", "os.rmdir", "glob", "listdir", "scandir", "walk("):
+        assert forbidden not in code, forbidden
+    # exactly one removal primitive in the whole module, inside the one best-effort helper
+    assert code.count("os.remove(") == 1
+    assert "os.remove(" in _code(_BUILDER, "discard_playlist_master")
 
 
 def test_the_master_never_goes_into_the_processing_directory():
@@ -850,14 +1022,174 @@ def test_the_builder_never_writes_near_the_operators_own_files():
     assert code.count("os.remove(") == 1
 
 
+# ===========================================================================
+# 6b. [R2 / F3] REPEAT PLAYLIST CAPACITY AND FORMAT LIMITS
+#
+# Every case below uses INJECTED sizes and capacities. Nothing here generates a multi-gigabyte
+# fixture or fills a physical drive -- the arithmetic is pure, and the two places that touch a real
+# disk (`free_space`, `playlist_repeat_capacity`) take the measurement as a parameter so it can be
+# supplied instead.
+# ===========================================================================
+
+_TWENTY_MINUTES = 20 * 60.0
+
+
+def test_a_repeat_past_the_one_WAV_CEILING_is_refused_with_an_actionable_message():
+    """Reproduced on the R1 candidate: a 20-minute playlist at 30x is 10.4 GB against a 3.9 GB
+    ceiling, nothing refused it, R10 wrote the file, and it failed only on R10's own duration check
+    **after** the write."""
+    verdict = P.capacity_verdict(_TWENTY_MINUTES, 30)
+    assert not verdict.ok and verdict.reason == P.REFUSAL_FORMAT
+    assert "10.4 GB" in verdict.message and "3.9 GB" in verdict.message
+    # actionable: it names the repeat count that WOULD fit rather than only saying no
+    assert "Lower the repeat count to 11x or less" in verdict.message
+    assert P.capacity_verdict(_TWENTY_MINUTES, 11).ok
+    assert not P.capacity_verdict(_TWENTY_MINUTES, 12).ok
+
+
+def test_the_overlapping_peak_counts_all_three_artifacts_that_coexist():
+    """The playlist master, R10's own copy of it, and the repeated master — `(N + 2) x cycle`.
+    Counting only the repeated master is how a check passes and the write then fails."""
+    one = P.master_bytes(_TWENTY_MINUTES)
+    assert P.repeat_peak_bytes(_TWENTY_MINUTES, 3) == one * 5
+    assert P.repeat_peak_bytes(_TWENTY_MINUTES, 30) == one * 32
+    # at 1x R10 is never entered, so the repeat stage contributes nothing
+    assert P.repeat_peak_bytes(_TWENTY_MINUTES, 1) == 0
+
+
+def test_a_peak_larger_than_the_volume_is_refused_with_both_figures():
+    verdict = P.capacity_verdict(_TWENTY_MINUTES, 3, free_bytes=100 * 10 ** 6,
+                                 min_free_bytes=256 * 1024 * 1024)
+    assert not verdict.ok and verdict.reason == P.REFUSAL_SPACE
+    assert "100 MB" in verdict.message                      # what is free
+    assert "2.0 GB" in verdict.message                      # what is needed
+    assert "Lower the repeat count" in verdict.message
+
+
+def test_an_UNMEASURED_volume_is_never_a_refusal_but_the_format_check_still_runs():
+    """The same rule the sample-count verification follows: an instrument that could not read must
+    not become a verdict. The format ceiling is arithmetic and needs no disk, so it is unaffected."""
+    for unmeasured in (None, -1, "", object(), True):
+        assert P.capacity_verdict(_TWENTY_MINUTES, 3, free_bytes=unmeasured).ok
+        assert P.capacity_verdict(_TWENTY_MINUTES, 30,
+                                  free_bytes=unmeasured).reason == P.REFUSAL_FORMAT
+
+
+def test_an_ordinary_request_is_still_admitted():
+    """The control. A guard that refuses everything is not a guard."""
+    verdict = P.capacity_verdict(3 * 60.0, 5, free_bytes=50 * 10 ** 9,
+                                 min_free_bytes=256 * 1024 * 1024)
+    assert verdict.ok and verdict.reason == P.REFUSAL_NONE and verdict.message == ""
+
+
+def test_a_verdict_says_whether_it_was_ESTIMATED_or_GUARANTEED():
+    """Before the decode the only figures are the containers' own durations; afterwards the cycle
+    is a measurement. The same arithmetic serves both, so the verdict carries which it was given
+    and an estimated pass is never reported as a promise."""
+    estimated = P.capacity_verdict(_TWENTY_MINUTES, 30, guaranteed=False)
+    guaranteed = P.capacity_verdict(_TWENTY_MINUTES, 30, guaranteed=True)
+    assert estimated.guaranteed is False and guaranteed.guaranteed is True
+    assert "is about" in estimated.message
+    assert "is about" not in guaranteed.message
+
+
+def test_the_two_refusals_carry_the_two_different_exception_types():
+    """`gui.py` maps them onto different batch semantics, so they must not collapse into one: a
+    format refusal is a fact about the REQUEST (every candidate hits it identically), a space
+    refusal is a fact about one volume at one instant (a later candidate might not)."""
+    namespace = _exec_builder_functions(["raise_for_capacity"])
+    raiser = namespace["raise_for_capacity"]
+    assert raiser(P.capacity_verdict(60.0, 2)) is None            # ok -> nothing happens
+    with pytest.raises(namespace["PlaylistInputError"]):
+        raiser(P.capacity_verdict(_TWENTY_MINUTES, 30))
+    with pytest.raises(namespace["PlaylistBuildError"]):
+        raiser(P.capacity_verdict(_TWENTY_MINUTES, 3, free_bytes=1,
+                                  min_free_bytes=256 * 1024 * 1024))
+
+
+def test_the_guaranteed_gate_runs_after_the_master_is_measured_and_before_R10():
+    """The only moment both facts exist. Asserted as an ORDER in the real render body, because
+    that is the property: refusing after the write is not refusing."""
+    body = _body(_GUI, "_process_video_impl")
+    built = body.index("prepared_playlist = music_playlist_builder.build_playlist_master(")
+    gate = body.index("music_playlist_builder.playlist_repeat_capacity(")
+    repeated = body.index("music_repeater.build_repeated_music(")
+    assert built < gate < repeated
+    # it reads the MEASURED cycle, not the queued durations
+    assert "prepared_playlist.total_seconds, music_repeat, session_dir" in body
+
+
+def test_the_guaranteed_gate_is_behind_the_repeat_guard_and_classified_both_ways():
+    impl = _func(_GUI, "_process_video_impl")
+    for node in ast.walk(impl):
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "music_repeat > 1":
+            rendered = ast.unparse(node)
+            if "playlist_repeat_capacity" not in rendered:
+                continue
+            assert "RenderOutcomeKind.SHARED_FATAL" in rendered
+            assert "RenderOutcomeKind.UNKNOWN_FATAL" in rendered
+            assert "Repeat Playlist" in rendered
+            break
+    else:
+        raise AssertionError("the guaranteed capacity gate is not behind a repeat guard")
+
+
+def test_the_estimate_reaches_the_builder_so_an_impossible_job_costs_no_decode():
+    node = _func(_BUILDER, "build_playlist_master")
+    assert "repeat" in [a.arg for a in node.args.args]
+    body = _code(_BUILDER, "build_playlist_master")
+    assert "_refuse_impossible_sizes(estimated_total, session_dir, repeat=repeat)" in body
+    # ...and it runs before the first decode
+    assert body.index("_refuse_impossible_sizes") < body.index("build_decode_command")
+    impl = _body(_GUI, "_process_video_impl")
+    assert "repeat=music_repeat," in impl
+
+
+def test_the_slider_read_out_states_the_refusal_before_the_operator_commits():
+    """A refusal the operator only discovers after a long wait is a worse refusal. The read-out
+    uses the same `capacity_verdict`, so the two cannot disagree."""
+    long_playlist = [_entry(f"C:/m/{i}.mp3", duration=600.0) for i in range(2)]
+    text = P.repeat_estimate_markdown(long_playlist, 30)
+    assert "This will be refused" in text
+    assert "3.9 GB" in text
+    # an ordinary request keeps the plain estimate, with the peak stated honestly
+    ordinary = P.repeat_estimate_markdown(long_playlist, 3)
+    assert "This will be refused" not in ordinary
+    assert "all exist at once" in ordinary
+
+
+def test_capacity_arithmetic_is_pure_and_needs_no_disk():
+    """Which is what lets the suite drive every refusal with injected numbers."""
+    pure = _executable_source(_PURE)
+    for forbidden in ("shutil", "disk_usage", "statvfs", "os.stat"):
+        assert forbidden not in pure, forbidden
+    # and the runtime side takes the measurement as a parameter so it can be supplied
+    node = _func(_BUILDER, "playlist_repeat_capacity")
+    names = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
+    assert "free_bytes" in names and "ceiling_bytes" in names
+
+
+def test_the_format_ceiling_has_exactly_one_definition():
+    """R2 needs the same number for two artifacts -- the joined master and the repeated master --
+    and two copies of a limit are two limits waiting to disagree."""
+    assert P.MAX_MASTER_BYTES == 3_900_000_000
+    builder = _executable_source(_BUILDER)
+    assert "MAX_MASTER_BYTES = fork_playlist.MAX_MASTER_BYTES" in builder
+    assert builder.count("3_900_000_000") == 0 and builder.count("3900000000") == 0
+
+
 def test_the_format_ceiling_and_the_volume_check_refuse_rather_than_corrupt():
     """A WAV `data` size is 32 bits, so an over-long soundtrack would be written with a wrapped
     header and would desynchronise. And a volume that cannot hold the peak is refused up front."""
-    body = _body(_BUILDER, "_refuse_impossible_sizes")
+    body = _code(_BUILDER, "_refuse_impossible_sizes")
     assert "MAX_MASTER_BYTES" in body
-    assert "shutil.disk_usage(session_dir)" in body
+    # [R2 / F3] the disk read moved into `free_space`, so the policy can be GIVEN a number --
+    # which is what lets the suite drive every refusal with no real disk.
+    assert "free_space(session_dir)" in body
+    assert "shutil.disk_usage" in _code(_BUILDER, "free_space")
     # an unmeasurable volume is NOT a refusal
-    assert "except OSError" in body and "return" in body
+    assert "except OSError" in _code(_BUILDER, "free_space")
+    assert "if measured_free is None:" in body
     assert "build_playlist_master" in _executable_source(_BUILDER)
     assert "_refuse_impossible_sizes(" in _body(_BUILDER, "build_playlist_master")
 
@@ -1481,13 +1813,15 @@ def test_the_selector_values_are_positions_so_a_repeated_track_stays_unambiguous
     assert labels[1][0].startswith("2. a.mp3")
 
 
-def test_the_long_render_warning_names_both_masters():
-    """A playlist render can hold the soundtrack master AND the repeated master at once, so the
-    disk warning says so rather than understating it."""
+def test_the_long_render_warning_states_the_OVERLAPPING_peak():
+    """[R2 / F3] It used to add the repeated master and the playlist master as two separate
+    figures, which understates the moment that actually matters: **three** artifacts coexist, not
+    two. One honest peak replaces them, from the same arithmetic the refusal uses."""
     long_playlist = [_entry(f"C:/m/{i}.mp3", duration=600.0) for i in range(3)]
     text = P.repeat_estimate_markdown(long_playlist, 4)
     assert "temporary disk space" in text
-    assert text.count("GB") + text.count("MB") >= 2
+    assert "all exist at once" in text
+    assert P.format_bytes(P.repeat_peak_bytes(1800.0, 4)) in text
 
 
 def test_the_success_panel_line_reads_only_the_bus():
@@ -1603,7 +1937,11 @@ def test_every_pure_entry_point_is_total():
         P.has_supported_extension(junk)
         P.playlist_from_entries(junk)
         P.entries_of(junk)
-        P.freeze_entries(junk, junk)
+        P.freeze_queue(junk, junk).refusal()
+        P.count_rows(junk)
+        P.capacity_verdict(junk, junk, junk)
+        P.repeat_peak_bytes(junk, junk)
+        P.total_seconds_for(junk, junk)
         P.add_tracks(junk, junk)
         P.remove_tracks(junk, junk)
         P.move_up(junk, junk)

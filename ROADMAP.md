@@ -1810,6 +1810,18 @@ maintenance.
 > not owner-accepted** — a playtest is the next step. The scope block below is preserved as the
 > accepted scope; what follows here records what was actually built and what was decided.
 >
+> **R2 final hardening, 2026-11-28.** A focused pass over the V1 candidate `f8d6aa0a` closed three
+> preparation and resource-boundary gaps, each **reproduced against that candidate first** (13 of
+> 13 reproduce there; 0 of 15 on the fixed tree): **F1** a failed, timed-out, cancelled or
+> unexpectedly-faulted preparation left scratch — a partial WAV per path, and the master itself on
+> the unexpected path; **F2** an unmeasurable WAV header silently downgraded verified geometry to
+> an estimate, the render-admission freeze silently dropped malformed rows and truncated past the
+> 200-track limit, and the identity validated by the preflight was not re-checked when the bytes
+> were finally read; **F3** Repeat Playlist accounted for neither the repeated master's format
+> ceiling nor the overlapping peak, so a 20-minute playlist at 30× wrote 10.4 GB past a 3.9 GB
+> ceiling and failed only afterwards. No feature scope was added. `music_repeater.py` is untouched
+> and Single Track and Repeat Music are unchanged.
+>
 > **The deferred question is settled: Repeat Playlist repeats the WHOLE ordered playlist, not each
 > song.** The owner's recorded preference is now the implementation, and it is settled
 > *structurally* rather than by a branch: the queued tracks become one soundtrack master **before**
@@ -1832,9 +1844,12 @@ maintenance.
 > candidates rendered byte-identical audio with different video. Full contract and every figure:
 > `.claude/rules/music-playlist.md`.
 >
-> **Known limitation, measured and left open:** the L2 process-local post-Stage-3 cache always
-> misses in playlist mode, because the soundtrack master is a fresh path per render. That is
-> correct — it really is a new track — but a playlist re-render pays for Stages 1–3 again.
+> **Known limitations, measured and left open:** the L2 process-local post-Stage-3 cache always
+> misses in playlist mode, because the soundtrack master is a fresh path per render — correct (it
+> really is a new track) but a playlist re-render pays for Stages 1–3 again. And a 30×
+> **single-track** render of a song longer than about 8¼ minutes still exceeds the one-WAV format
+> ceiling unguarded: that is pre-existing R10 behaviour, R2 deliberately did not change
+> `music_repeater.py`, and fixing it belongs in a task permitted to.
 >
 > **Still out of V1, deliberately:** crossfades, DJ mixing, automatic loudness mastering, per-song
 > repeat, and a CLI flag.

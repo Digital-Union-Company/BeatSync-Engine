@@ -968,6 +968,15 @@ automatically.
     pinned site count of two (the delivery preview and the Director) is untouched.
   * **One new `gr.State`**, taking `_EXPECTED_STATE_COUNT` to 13, and `_on_playlist_shuffle` is the
     fifth entry in the exact `random_seed()` owner list — both pinned by name, not by count alone.
+  * **R2: the gate refuses a queue it cannot render faithfully, not just an empty one.** The freeze
+    returns a `FrozenQueue` carrying `submitted` / `usable` / `over_limit`, and **one** branch —
+    `if refusal:` — covers empty, lossy and over-limit alike, because the pure record decides which
+    sentence applies and the gate only decides what to do about it. It still happens before
+    `RENDER_STARTED_KEY`, so a refused click raises no desktop notification.
+  * **R2: a second capacity gate sits between the playlist master and R10**, inside the existing
+    `music_repeat > 1` guard, classified `SHARED_FATAL` for a format refusal and `UNKNOWN_FATAL`
+    for a space one. It is the only moment the measured cycle and the repeat count both exist, and
+    refusing after R10's write is not refusing.
 
   Full contract: `.claude/rules/music-playlist.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not

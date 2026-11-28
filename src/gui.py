@@ -3131,6 +3131,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     session_dir=session_dir,
                     lifecycle=lifecycle,
                     on_track=_playlist_track_progress,
+                    # [R2 / F3] The repeat count the render will apply AFTER this returns. It
+                    # changes nothing about what is built -- the master is always one cycle --
+                    # and is passed so the pre-admission check can refuse an impossible TOTAL
+                    # before paying for the decode. That check is an estimate; the guaranteed one
+                    # runs below, against the measured cycle.
+                    repeat=music_repeat,
                 )
             except music_playlist_builder.PlaylistInputError as exc:
                 # A statement about the operator's own files, frozen for the whole batch, so every
@@ -3153,11 +3159,40 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                 return None, f'❌ Music Playlist: {exc}', session_state
             playlist_master_path = prepared_playlist.path
             local_audio_path = prepared_playlist.path
+
+            # [R2 / F3] The GUARANTEED capacity gate, and the only moment both facts exist: the
+            # cycle is now a MEASUREMENT rather than a sum of container durations, and the repeat
+            # count is known. R10 is handed this file a few lines below and has no capacity or
+            # format check of its own -- so without this, a 20-minute playlist at 30x reached it,
+            # wrote 10.4 GB past the 3.9 GB one-WAV ceiling, and failed only on R10's own duration
+            # check *after* the write. Refusing here costs nothing; refusing there costs the write.
+            #
+            # It is deliberately scoped to the playlist path. Single Track and Repeat Music keep
+            # exactly the behaviour they had -- the task's explicit instruction -- so a 30x
+            # single-track render of a very long song is unchanged, including its pre-existing
+            # exposure to the same ceiling, which is recorded as a known limitation rather than
+            # fixed here under a playlist heading.
+            if music_repeat > 1:
+                try:
+                    music_playlist_builder.raise_for_capacity(
+                        music_playlist_builder.playlist_repeat_capacity(
+                            prepared_playlist.total_seconds, music_repeat, session_dir))
+                except music_playlist_builder.PlaylistInputError as exc:
+                    # A fact about what was REQUESTED -- the repeat count and the playlist are both
+                    # batch-frozen, so every candidate would hit it identically.
+                    session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
+                    return None, f'❌ Repeat Playlist: {exc}', session_state
+                except music_playlist_builder.PlaylistBuildError as exc:
+                    # A fact about one volume at one instant, which a later candidate might not
+                    # hit: fail-closed rather than claiming the batch is doomed.
+                    session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
+                    return None, f'❌ Repeat Playlist: {exc}', session_state
+
             if console_logger:
                 console_logger.line(
                     f"Music Playlist: {prepared_playlist.describe()} "
-                    f"(prepared in {prepared_playlist.prepare_seconds:.1f}s"
-                    f"{'' if prepared_playlist.measured else ', boundaries estimated'})")
+                    f"(prepared in {prepared_playlist.prepare_seconds:.1f}s, "
+                    f"measured by {prepared_playlist.measurement})")
             if event_callback is not None:
                 event_callback(ProgressEvent(
                     stage=1, kind=EventKind.STATE,
@@ -3165,7 +3200,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     data={"phase": "music_playlist",
                           "tracks": int(prepared_playlist.count),
                           "total_seconds": float(prepared_playlist.total_seconds),
-                          "measured": bool(prepared_playlist.measured)}))
+                          "measurement": str(prepared_playlist.measurement)}))
 
         selected_beats, beat_info = analyze_beats_auto(
             local_audio_path,
@@ -5564,8 +5599,8 @@ def _process_video_guarded_unlocked(audio_file: str,
     # The `!= 'single'` pre-check is the explicit legacy branch this repository prefers over "the new
     # code with a neutral value" — at exactly `single` nothing is resolved, nothing is frozen and
     # the value threaded onward is the empty tuple. Every other value, valid or malformed, goes
-    # through the ONE normaliser inside `freeze_entries`, which answers `()` for anything that is not
-    # a playlist declaration, so there is no second interpretation of what Music Source means.
+    # through the ONE normaliser inside `freeze_queue`, which answers an empty queue for anything
+    # that is not a playlist declaration, so there is no second interpretation of Music Source.
     #
     # Like the creative controls, the audio levels and the repeat count this is a render-request
     # input and NOT video source identity: neither widget is wired into a source or preparation
@@ -5573,23 +5608,31 @@ def _process_video_guarded_unlocked(audio_file: str,
     # touch Media Library Preparation. The converse also holds and is the point of the split —
     # editing the playlist DOES invalidate the audio-dependent read-outs, because those are written
     # by the playlist handlers themselves.
+    #
+    # [R2 / F2] The freeze now reports what it could NOT use, and the gate refuses on it. The
+    # projection skips a malformed row and truncates past the 200-track limit, so a three-row queue
+    # could freeze as two and render a soundtrack missing a song — the exact silent omission this
+    # feature refuses everywhere else, reproduced on the R1 candidate at `3 rows submitted -> 2
+    # frozen`. The 200-track limit is still enforced; what changed is that it is enforced VISIBLY.
     playlist = ()
     if music_source != 'single':
-        playlist = fork_playlist.freeze_entries(music_source, playlist_state)
-        if not playlist:
-            # Playlist mode armed with an empty queue. A refusal, never a silent fall back to the
-            # Single Track picker -- which would render music the operator did not ask for, or
-            # nothing at all, without saying which. It happens BEFORE `RENDER_STARTED_KEY` is set,
-            # so a refused click raises no desktop notification, exactly as a source-gate refusal
-            # does not.
+        frozen_queue = fork_playlist.freeze_queue(music_source, playlist_state)
+        refusal = frozen_queue.refusal()
+        if refusal:
+            # Playlist mode armed with a queue that cannot be rendered faithfully -- empty, missing
+            # rows, or longer than the limit. A refusal, never a silent fall back to the Single
+            # Track picker, which would render music the operator did not ask for, or nothing at
+            # all, without saying which. It happens BEFORE `RENDER_STARTED_KEY` is set, so a
+            # refused click raises no desktop notification, exactly as a source-gate refusal does
+            # not.
             #
             # SHARED_FATAL: the gate's inputs here are this handler's own submitted arguments,
             # frozen and identical for every candidate of a C3 batch, and no candidate recipe can
-            # put a track in an empty playlist.
+            # put a track in an empty queue or repair a row that could not be read.
             session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
-            yield (None, f"❌ {fork_playlist.EMPTY_PLAYLIST_MESSAGE}", session_state,
-                   '', '', invocation_id)
+            yield (None, f"❌ {refusal}", session_state, '', '', invocation_id)
             return
+        playlist = frozen_queue.entries
 
     # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): `process_video` keeps its
     # existing 3-value streaming contract — video, status, session_state — and this handler projects
