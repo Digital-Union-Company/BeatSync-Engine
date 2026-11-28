@@ -979,6 +979,65 @@ automatically.
     refusing after R10's write is not refusing.
 
   Full contract: `.claude/rules/music-playlist.md`.
+- **The Render tab has a live activity panel above the Status box, and the render controls
+  interlock while a render owns the mutex (UX-RENDER-ACTIVITY V1).** The owner's complaint was that
+  a four-line `Status` textbox which has not changed for twenty minutes is indistinguishable from a
+  frozen application. The answer is the third instance of a shape this file already carries twice:
+
+  ```
+  render_activity         gr.HTML, directly ABOVE status_output. gr.Markdown would strip every
+                          data-* attribute and leave the browser timer nothing to read.
+  RENDER_ACTIVITY_CSS     where the MOTION lives -- one @keyframes, no timer
+  _RenderActivityReporter ONE per top-level render event, reusing raw_cutter_activity.ActivityClock
+  _render_interlock_lock / _render_interlock_restore   the two halves of the control interlock
+  _render_is_active       ONE diagnostic read of the EXISTING active-render slot
+  ```
+
+  * **Both render events' `fn`, `inputs` and emitted shape are unchanged except for one appended
+    output.** `render_activity` is appended LAST to each `outputs` list (`process_btn` 6 → 7,
+    `render_selected_variants_btn` 5 → 6), and the panel is projected by
+    `_process_video_guarded_unlocked`, which already did the 3→6 projection — so
+    `process_video_guarded` carries it out through its existing `yield from` with no loop of its
+    own, and **`process_video` keeps its 3-value contract**.
+  * **The panel rides on `session_state`**, exactly as the Audio Layers and Smart Mix read-outs do,
+    and for the same reason: `ProgressView` lives inside `process_video`, the worker thread must
+    never touch a Gradio component, and that generator's yield arity is pinned.
+  * **`gr.skip()`, never `''`, when no panel was published for a frame** — an empty string blanks a
+    `gr.HTML`. **A refusal carries no activity frame at all** (five yields), the rule the Raw
+    Cutter's `refuse(...)` and Prepare & Verify's declined click already follow.
+  * **No poll, timer, coordinator, worker or endpoint was added, and `status_queue.get()` is still
+    unbounded.** The elapsed clocks are advanced by the browser (`CUT_ACTIVITY_JS`, anchored on
+    `data-job-token`) and the animation is CSS, so a silent Stage 5 stretch stays alive with zero
+    server frames. The installer gained **one selector token and one uniform field triple**;
+    `app.load(fn=None, …)` is still four registrations and cutter behaviour is byte-identical.
+  * **The interlock set is derived from the six non-blocking `_RENDER_LOCK.acquire()` callers**, not
+    from sweeping the UI: `process_btn`, `render_selected_variants_btn`, `prep_verify_btn` and
+    `sample_btn` are disabled. The two Raw Cutter buttons are **deliberately not**, because they
+    already have their own server-managed interactive state and a render event writing them would
+    be a second authority over one widget; they keep their own accurate refusal. The Audio Cutter
+    holds no mutex at all. A test pins the holder count at six so a seventh forces a decision.
+  * **The DISABLE half is a separate `.click` registration declared first; the RESTORE half is a
+    chained `.then()`.** That is what keeps the render registration byte-identical, and — measured
+    on the pinned version — a `.then()` link runs *after* the generator's `finally`, so the controls
+    cannot come back until the worker was joined and the mutex released. A terminal yield could not
+    promise that: it runs inside the `try`.
+  * **Create Music Video is restored from the source gate, never to `True`**, and a still-active
+    render returns `gr.update()` for everything so an older invocation's delayed `.then()` cannot
+    unlock a newer job's controls.
+  * **`_source_ui_updates` now reads `and not _render_is_active()`**, which closed a real hole:
+    Scan and Confirm take no mutex, so re-confirming mid-render re-enabled Create from a completely
+    unrelated handler.
+  * **None of it is an authorization boundary.** `_RENDER_LOCK.acquire()` is still the sole
+    admission authority and `_RENDER_LOCK.locked()` is still called nowhere. **Measured on the
+    pinned version: a same-session duplicate click in the `concurrency_limit=1` lane is DISCARDED,
+    and a cross-session click is QUEUED and then admitted 33 ms after the first render releases** —
+    a visibility gap, not a safety one, since the lock held throughout. The waiting session is told
+    `Queued` rather than nothing.
+  * **Cancel's `outputs` stay exactly `[status_output]`.** `Cancelling` reaches the panel from
+    `lifecycle.cancel_requested()` on the render stream's next frame, which costs a short recorded
+    latency rather than a second writer.
+
+  Full contract: `.claude/rules/render-activity.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -1006,6 +1065,7 @@ automatically.
 | Media Library Preparation scan/analyze, batch size | `.claude/rules/library-preparation.md` |
 | the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) — **+ `.claude/rules/prep-activity.md`** if you touch either frames generator, `_activity_frames`, `_prep_phase` or `_run_prep_in_worker`'s event wait |
 | the in-flight **activity** for Scan / Analyze / Verify / Sample, `_activity_frames`, `_verify_sources_frames`, `_sample_decode_frames`, `_prep_phase` or `prep_activity.py` (UX-PREP-ACTIVITY) | `.claude/rules/prep-activity.md` **+** `.claude/rules/source-verification.md` (the mutex, the pin and the staleness rule it must not disturb) **+** `.claude/rules/progress-events.md` (the generator-lifetime rule the join rests on, and the ETA ban it restates) |
+| the **Render Activity** panel, `render_activity`, `_RenderActivityReporter`, `_publish_render_activity`, either interlock handler, `_render_is_active`, `RENDER_ACTIVITY_CSS` or `render_activity.py` (UX-RENDER-ACTIVITY V1) | `.claude/rules/render-activity.md` **+** `.claude/rules/progress-events.md` (`active_measurement` / `completed_stages`, and the ETA ban) **+** `.claude/rules/render-worker.md` (the lifecycle it reads for `Cancelling`, and the generator-lifetime rule the chained restore rests on) **+** `.claude/rules/variant-lab.md` if you touch the batch's candidate context. Touching `CUT_ACTIVITY_JS` also means the Raw Cutter R12 bullet above and `tests/test_raw_cutter_activity.py`, which pins that installer |
 | Settings → **Video Analysis Cache**, the shared cache folder, the Import button, or Cache Management's analysis category | `.claude/rules/shared-analysis-cache.md` **+** `.claude/rules/stage5-cache-identity.md` (the directory is deliberately not part of identity) |
 | `_settings_on_load`, the one server-side `app.load`, `pref_collision` / `_on_collision_policy_change`, `_on_reset_folder_prefs`, or **any new saved option in the Settings panel** | the *Settings preference consistency* bullet above **+** `.claude/rules/desktop-notifications.md` (the sibling option shares both the page-load reader and the no-op-guard rule) — and `tests/test_settings_pref_consistency.py`, which executes the shipped handlers against the real store rather than asserting about them. A new option is not finished until it is in `_settings_on_load` **and** its writer carries the no-op guard |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |

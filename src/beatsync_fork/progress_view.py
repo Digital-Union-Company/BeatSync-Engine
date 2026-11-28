@@ -287,6 +287,25 @@ class ProgressView:
             finished=stage.finished,
         )
 
+    def completed_stages(self) -> tuple[int, ...]:
+        """The stage numbers that have actually reported END, ascending.
+
+        [FORK] Digital-Union (UX-RENDER-ACTIVITY V1). A second read-only projection of state this
+        view has already folded, added for exactly the reason :meth:`active_measurement` was: the
+        Render tab's activity panel needs to know which stages are done, and the two wrong ways to
+        find out are reaching into ``_stages`` and reading it back out of :meth:`render`'s text --
+        the prose parsing Phase 2A deleted.
+
+        **``finished`` is the stage's own END report and nothing else.** It is never inferred from
+        the active stage number, because "stage 5 is active, therefore 1-4 are done" is an
+        assumption rather than a measurement, and it is how a stage that was skipped would be
+        reported as completed.
+
+        Folds nothing, mutates nothing, emits no event and defines no phase. The tuple is a copy,
+        so a caller cannot reach this view's ordering through it.
+        """
+        return tuple(sorted(s for s in self._order if self._stages[s].finished))
+
     def stage_line(self, stage: int) -> str:
         """Detail line for a stage's **active phase**, or ``""`` if the stage is unknown."""
         view = self._stages.get(stage)

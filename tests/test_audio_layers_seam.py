@@ -428,6 +428,8 @@ def test_the_audio_controls_are_live_render_request_inputs_in_order():
     for node in ast.walk(tree()):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and getattr(node.func.value, "id", None) == "process_btn"):
             kwargs = {kw.arg: kw.value for kw in node.keywords}
             break
@@ -452,6 +454,8 @@ def test_the_report_widget_is_not_a_render_input():
     for node in ast.walk(tree()):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and getattr(node.func.value, "id", None) == "process_btn"):
             inputs = [n.id for n in node.keywords[1].value.elts if isinstance(n, ast.Name)]
             assert "audio_layers_report" not in inputs
@@ -548,6 +552,8 @@ def test_music_under_voice_is_written_only_by_the_two_variant_lab_buttons():
     outputs = next(kw.value for node in ast.walk(root)
                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                    and node.func.attr == "click"
+                   # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                   and "fn=_render_interlock_lock" not in ast.unparse(node)
                    and getattr(node.func.value, "id", None) == "generate_variant_btn"
                    for kw in node.keywords if kw.arg == "outputs")
     assert "music_under_voice" not in names_in(outputs)
@@ -856,29 +862,42 @@ def test_the_report_is_cleared_before_the_gate_and_before_the_attempt():
 def test_a_refused_render_yields_a_blank_report():
     """The gate's own refusal is a yield, so it has to carry the report values itself.
 
-    6 since C3-R1A: video, status, state, Audio Layers report, Smart Mix report, invocation id. The
-    property this test exists for is untouched — a refused render must blank **both** reports rather
-    than leave the previous attempt's text on screen — and the two report slots are still pinned by
-    index, so the appended element cannot shift what they mean.
+    7 since UX-RENDER-ACTIVITY V1: video, status, state, Audio Layers report, Smart Mix report,
+    invocation id, activity panel. (6 since C3-R1A, which appended the invocation id.) The property
+    this test exists for is untouched both times — a refused render must blank **both** reports
+    rather than leave the previous attempt's text on screen — and the two report slots are still
+    pinned by index, so neither appended element can shift what they mean.
+
+    The appended activity element is `gr.skip()` rather than a blank, and the asymmetry is the
+    point: a report must be **cleared** so the previous attempt's text cannot be read as this one's,
+    while the activity panel must be **left alone**, because a refused render performed no work and
+    has no activity to report. Asserted here so the two cannot be confused.
     """
     refusal = next(node for node in ast.walk(func(GATE_CORE))
                    if isinstance(node, ast.If)
                    and ast.unparse(node.test) == "not decision.allowed")
     yielded = next(n for n in ast.walk(refusal) if isinstance(n, ast.Yield))
     assert isinstance(yielded.value, ast.Tuple)
-    assert len(yielded.value.elts) == 6, ast.unparse(yielded)
+    assert len(yielded.value.elts) == 7, ast.unparse(yielded)
     for index in (3, 4):
         assert isinstance(yielded.value.elts[index], ast.Constant)
         assert yielded.value.elts[index].value == ""
+    assert ast.unparse(yielded.value.elts[6]) == "gr.skip()", ast.unparse(yielded)
 
 
-def test_the_guard_projects_the_three_value_stream_onto_six_outputs():
+def test_the_guard_projects_the_three_value_stream_onto_seven_outputs():
     """`process_video` keeps its 3-value contract; only the outermost handler projects.
 
     **Amended by Smart Mix V1 / E**: the projection gained the Smart Mix read-out. **Amended again
-    by C3-R1A**: it gained the control-plane invocation id. The invariant the test exists for is
-    untouched both times, and is the stronger half — the *inner* generator's streaming contract did
-    not change, so the worker thread still carries nothing but `session_state`.
+    by C3-R1A**: it gained the control-plane invocation id. **And again by UX-RENDER-ACTIVITY V1**:
+    it gained the rendered activity panel. The invariant the test exists for is untouched all three
+    times, and is the stronger half — the *inner* generator's streaming contract did not change, so
+    the worker thread still carries nothing but `session_state`.
+
+    That is also exactly why the panel travels this way rather than as a wider `process_video`
+    yield: `ProgressView` lives inside that generator, so it is the one place that can render the
+    panel, but its 3-value contract is pinned here. So the panel is parked on `session_state` —
+    the same seam the two report read-outs use — and projected onto its widget right here.
     """
     guarded = body_source(GATE_CORE)
     # **C3-R0 R1**: the stream is owned so it can be closed deterministically — the worker
@@ -887,8 +906,9 @@ def test_the_guard_projects_the_three_value_stream_onto_six_outputs():
     assert "for video, status, state in render_stream:" in guarded
     assert "render_stream.close()" in guarded
     assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
-            "(state or {}).get(SMART_MIX_REPORT_KEY, ''), invocation_id)") in guarded
-    # the inner generator's 3-value contract is unchanged; only the outer handler is 6-valued
+            "(state or {}).get(SMART_MIX_REPORT_KEY, ''), invocation_id, "
+            "(state or {}).get(RENDER_ACTIVITY_KEY) or gr.skip())") in guarded
+    # the inner generator's 3-value contract is unchanged; only the outer handler is 7-valued
     assert ast.unparse(func("process_video").returns) == "Iterator[StatusResult]"
     assert ast.unparse(func("process_video_guarded").returns) == "Iterator[GuardedResult]"
 
@@ -924,15 +944,22 @@ def test_the_report_never_reaches_the_pipeline():
 def test_the_report_is_an_output_only_and_never_a_render_input():
     click = next(node for node in ast.walk(tree())
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                 and ast.unparse(node.func) == "process_btn.click")
+                 and ast.unparse(node.func) == "process_btn.click"
+                 # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                 # presentation-only one, which is declared first on both render buttons.
+                 and "fn=_render_interlock_lock" not in ast.unparse(node))
     kwargs = {kw.arg: kw.value for kw in click.keywords}
     assert "audio_layers_report" not in names_in(kwargs["inputs"])
     assert "smart_mix_report" not in names_in(kwargs["inputs"])
     outputs = names_in(kwargs["outputs"])
     # [C3-R1A] `render_invocation_state` appended LAST — a control-plane string, not a read-out. The
     # two report panels keep their positions and `process_btn.click` is still their only writer.
+    # [UX-RENDER-ACTIVITY V1] `render_activity` appended after it, same discipline: an output-only
+    # read-out, so the two report panels' indices are unchanged for the second time.
     assert outputs == ["video_output", "status_output", "session_state",
-                       "audio_layers_report", "smart_mix_report", "render_invocation_state"]
+                       "audio_layers_report", "smart_mix_report", "render_invocation_state",
+                       "render_activity"]
+    assert "render_activity" not in names_in(kwargs["inputs"])
 
 
 def test_the_report_is_absent_from_the_live_source_declaration():
@@ -1332,6 +1359,8 @@ def test_the_variant_lab_buttons_carry_exactly_the_two_smart_mix_levels():
             value = next((kw.value for node in ast.walk(root)
                           if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                           and node.func.attr == "click"
+                          # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                          and "fn=_render_interlock_lock" not in ast.unparse(node)
                           and getattr(node.func.value, "id", None) == button
                           for kw in node.keywords if kw.arg == keyword), None)
             assert value is not None, f"{button}.click has no {keyword}"
@@ -1359,7 +1388,10 @@ def test_the_click_inputs_align_with_the_guard_parameters():
     """Gradio passes positionally, so a silent reordering would be invisible."""
     click = next(node for node in ast.walk(tree())
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                 and ast.unparse(node.func) == "process_btn.click")
+                 and ast.unparse(node.func) == "process_btn.click"
+                 # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                 # presentation-only one, which is declared first on both render buttons.
+                 and "fn=_render_interlock_lock" not in ast.unparse(node))
     kwargs = {kw.arg: kw.value for kw in click.keywords}
     inputs = [getattr(n, "id", None) for n in kwargs["inputs"].elts]
     # [FORK] R17-A: submitted parameters only -- `request` is injected (see `tests/conftest.py`).
@@ -1708,7 +1740,10 @@ def test_the_public_wrapper_keeps_its_positional_gradio_contract():
     params = submitted_parameters(func("process_video_guarded"))
     click = next(n for n in ast.walk(root)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                 and ast.unparse(n.func) == "process_btn.click")
+                 and ast.unparse(n.func) == "process_btn.click"
+                 # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                 # presentation-only one, which is declared first on both render buttons.
+                 and "fn=_render_interlock_lock" not in ast.unparse(n))
     kwargs = {kw.arg: kw.value for kw in click.keywords}
     assert ast.unparse(kwargs["fn"]) == "process_video_guarded"
     inputs = [getattr(n, "id", None) for n in kwargs["inputs"].elts]

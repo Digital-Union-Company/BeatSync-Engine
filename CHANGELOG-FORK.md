@@ -20,6 +20,88 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-28 (UX-RENDER-ACTIVITY V1: a long render looks active, and the render controls interlock)
+
+**Source implemented and tested. NOT merged, NOT installed, NOT owner accepted.**
+
+The owner reported that during a long render — above all Stage 5 against thousands of sources — the
+Render tab's only sign of life is a four-line `Status` textbox, and a textbox that has not changed
+for twenty minutes is indistinguishable from a frozen application. This is the third time this
+repository has answered that observation and deliberately the third time it has answered it the
+same way, splitting the two questions that conflating produces a lying panel:
+
+```
+"is this running?"     a state chip, a CSS @keyframes, and a BROWSER-anchored clock --
+                       all three true for as long as a worker lives, all three costing
+                       NO measurement at all
+"how far has it got?"  ONLY ProgressView.active_measurement(). Absent otherwise.
+```
+
+**New.** `src/beatsync_fork/render_activity.py` — pure, stdlib-only, clock-free: the eight-state
+lifecycle vocabulary, the determinate/indeterminate track, the stage pills, the batch position and
+every honesty rule. `ProgressView.completed_stages()` — a second read-only projection beside
+`active_measurement()`. In `gui.py`: `_RenderActivityReporter` (the two clocks and the measurement
+age, reusing `raw_cutter_activity.ActivityClock` rather than reimplementing a third two-timer
+clock), `_render_interlock_lock` / `_render_interlock_restore`, `_render_is_active`, the
+`render_activity` `gr.HTML` panel directly above the Status box, and `RENDER_ACTIVITY_CSS`.
+
+**Unchanged, and that is most of the point.** `process_video` keeps its 3-value yield contract and
+its **unbounded** `status_queue.get()`; `video_analysis.py`, `video_processor.py`, `auto_mode/*`,
+`ffmpeg_processing.py` and every creative, playlist and cache module are untouched; no stage,
+phase, event, cache key, identity or frame-lock behaviour moved. **No poll, timer, coordinator,
+background worker or endpoint was added anywhere** — the clocks are advanced by the browser, so a
+forty-minute silent Stage 5 stretch stays visibly alive while the server yields nothing.
+
+`CUT_ACTIVITY_JS` gained **one selector token and one uniform field triple** (the measurement age,
+which needed no new logic because its token changes when a new measurement arrives). Raw Cutter
+behaviour is byte-for-byte unchanged, and `app.load(fn=None, …)` is still four registrations.
+
+**Four pinned-Gradio measurements shaped the design** rather than assumptions about `concurrency_*`
+semantics — the trap this repository has already paid for once (S2-A R3):
+
+- a **same-session** duplicate click on an event already running in the `concurrency_limit=1` lane
+  is **DISCARDED**, measured with the client-side disable deliberately bypassed. So **no**
+  server-side duplicate-render gate was built: it would have been machinery for a defect that does
+  not exist on this version;
+- a separate instant `.click` registration runs **60 ms before** the slow handler is entered, which
+  is why the interlock's disable half is a second registration and the render event's own `fn`,
+  `inputs` and emitted shape are byte-identical;
+- a `.then()` link runs **after** the generator's `finally` — 30 ms after the mutex release — which
+  is what makes *"stay disabled until the worker and its subprocesses have actually stopped"*
+  structural rather than hopeful. A terminal yield could not promise it, because it runs inside the
+  `try`;
+- a **cross-session** render click is **queued, not refused**, and admitted **33 ms after** the
+  first render releases. `_RENDER_LOCK` held throughout and the two renders never overlapped, so
+  this is a **visibility** gap and not a safety one. Recorded rather than closed with a new
+  cross-session subsystem; the waiting session is told `Queued` instead of being shown nothing.
+
+**The interlock set is derived from the six non-blocking `_RENDER_LOCK.acquire()` callers**, not
+from sweeping the UI. Create Music Video, Render Selected Variants, Verify Sources and Sample Decode
+are disabled while a render runs. The two Raw Cutter buttons deliberately are **not**: both already
+have their own server-managed interactive state, so a render event writing them would be a second
+authority over one widget, and restoring them would mean guessing `interactive=True` — which offers
+Run with no plan. They keep their own accurate refusal instead. The Audio Cutter holds no mutex at
+all, and source confirmation cannot reach a render in flight.
+
+**Fixed on the way — a real hole.** Scan and Confirm take no mutex, so they run happily while a
+render does, and `_source_ui_updates` is the *other* authority over Create Music Video's enabled
+state. Re-confirming sources mid-render therefore re-enabled Create from a completely unrelated
+handler. Its one expression is now `state.is_confirmed() and not _render_is_active()`.
+
+**Nothing here is an authorization boundary.** `_RENDER_LOCK.acquire()` remains the sole admission
+authority, `RenderLifecycle` the sole cancellation authority, `_RENDER_LOCK.locked()` is still
+called nowhere, and `_render_is_active()` is a total diagnostic that answers `False` when it cannot
+read the slot.
+
+**Recorded rather than claimed closed:** the `Cancelling` chip lags the status line by one pipeline
+frame (Cancel's `outputs` stay exactly `[status_output]` — widening them would have reset the
+elapsed clock); an abandoned render leaves its panel reading `Running` in that browser page until
+the page is replaced; the cross-session queued render is reported, not refused; and reduced motion
+was verified by stylesheet inspection, not emulation.
+
+`tests/test_render_activity.py` adds 111 focused tests across the three tiers. Full contract:
+`.claude/rules/render-activity.md`.
+
 ### Released — 2026-11-28 (R16 Music Playlist Mode V1 merged and installed as `ff3a5ba9`)
 
 PR #116 (head `271f6b43`) merged into `main` as the ordinary two-parent merge commit

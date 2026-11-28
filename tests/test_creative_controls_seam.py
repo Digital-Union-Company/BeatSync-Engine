@@ -468,9 +468,20 @@ def _gui_tree():
 
 
 def _registration(tree, widget: str, attrs=("click", "change", "input", "submit", "release")):
+    """Every registration on `widget`, EXCEPT the render interlock's presentation-only one.
+
+    [UX-RENDER-ACTIVITY V1] Both render buttons now carry a second, instant `.click` that greys
+    out the four controls which genuinely conflict with a render and writes the activity panel. It
+    must be declared first (measured on gradio==6.19.0: declared second it never fires while the
+    render generator is streaming), so it would otherwise be what every caller here inspects --
+    and it reads NO widget at all, so a creative-input assertion against it is vacuously true,
+    which is the worst kind of passing test. Excluding it keeps every assertion in this file about
+    the registration it has always been about.
+    """
     return [node for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr in attrs
+            and "fn=_render_interlock_lock" not in ast.unparse(node)
             and isinstance(node.func.value, ast.Name) and node.func.value.id == widget]
 
 

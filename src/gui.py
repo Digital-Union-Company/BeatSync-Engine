@@ -245,6 +245,13 @@ from beatsync_fork import raw_cutter_activity as fork_activity
 # defining a second elapsed formatter, and it starts nothing: `_RENDER_LOCK` is still the only
 # authority on whether Verify or Sample may run.
 from beatsync_fork import prep_activity as fork_prep_activity
+# [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the Render tab's live activity read-out. Pure and
+# clock-free for the same reasons as the two above, and it deliberately reuses both of their
+# contracts rather than inventing a third: the same four tones, the same imported `format_elapsed`,
+# and -- crucially -- the same browser-timer attribute contract, so `CUT_ACTIVITY_JS` ticks the
+# render panel too after a one-token broadening of its selector. No new installer, timer,
+# coordinator, worker or endpoint, and nothing in it is ever an authorization boundary.
+from beatsync_fork import render_activity as fork_render_activity
 # [FORK] Digital-Union (Raw Cutter R11): the finished job's handoff record. Pure, and the gate on
 # whether review is offered at all lives in it -- a record exists only when clips really reached
 # disk, so "do not offer an empty folder" is a property of the record rather than a check a
@@ -436,6 +443,21 @@ AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 #: the generator projects it onto the widget. Pure diagnostics: nothing downstream reads it.
 SMART_MIX_REPORT_KEY = 'smart_mix_report'
 
+#: [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the rendered Render Activity panel, on exactly the
+#: same bookkeeping seam as the two report keys above — and for the same reason, which is worth
+#: stating because it looks like an indirection that could be removed.
+#:
+#: `ProgressView` lives inside `process_video`, so that generator is the ONE place that holds both
+#: the folded measurement and the view it came from. But `process_video`'s 3-value yield contract
+#: (`video, status, state`) is pinned by the progress seam suite and must not widen — the worker
+#: thread still carries nothing but `session_state`. So the panel is rendered where the view is,
+#: parked on `session_state`, and projected onto the widget by
+#: `_process_video_guarded_unlocked`, exactly as the Audio Layers and Smart Mix reports are.
+#:
+#: It holds a plain `str` of already-escaped HTML. Pure presentation: nothing downstream reads it,
+#: nothing branches on it, and it reaches no cache, identity, stage or creative value.
+RENDER_ACTIVITY_KEY = 'render_activity_panel'
+
 # [FORK] Digital-Union (AI Director V2): the Director's runtime assets.
 #
 # A SEPARATE text-only GGUF from Stage 5's — see `DIRECTOR_MODEL` below for why the shared 2B model
@@ -520,6 +542,11 @@ StatusResult : TypeAlias = Tuple[str, str, Dict]
 # `process_video_guarded` yields to Gradio — the three values `process_video` streams, plus the
 # Audio Layers placement read-out and the Smart Mix read-out. The inner
 # 3-value contract is deliberately unchanged; only the outermost handler projects onto the widgets.
+# [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): one further element, the rendered activity panel,
+# appended LAST so every pre-existing position keeps its meaning. The inner 3-value contract is
+# still unchanged — the projection happens in `_process_video_guarded_unlocked`, which already did
+# the 3-to-6 projection, so the panel rides out through `process_video_guarded`'s `yield from`
+# without that wrapper needing a loop of its own.
 GuardedResult : TypeAlias = Tuple[str, str, Dict, str, str]
 
 STATUS_BOX_CSS = """
@@ -911,6 +938,189 @@ PREP_ACTIVITY_CSS = """
        across the whole track still distinguishes a running panel from a terminal one, which has
        no track at all. */
     .bs-prep-sweep {
+        background-image: repeating-linear-gradient(135deg,
+            rgba(255, 255, 255, 0.30) 0 7px, rgba(255, 255, 255, 0) 7px 14px);
+        background-size: auto;
+        background-repeat: repeat;
+    }
+}
+"""
+
+# [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the Render Activity panel's stylesheet.
+#
+# Where the MOTION lives, and it is deliberately CSS rather than a timer. Two reasons, both
+# measured rather than assumed. The server emits one frame per `ProgressEvent`, so an animation
+# driven by frames would stutter -- or stop entirely through a silent Stage 5 stretch, which is the
+# exact case this item exists for. And a browser-side animation timer would mean per-element state
+# that a Gradio re-render destroys. A `@keyframes` declared once on the Blocks keeps moving with no
+# frames, no script and no network traffic at all; UX-PREP-VISUAL-PROGRESS measured 17 distinct
+# computed sweep positions while a single server frame sat on screen for 680 ms.
+#
+# Shapes and tones are the Prepare & Verify panel's, intentionally, so the application does not
+# teach an operator two visual languages for "this is running". No absolute positioning outside the
+# track, no negative margins, no pinned heights -- the same restraint `BUILD_ID_CSS` records.
+RENDER_ACTIVITY_CSS = """
+#render-activity-panel {
+    margin: 0 0 8px 0 !important;
+    padding: 0 !important;
+}
+
+.bs-render-activity {
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    display: grid;
+    gap: 6px;
+    font-size: 0.92em;
+}
+
+.bs-render-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+}
+
+.bs-render-chip {
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    white-space: nowrap;
+}
+
+.bs-render-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+/* Only the states in which a worker may still be alive pulse. A terminal panel is still. */
+.bs-render-running .bs-render-dot,
+.bs-render-starting .bs-render-dot,
+.bs-render-cancelling .bs-render-dot,
+.bs-render-queued .bs-render-dot {
+    animation: bs-render-pulse 1.3s ease-in-out infinite;
+}
+
+.bs-render-candidate {
+    font-weight: 600;
+}
+
+.bs-render-clocks {
+    margin-left: auto;
+    display: flex;
+    align-items: baseline;
+    gap: 4px 8px;
+    white-space: nowrap;
+}
+
+.bs-render-clock-label {
+    opacity: 0.5;
+    font-size: 0.82em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.bs-render-clock {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+}
+
+.bs-render-track {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.10);
+    overflow: hidden;
+}
+
+.bs-render-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: #2f81f7;
+}
+
+/* A SIBLING of the fill, spanning the whole track -- never nested inside it. On the fill, a
+   determinate 0 / 3620 renders a zero-width element and the animation meant to say "alive" has
+   nowhere to travel. */
+.bs-render-sweep {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%,
+        rgba(255, 255, 255, 0.55) 50%, rgba(255, 255, 255, 0) 100%);
+    background-size: 40% 100%;
+    background-repeat: no-repeat;
+    animation: bs-render-sweep 1.4s linear infinite;
+}
+
+.bs-render-detail {
+    opacity: 0.9;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+}
+
+.bs-render-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.bs-render-pill {
+    font-size: 0.78em;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    white-space: nowrap;
+}
+
+/* Three visually distinct states, and never by colour alone: done is filled, active is outlined
+   and brighter, pending is dimmed. */
+.bs-render-pill-done {
+    background: rgba(46, 160, 67, 0.22);
+    border-color: rgba(46, 160, 67, 0.55);
+}
+
+.bs-render-pill-active {
+    background: rgba(47, 129, 247, 0.22);
+    border-color: rgba(47, 129, 247, 0.75);
+    font-weight: 700;
+}
+
+.bs-render-pill-pending {
+    opacity: 0.42;
+}
+
+.bs-render-foot {
+    opacity: 0.55;
+    font-size: 0.88em;
+    font-variant-numeric: tabular-nums;
+}
+
+@keyframes bs-render-sweep {
+    0%   { background-position: -40% 0; }
+    100% { background-position: 140% 0; }
+}
+
+@keyframes bs-render-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.35; transform: scale(0.72); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .bs-render-activity .bs-render-dot,
+    .bs-render-sweep {
+        animation: none !important;
+    }
+
+    /* The motion stops; the RUNNING state does not become ambiguous. A static diagonal stripe
+       across the whole track still separates an active panel from a terminal one, which carries no
+       track at all. */
+    .bs-render-sweep {
         background-image: repeating-linear-gradient(135deg,
             rgba(255, 255, 255, 0.30) 0 7px, rgba(255, 255, 255, 0) 7px 14px);
         background-size: auto;
@@ -1316,11 +1526,30 @@ CUT_ACTIVITY_JS = r"""
   };
   const FIELDS = [
     ["data-job-token", "data-job-ms", ".bs-cut-job-elapsed"],
-    ["data-phase-token", "data-phase-ms", ".bs-cut-phase-elapsed"]
+    ["data-phase-token", "data-phase-ms", ".bs-cut-phase-elapsed"],
+    // [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): a THIRD field on the identical contract --
+    // the measured age of the last progress update, which the render panel reports separately
+    // from elapsed time because elapsed time is not evidence of progress. It needs no new logic
+    // at all: the token changes whenever a new measurement arrives, so the anchor below is
+    // re-created and the age restarts from the figure the server sent, rather than advancing a
+    // stale one. A panel that does not carry this child (the Raw Cutter one) is skipped by the
+    // `!out || !token` guard below, so cutter behaviour is byte-for-byte unchanged.
+    //
+    // NOTE, and a test enforces it: there may be no apostrophe anywhere in this script. It is a
+    // Python string handed to Gradio as JS, and one stray apostrophe in the wrong quoting context
+    // takes the whole script with it (measured, R5-P3).
+    ["data-update-token", "data-update-ms", ".bs-cut-update-elapsed"]
   ];
   const tick = () => {
     const live = {};
-    document.querySelectorAll(".bs-cut-activity").forEach((panel) => {
+    // [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the selector gained one token so the Render
+    // tab activity panel is ticked by this SAME already-authorised installer. No second
+    // installer, no second interval, no second anchor map and no network request -- the count of
+    // authorised JavaScript load registrations is unchanged at four, pinned by identity.
+    //
+    // (Deliberately NOT spelling the registration call out here: two suites count that literal in
+    // this file as raw text, so writing it inside a comment makes the count read six.)
+    document.querySelectorAll(".bs-cut-activity, .bs-render-activity").forEach((panel) => {
       const running = panel.getAttribute("data-running") === "1";
       FIELDS.forEach((field) => {
         const token = panel.getAttribute(field[0]) || "";
@@ -3823,6 +4052,241 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             music_playlist_builder.discard_playlist_master(playlist_master_path)
 
 
+# =============================================================================================
+# [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the render's activity reporter.
+#
+# This is the impure half of the read-out. `beatsync_fork.render_activity` holds every formatting
+# and honesty rule and reads no clock; this class supplies the readings and the facts, exactly as
+# `_cut_activity` does for the Raw Cutter and `_activity_frames` for Prepare & Verify.
+#
+# ONE reporter per top-level render event, constructed by the mutex-owning wrapper alongside the
+# `RenderLifecycle` and threaded down the same way. That is not a stylistic echo of the lifecycle —
+# it is the requirement: *"Total elapsed time spans the complete batch; current phase timing belongs
+# to the active candidate."* A reporter per `process_video()` call would restart the total clock on
+# candidate 2.
+#
+# It owns NOTHING that runs: no thread, no process, no queue, no lock, no Gradio object. It cannot
+# admit, refuse, cancel or release anything, and nothing branches on it — it can word a panel and
+# nothing else.
+# =============================================================================================
+
+
+class _RenderActivityReporter:
+    """The two clocks, the batch position, and the measurement age — for one render event.
+
+    The timers are `raw_cutter_activity.ActivityClock`, reused rather than reimplemented. That
+    class already owns exactly the rules wanted here — a job clock from a caller-supplied start, a
+    phase clock that resets only on a *real* phase change, and tokens derived from the start
+    reading so the browser can anchor on them — and it takes a `prefix`, so `'render'` is all this
+    needed. Only its four measured numbers are read off the snapshot it returns; its
+    cutter-specific fields are ignored. A third copy of a two-timer clock in this codebase would be
+    a third place for the freeze and reset rules to drift.
+    """
+
+    def __init__(self, now: float) -> None:
+        self._clock = fork_activity.ActivityClock(now, prefix='render')
+        self._candidate: "tuple[int, int] | None" = None
+        # The measurement age, reported separately from elapsed time because elapsed time is not
+        # evidence of progress. `_update_seq` is what makes the browser RE-ANCHOR rather than keep
+        # advancing a stale reading: a new sequence number is a new token, and the shared timer
+        # drops an anchor whose token is no longer on screen.
+        self._update_seq = 0
+        self._update_at: "float | None" = None
+        self._last_signature: "tuple | None" = None
+        # The last completed-stage set this render actually reported, so a TERMINAL frame can still
+        # say which stages finished. Found by the browser smoke: without it, `simple()` rendered
+        # `completed_stages=()` and a successful render's panel came to rest with all seven stage
+        # pills grey -- reading as "nothing completed" for a render that had just completed
+        # everything. It is a remembered MEASUREMENT, not an inference: these are stages that
+        # really reported END, and on a failure "6 / 7 stages completed" is exactly the useful
+        # thing to still be able to see.
+        self._completed: tuple = ()
+
+    # -- facts the wrapper supplies ------------------------------------------------------------
+
+    def set_candidate(self, position: "int | None", total: "int | None") -> None:
+        """Declare the Variant Lab batch position, or clear it for a single render.
+
+        `None` is **not** `1 / 1`: a single render has no candidate context, and rendering one
+        would be inventing it.
+        """
+        self._candidate = None if position is None or total is None else (
+            int(position), int(total))
+
+    def enter_phase(self, label: str, now: float, key) -> None:
+        """Reset the phase clock, but only on a genuinely different stretch of work.
+
+        `key` carries the candidate position as well as the stage and phase, for the reason the
+        cutter's batch does the same: the same stage label recurs on candidate 2, and keying on the
+        label alone would let the phase clock run across the whole batch.
+        """
+        self._clock.enter(label, now, key=key)
+
+    # -- readings ------------------------------------------------------------------------------
+
+    def _numbers(self, now: float):
+        """The four measured figures, read off the reused clock's own snapshot."""
+        snap = self._clock.snapshot(now)
+        return snap.job_ms, snap.phase_ms, snap.job_token, snap.phase_token
+
+    def frame(self, now: float, view: "ProgressView", *, status: str) -> str:
+        """A panel rendered from THIS render's own `ProgressView`, and from nothing else.
+
+        The measurement comes from `ProgressView.active_measurement()` — the read-only projection
+        that exists so the figures can be had without reaching into `_stages` or parsing them back
+        out of `render()`'s text. So the bar can only ever show what the pipeline counted, an
+        uncounted phase reports `None` rather than zero, and nothing is carried across a phase
+        boundary because one `_PhaseView` is reported at a time.
+        """
+        measurement = view.active_measurement()
+        job_ms, phase_ms, job_token, phase_token = (0, 0, self._clock.token, '')
+        stage = stage_name = detail = unit = None
+        done = total = None
+        if measurement is not None:
+            stage = measurement.stage
+            # The pipeline's OWN title for the stage, straight off the measurement. Not a lookup
+            # in a second table here: `ActiveMeasurement.stage_title` already carries
+            # `progress.STAGE_TITLES`' word for it.
+            stage_name = measurement.stage_title
+            # The phase's own words when the pipeline named one, else the stage's. Never a
+            # prettified version of an internal phase key.
+            phase_words = fork_render_activity.phase_label(measurement.phase)
+            detail = measurement.message or phase_words
+            if phase_words and measurement.message:
+                detail = '%s — %s' % (phase_words, measurement.message)
+            unit = measurement.unit
+            done, total = measurement.current, measurement.total
+            # A real phase change is what resets the phase clock. The signature includes the
+            # candidate, so candidate 2's Stage 5 is a different stretch of work from candidate
+            # 1's — and excludes the counts, so an advancing counter does not restart the clock.
+            signature = (self._candidate, measurement.stage, measurement.phase)
+            if signature != self._last_signature:
+                self._last_signature = signature
+                self.enter_phase(str(stage_name or ''), now, key=signature)
+            # The measurement age re-anchors on a NEW measurement only. `current`/`total` are part
+            # of this signature deliberately: an advancing Stage 5 counter IS a progress update,
+            # and that is exactly what the operator wants the age of.
+            self._update_seq += 1
+            self._update_at = now
+        job_ms, phase_ms, job_token, phase_token = self._numbers(now)
+        update_ms = None if self._update_at is None else max(
+            0.0, (now - self._update_at) * 1000.0)
+        candidate, candidate_total = (None, None) if self._candidate is None else self._candidate
+        self._completed = view.completed_stages()
+        return fork_render_activity.activity_html(fork_render_activity.RenderActivityState(
+            status=status,
+            job_ms=job_ms,
+            phase_ms=phase_ms,
+            job_token=job_token,
+            phase_token=phase_token,
+            stage=stage,
+            stage_name=stage_name or '',
+            detail=detail or '',
+            done=done,
+            total=total,
+            unit=unit or '',
+            candidate=candidate,
+            candidate_total=candidate_total,
+            completed_stages=self._completed,
+            update_ms=update_ms,
+            update_token='%s-u%d' % (self._clock.token, self._update_seq),
+        ))
+
+    def simple(self, now: float, *, status: str, detail: str = '') -> str:
+        """A panel for a state that has no pipeline measurement of its own.
+
+        Used for the wrapper's own frames: the pre-gate `Starting`, and each terminal state. It
+        carries the measured total elapsed and no bar at all, because there is nothing to count --
+        but it DOES carry the completed-stage set this render reported, so a finished render's panel
+        does not come to rest claiming that no stage ever completed. Before any stage has reported
+        (the `Starting` frame) that set is legitimately empty.
+        """
+        job_ms, phase_ms, job_token, phase_token = self._numbers(now)
+        candidate, candidate_total = (None, None) if self._candidate is None else self._candidate
+        return fork_render_activity.activity_html(fork_render_activity.RenderActivityState(
+            status=status,
+            job_ms=job_ms,
+            phase_ms=phase_ms,
+            job_token=job_token,
+            phase_token=phase_token,
+            detail=detail,
+            candidate=candidate,
+            candidate_total=candidate_total,
+            completed_stages=self._completed,
+        ))
+
+
+def _render_activity_status(lifecycle) -> str:
+    """`Cancelling` once a Stop has landed, otherwise `Running`.
+
+    The lifecycle's own cancellation flag is the authority, read by attribute. Nothing here parses
+    a status string, and this is the ONLY route by which `Cancelling` reaches the panel — the
+    Cancel button's own `outputs` stay exactly `[status_output]`, so Cancel gains no second widget
+    and no new writer. The consequence is recorded rather than hidden: between a Stop landing and
+    the next progress frame, the chip still reads `Running` while the status line already says the
+    cancellation was requested. Stage 5 and extraction both emit a frame per item, so the gap is
+    short; a genuinely silent stretch (the Qwen model load) can hold it for a few seconds.
+    """
+    try:
+        return (fork_render_activity.STATUS_CANCELLING if lifecycle is not None
+                and lifecycle.cancel_requested() else fork_render_activity.STATUS_RUNNING)
+    except Exception:
+        # A status line must never be the thing that breaks a render.
+        return fork_render_activity.STATUS_RUNNING
+
+
+def _render_activity_idle() -> str:
+    """The panel's construction-time value: permanently visible, and claiming nothing."""
+    return fork_render_activity.activity_html(fork_render_activity.RenderActivityState())
+
+
+def _new_render_activity() -> "_RenderActivityReporter":
+    """One reporter for one top-level render event. The mutex-owning wrappers' only constructor.
+
+    A factory rather than an inline construction for a measured reason: both render wrappers are
+    AST-extracted and executed against synthesised namespaces by a dozen suites, and every module
+    name their bodies mention has to exist in each of those namespaces. Funnelling this through one
+    helper means each body mentions one name instead of two.
+    """
+    return _RenderActivityReporter(time.perf_counter())
+
+
+def _render_activity_panel(activity, status: str, detail: str = ''):
+    """A terminal or pre-pipeline panel for a wrapper's own frame, or `gr.skip()`.
+
+    `gr.skip()` — never `''` — is the answer when there is no reporter, because an empty string
+    would BLANK a `gr.HTML` and a missing reporter is not a reason to erase whatever the panel
+    legitimately shows. Guarded for the same reason `_publish_render_activity` is: a status panel
+    must never be the thing that breaks a render's terminal path.
+    """
+    if activity is None:
+        return gr.skip()
+    try:
+        return activity.simple(time.perf_counter(), status=status, detail=detail)
+    except Exception:
+        return gr.skip()
+
+
+def _publish_render_activity(session_state, activity, view, lifecycle) -> None:
+    """Park a freshly rendered panel on `session_state`, and never raise doing it.
+
+    The guard is the same rule `progress.emit()` is built on and for the same reason: a broken
+    status widget must not be able to lose hours of analysis. So every failure here — a reporter
+    that is `None`, a `session_state` that is not a dict, a formatting error — leaves the previous
+    panel on screen and the render completely untouched. `KeyboardInterrupt` still propagates
+    because it is a `BaseException`.
+
+    It writes exactly one key and reads nothing back. Nothing branches on the result.
+    """
+    if activity is None or not isinstance(session_state, dict):
+        return
+    try:
+        session_state[RENDER_ACTIVITY_KEY] = activity.frame(
+            time.perf_counter(), view, status=_render_activity_status(lifecycle))
+    except Exception:
+        pass
+
+
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  output_profile: str, session_state: dict,
@@ -3849,6 +4313,16 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  # file by the time the pipeline sees it, not a different lifecycle. Placed before
                  # `lifecycle`, which the cancellation seam requires to stay last.
                  playlist: tuple = (),
+                 # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the render event's ONE activity
+                 # reporter, threaded in rather than constructed here — because this generator is
+                 # called once per candidate and a reporter made here would restart the batch's
+                 # total-elapsed clock on candidate 2. Placed before `lifecycle`, which the
+                 # cancellation seam requires to stay last.
+                 #
+                 # `None` preserves today's exact behaviour: no panel is rendered, nothing is
+                 # written to `session_state`, and the headless CLI and `video_processor.main` are
+                 # unaffected. It is diagnostics only — it cannot admit, refuse or cancel anything.
+                 activity: "_RenderActivityReporter | None" = None,
                  # [FORK] Digital-Union (C3-R1A): appended last with a default, same reasoning.
                  # `None` preserves today's exact behaviour.
                  lifecycle: "RenderLifecycle | None" = None
@@ -3983,6 +4457,16 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                 view.apply(item)
                 console_logger.apply_event(item)
                 rendered = view.render()
+                # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): refresh the panel from the view
+                # this event has just been folded into. Deliberately NOT a change to the yield
+                # condition below: the cadence of this stream is pinned by the progress seam
+                # suite, and it does not need changing, because the panel's clocks are advanced
+                # BY THE BROWSER between frames (`CUT_ACTIVITY_JS` anchors on `data-job-token`)
+                # and its animation is a CSS keyframe that needs no frames at all. So a silent
+                # Stage 5 stretch stays visibly alive without this generator emitting anything —
+                # which is why `status_queue.get()` is still an unbounded wait and no poll, timer,
+                # coordinator or endpoint was added anywhere.
+                _publish_render_activity(session_state, activity, view, lifecycle)
             else:
                 # Legacy string status: shown only when no structured event has arrived yet, so
                 # the old "Stage N is processing" sentences cannot overwrite richer structured
@@ -4313,12 +4797,32 @@ def _on_music_source_change(music_source, playlist_state, audio_file, repeat_val
 
 
 def _source_ui_updates(state) -> Tuple:
-    """Project the backend source state onto the four source widgets plus the Create button."""
+    """Project the backend source state onto the four source widgets plus the Create button.
+
+    [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): Create Music Video is enabled when the source set
+    is confirmed **and** no render is currently active. The second half is new, and it closes a real
+    interaction rather than adding a precaution.
+
+    This function is the ONE authority over that button's enabled state, and the render interlock
+    disables it for the duration of a render. But Scan and Confirm take no mutex, so they run
+    perfectly happily while a render does -- and every one of this function's six callers is one of
+    those source handlers. So an operator who re-scanned and re-confirmed mid-render used to get
+    `is_confirmed() == True` projected straight onto Create, re-enabling it underneath a running
+    job and undoing the interlock from a completely unrelated handler.
+
+    The authorization boundary has not moved and is not this: `_RENDER_LOCK` still decides whether a
+    render may start, and the duplicate click was measured to be DISCARDED by the queue anyway on
+    the pinned version. What was wrong was the *claim* -- a lit Create button during a render says
+    "you may start one", which is the kind of small lie this item exists to remove.
+
+    `_render_is_active()` is diagnostic, total and never raises; a slot that cannot be read answers
+    "not active", so the pre-existing behaviour is what a failure falls back to.
+    """
     return (
         state.report_text,
         gr.update(value=state.confirm_button_label(), interactive=state.can_confirm()),
         state.confirmation_status_text(),
-        gr.update(interactive=state.is_confirmed()),
+        gr.update(interactive=state.is_confirmed() and not _render_is_active()),
         state,
     )
 
@@ -5438,6 +5942,19 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # Tests pin both literals equal to the real constants.
                                     music_source: str = 'single',
                                     playlist_state=(),
+                                    # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the render
+                                    # event's ONE activity reporter, appended after R16's pair with
+                                    # a `None` default, for the identical reason — nothing is
+                                    # inserted, so no pre-existing positional index moves and a
+                                    # caller that omits it behaves exactly as it did before.
+                                    #
+                                    # This core only threads it down to `process_video` and reads
+                                    # nothing off it; the panel is rendered where `ProgressView`
+                                    # lives and arrives back on `session_state`. Placed BEFORE
+                                    # `lifecycle` because the C3-R1A cancellation seam requires
+                                    # `lifecycle` to remain the LAST parameter of every seam it
+                                    # threads through.
+                                    activity=None,
                                     lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -5518,7 +6035,14 @@ def _process_video_guarded_unlocked(audio_file: str,
         # three audio levels, none of which the gate reads, so a refusal cannot be rescued by a
         # different recipe. This is the first producer `SHARED_FATAL` ever had.
         session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
-        yield None, f"❌ {decision.message}", session_state, '', '', invocation_id
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): `gr.skip()` for the activity panel, so a
+        # REFUSAL carries no activity frame of its own. That is the rule both existing activity
+        # surfaces already follow -- the Raw Cutter's `refuse(...)` renders no panel because it
+        # performed no work, and Prepare & Verify emits exactly one frame and no activity frame for
+        # a declined click. A timer here would be counting a job that never began. The wrapper's
+        # terminal yield is what freezes the panel into its terminal state, and it runs on this
+        # path too, so the pre-gate `Starting` frame cannot be left standing.
+        yield None, f"❌ {decision.message}", session_state, '', '', invocation_id, gr.skip()
         return
 
     # [FORK] Digital-Union (Creative Controls Core): the four raw widget values are collapsed into
@@ -5630,7 +6154,9 @@ def _process_video_guarded_unlocked(audio_file: str,
             # frozen and identical for every candidate of a C3 batch, and no candidate recipe can
             # put a track in an empty queue or repair a row that could not be read.
             session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
-            yield (None, f"❌ {refusal}", session_state, '', '', invocation_id)
+            # `gr.skip()` for the activity panel: a refusal carries no activity frame, exactly as
+            # the source-gate refusal above does not.
+            yield (None, f"❌ {refusal}", session_state, '', '', invocation_id, gr.skip())
             return
         playlist = frozen_queue.entries
 
@@ -5671,14 +6197,26 @@ def _process_video_guarded_unlocked(audio_file: str,
         music_repeat=music_repeat,
         # [FORK] R16: the frozen ordered soundtrack. `()` is a Single Track render.
         playlist=playlist,
+        # [FORK] UX-RENDER-ACTIVITY V1: the render event's one reporter, threaded down so the
+        # panel is rendered where `ProgressView` lives. `None` renders no panel at all.
+        activity=activity,
         lifecycle=lifecycle,
     )
     try:
         for video, status, state in render_stream:
+            # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the activity panel is projected onto
+            # its widget here, on exactly the seam the two report read-outs already use -- the
+            # worker thread must never touch a Gradio component, so the panel rides on
+            # `session_state` and this generator does the widget update.
+            #
+            # `gr.skip()` when nothing has published one yet, never `''`: an empty string would
+            # BLANK the `gr.HTML`, and "no panel has been rendered for this frame" is not a reason
+            # to erase the one already on screen.
             yield (video, status, state,
                    (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''),
                    (state or {}).get(SMART_MIX_REPORT_KEY, ''),
-                   invocation_id)
+                   invocation_id,
+                   (state or {}).get(RENDER_ACTIVITY_KEY) or gr.skip())
     finally:
         render_stream.close()
 
@@ -6226,6 +6764,152 @@ def _request_cancel_if_matching(invocation_id: str) -> bool:
         return False
     slot[1].request_cancel()
     return True
+
+
+# =============================================================================================
+# [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the render control interlocks.
+#
+# WHICH controls these are was decided by measurement, not by sweeping the UI. The question "does
+# this genuinely conflict with an active render" already has an authoritative answer in this file:
+# the set of non-blocking `_RENDER_LOCK.acquire()` callers. There are exactly six --
+# `process_video_guarded`, `render_selected_variants_guarded`, `_verify_sources_frames`,
+# `_sample_decode_frames`, `_on_cut_run` and `_on_cut_batch_run` -- and nothing else in the
+# application is mutually exclusive with a render by construction.
+#
+#     DISABLED here        process_btn, render_selected_variants_btn, prep_verify_btn, sample_btn
+#     NOT disabled here    cut_run_btn, cut_batch_start_btn      -- see below
+#     NOT a conflict       the Audio Cutter, source confirmation, Scan, Analyze, Cancel,
+#                          Open Output Folder, tab navigation, every read-only panel
+#
+# **The two Raw Cutter buttons are deliberately left alone, and that is a decision rather than an
+# omission.** Both already have their own server-managed interactive state -- `cut_run_btn` is
+# enabled by a successful Analyze and appears in three separate `outputs` lists -- so a render
+# event writing them would be a SECOND authority over one widget. Restoring them afterwards would
+# mean either guessing `interactive=True`, which offers Run with no plan and makes the UI lie, or
+# re-deriving the cutter's plan state inside a render handler, which couples two subsystems that
+# currently share nothing but a mutex. What they already have is the right answer: an instant,
+# accurate refusal naming the holder (`_cut_busy_message()`), costing nothing and losing no work.
+# The brief's own instruction is to restore from real readiness "rather than blindly enabling every
+# button", and for these two there is no readiness this module can honestly compute.
+#
+# **The Audio Cutter is not a `_RENDER_LOCK` holder at all** -- measured, not assumed: its handler
+# contains no acquire. Disabling it would be inventing a conflict the admission architecture does
+# not recognise, which is exactly the indiscriminate disabling the brief rules out.
+#
+# **Source confirmation is not a conflict either.** `_process_video_guarded_unlocked` re-verifies
+# the live source controls once, at the gate, and renders from the paths it froze there, so a
+# confirmation changed mid-render cannot reach the render in flight. Disabling Confirm would remove
+# a harmless action and suggest a hazard that does not exist.
+#
+# NONE of this is an authorization boundary, and the split above is only safe because of that.
+# `_RENDER_LOCK` remains the sole admission authority; every one of the six refuses correctly on
+# its own whether or not its button was ever greyed out. A disabled button is a courtesy to the
+# operator, and the measured duplicate-click behaviour is recorded in the task evidence: on the
+# pinned gradio==6.19.0 a second same-session click on an event already running in a
+# `concurrency_limit=1` lane is DISCARDED, so the greying is not what prevents a double render.
+# =============================================================================================
+
+#: The four controls this feature disables, in the order both interlock handlers return them. A
+#: tuple so the two handlers cannot drift apart in length or order; the registrations below build
+#: their `outputs` lists from the same four widgets in the same order.
+_RENDER_INTERLOCK_WIDGET_COUNT = 4
+
+
+def _render_is_active() -> bool:
+    """Whether a render currently owns the capacity-one active-render slot.
+
+    The ONE diagnostic read of that slot this feature adds, shared by the two interlock handlers
+    and by `_source_ui_updates`, so there is a single answer to "is a render running" rather than
+    three. It reads the EXISTING slot -- the same evidence `_lock_holder_now` already treats as
+    proof of a render -- under that slot's own small lock.
+
+    **It is diagnostic only and is never an admission decision.** `_RENDER_LOCK.acquire()` remains
+    the sole authority on whether anything may start, this file still never asks the mutex whether
+    it happens to be held (the check-then-act form this module bans outright -- deliberately not
+    spelled out here, because sibling suites ban that literal as raw text and a docstring
+    explaining the rule would trip its own ban), and this function can word a panel or grey a
+    button and nothing else. Total: an unreadable slot answers `False`, which is the pre-existing
+    behaviour, because failing towards "no render" leaves every real guard exactly where it was.
+    """
+    try:
+        with _ACTIVE_RENDER_SLOT_LOCK:
+            return _active_render_slot is not None
+    except Exception:
+        return False
+
+
+def _render_interlock_pending_status() -> str:
+    """`queued` when another render already owns the slot, else `starting`.
+
+    This exists because of a measured fact rather than a guess. On gradio==6.19.0 a render click
+    from a SECOND browser session, made while another session owns the mutex, is neither refused
+    nor run: it waits in the shared `concurrency_limit=1` lane and is admitted 33 ms after the
+    first render releases. The lock held throughout and the two renders never overlapped, so this
+    is a visibility gap and not a safety one -- but telling that operator nothing for several
+    seconds is precisely the dead-button complaint this item exists to remove, so the state they
+    are genuinely in gets named.
+    """
+    return 'queued' if _render_is_active() else 'starting'
+
+
+def _render_interlock_lock() -> Tuple:
+    """Disable the four conflicting controls and put the activity panel live. No work, no state.
+
+    Registered as its own `.click` on each render button, declared BEFORE the render registration,
+    so the render event's own `fn`, `inputs`, `outputs` and emitted arity stay byte-identical and
+    every positional and arity contract guarding them is untouched. Measured on the pinned version:
+    this handler runs ~60 ms before the render handler is entered.
+
+    That ordering is measured rather than guaranteed by contract, and nothing rests on it: if this
+    ever landed after the render's first frame, the panel would briefly show `Starting` again and
+    self-correct on the next frame. No admission decision reads it.
+    """
+    return (gr.update(interactive=False),) * _RENDER_INTERLOCK_WIDGET_COUNT + (
+        _render_activity_panel(_new_render_activity(),
+                               _render_interlock_pending_status()),)
+
+
+def _render_interlock_restore(source_state) -> Tuple:
+    """Re-enable the four conflicting controls once the render event has fully finished.
+
+    Chained with `.then()` after the render registration, and that placement is the whole reason
+    this is a separate event rather than a terminal yield. Measured on gradio==6.19.0: a `.then()`
+    link runs AFTER the generator's `finally` has completed -- 30 ms after the mutex release in the
+    probe. So `process_video`'s finalizer has already joined the render worker and the wrapper has
+    already released `_RENDER_LOCK` before anything here runs, which makes *"keep conflicting
+    operations disabled until the worker and owned subprocesses have actually stopped"* a
+    structural property instead of a hopeful one. A terminal yield could not promise it: it runs
+    inside the `try`, before the `finally` that does the joining.
+
+    Two rules it obeys:
+
+    * **Create Music Video is restored from the SOURCE GATE, never to `True`.** Its enabled state
+      belongs to the confirmation state machine (`_source_ui_updates` derives it from
+      `state.is_confirmed()`), so blindly enabling it would offer a render over an unconfirmed or
+      newly invalidated source set. The same `source_state` the render already takes as an input
+      is read here, and nothing is written back to it.
+    * **A newer render keeps the controls locked.** If the slot still holds a render when this
+      runs -- an older invocation's delayed `.then()` arriving while a newer job is live -- every
+      widget gets `gr.update()`, i.e. no change at all, so a stale event can never unlock controls
+      belonging to a job that is still going.
+
+    Abandonment is not covered and must not be: a `.then()` link does not run for an abandoned
+    event (measured -- the generator's `finally` ran, the `.then()` did not). That costs nothing,
+    because the only way to abandon a render from the UI is to leave or reload the page, and a
+    `gr.update(interactive=False)` is a transient update rather than a config change -- the
+    replacing page rebuilds these controls from the Blocks config, enabled. Measured immediately
+    after a mid-stream reload in the probe: every disabled control read back as enabled.
+    """
+    if _render_is_active():
+        return (gr.update(),) * _RENDER_INTERLOCK_WIDGET_COUNT
+    try:
+        create_update = gr.update(interactive=bool(source_state.is_confirmed()))
+    except Exception:
+        # An unusable state is not evidence that a render may start, so fail CLOSED on the one
+        # control that starts one and leave the three diagnostics alone.
+        create_update = gr.update()
+    return (create_update,) + (gr.update(interactive=True),) * (
+        _RENDER_INTERLOCK_WIDGET_COUNT - 1)
 
 
 def _on_cancel_render_click(invocation_id: str) -> str:
@@ -6965,19 +7649,33 @@ def process_video_guarded(audio_file: str,
         # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): the refusal is unchanged -- only its wording is
         # now accurate about WHO holds the mutex, since read-only source verification can also hold
         # it. The gate itself is the same single non-blocking acquire.
-        yield gr.skip(), _busy_message(), session_state, gr.skip(), gr.skip(), ''
+        # [FORK] UX-RENDER-ACTIVITY V1: `gr.skip()` for the activity panel too. This refusal
+        # already "touches nothing", and a render that was declined because another operation holds
+        # the mutex did not begin, so it has no activity to report.
+        yield gr.skip(), _busy_message(), session_state, gr.skip(), gr.skip(), '', gr.skip()
         return
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for this whole render event, constructed and
     # installed here, before any expensive work -- the mutex-owning wrapper owns
     # installation/uninstallation, exactly as the frozen authorization requires.
     lifecycle = RenderLifecycle(invocation_id=str(uuid.uuid4()))
     _install_active_render(lifecycle)
+    # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): ONE activity reporter for this whole render
+    # event, constructed here beside the lifecycle and for the same reason -- the mutex-owning
+    # wrapper is the only thing that knows where the event begins, and the total-elapsed clock
+    # starts at that moment rather than when the first stage reports.
+    activity = _new_render_activity()
     try:
         lifecycle.mark_running()
         # The user cannot meaningfully cancel a render before the browser/session has been told
         # which invocation is active, so this id-publishing yield happens BEFORE the gate or any
         # pipeline work -- it writes no execution widget and no report, only the control-plane id.
-        yield gr.skip(), 'Starting…', session_state, gr.skip(), gr.skip(), lifecycle.invocation_id
+        #
+        # [FORK] UX-RENDER-ACTIVITY V1: and the activity panel goes live HERE, which is the whole
+        # of requirement 3's "visibly active as soon as a render has been admitted" -- before the
+        # source gate, before any probe and before a single frame of expensive work.
+        yield (gr.skip(), 'Starting…', session_state, gr.skip(), gr.skip(),
+               lifecycle.invocation_id,
+               _render_activity_panel(activity, 'starting'))
         yield from _process_video_guarded_unlocked(
             audio_file, voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
             music_under_voice, sfx_folder, sfx_roles, sfx_amount, sfx_level,
@@ -7005,6 +7703,9 @@ def process_video_guarded(audio_file: str,
             # same boundary — so this wrapper adds no second interpretation of either.
             music_source=music_source,
             playlist_state=playlist_state,
+            # [FORK] UX-RENDER-ACTIVITY V1: this event's one reporter. The core threads it to
+            # `process_video` and reads nothing off it.
+            activity=activity,
         )
         # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
         # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
@@ -7029,7 +7730,30 @@ def process_video_guarded(audio_file: str,
         _notify_render(request, outcome_kind, session_state.get(RENDER_STARTED_KEY))
         # The terminal yield clears the invocation id from the session -- a render that finished
         # normally has nothing left for a Cancel click to signal.
-        yield gr.skip(), gr.skip(), session_state, gr.skip(), gr.skip(), ''
+        #
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): it also FREEZES the activity panel, which
+        # is what stops the browser clock advancing (`data-running` becomes `0`) and what makes
+        # "do not report the job as completed while finalization is still running" structural: this
+        # statement is reached only after the whole core generator -- including the durable
+        # promotion, the delivery preview and the share publication -- has returned.
+        #
+        # The terminal state is read off the SAME typed outcome the lifecycle was just marked from,
+        # three lines above, so the chip and the lifecycle are two readings of one classification
+        # rather than two derivations. Nothing is parsed out of the status text.
+        #
+        # The status strings are LITERALS rather than `fork_render_activity.STATUS_*`, for the
+        # measured reason `repeat_music`'s integer literal records: this body is AST-extracted and
+        # executed against synthesised namespaces by a dozen suites, and a reference to a fork
+        # module that is a stub there would fail at exec time. Tests pin each literal equal to the
+        # real constant so they cannot drift.
+        if outcome_kind is RenderOutcomeKind.CANCELLED:
+            terminal_activity = 'cancelled'
+        elif outcome_kind is RenderOutcomeKind.SUCCESS:
+            terminal_activity = 'completed'
+        else:
+            terminal_activity = 'failed'
+        yield (gr.skip(), gr.skip(), session_state, gr.skip(), gr.skip(), '',
+               _render_activity_panel(activity, terminal_activity))
     finally:
         # [FORK] Digital-Union (C3-R1A): defensive terminal mark -- the normal path above already
         # reaches a terminal lifecycle state; this only catches an abandoned-generator or truly
@@ -7163,14 +7887,16 @@ def render_selected_variants_guarded(
         request_tag=_render_batch_request_tag(),
     )
     if batch_request is None:
-        yield summary_only[0], f"❌ {refusal}", session_state, refusal, ''
+        # [FORK] UX-RENDER-ACTIVITY V1: no activity frame for a refused batch -- it took no mutex,
+        # built no request and ran no candidate.
+        yield summary_only[0], f"❌ {refusal}", session_state, refusal, '', gr.skip()
         return
 
     if not _RENDER_LOCK.acquire(blocking=False):
         # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): same accurate wording as the single-render
         # wrapper; the gate is the unchanged single non-blocking acquire.
         _busy = _busy_message()
-        yield gr.skip(), _busy, session_state, _busy, ''
+        yield gr.skip(), _busy, session_state, _busy, '', gr.skip()
         return
 
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- every selected candidate
@@ -7180,6 +7906,13 @@ def render_selected_variants_guarded(
     # wrapper, mirroring `process_video_guarded` exactly.
     lifecycle = RenderLifecycle(invocation_id=str(uuid.uuid4()))
     _install_active_render(lifecycle)
+    # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): ONE reporter for the WHOLE batch, exactly as
+    # there is one lifecycle for the whole batch -- and this is the requirement rather than a
+    # symmetry: *"Total elapsed time spans the complete batch; current phase timing belongs to the
+    # active candidate."* The total clock starts here and is never restarted; the phase clock is
+    # keyed on the candidate position as well as the stage and phase, so candidate 2's Stage 5 is a
+    # different stretch of work from candidate 1's.
+    activity = _new_render_activity()
 
     outcomes: list = []
     stopped = False
@@ -7187,7 +7920,8 @@ def render_selected_variants_guarded(
         lifecycle.mark_running()
         # Publish the invocation id BEFORE any candidate work, same reasoning as the single-render
         # wrapper: a Cancel click needs the id on screen before there is anything to cancel.
-        yield gr.skip(), 'Starting…', session_state, gr.skip(), lifecycle.invocation_id
+        yield (gr.skip(), 'Starting…', session_state, gr.skip(), lifecycle.invocation_id,
+               _render_activity_panel(activity, 'starting'))
 
         # [FORK] Digital-Union (Freestyle V1): ONE declaration for the whole batch, frozen HERE —
         # outside the candidate loop, from this handler's own submitted arguments. Both candidates
@@ -7212,6 +7946,11 @@ def render_selected_variants_guarded(
                 break
 
             prefix = f"Rendering candidate {position} / {batch_request.count}"
+            # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the batch context the panel displays,
+            # declared from the loop's own counter and the request's own count -- the same two
+            # values `prefix` is built from, so the panel and the status line cannot disagree about
+            # which candidate is running. Nothing is parsed out of `prefix`.
+            activity.set_candidate(position, batch_request.count)
             recipe = candidate.creative_recipe
             audio = candidate.audio_recipe
             last_status, last_video = '', None
@@ -7249,19 +7988,29 @@ def render_selected_variants_guarded(
                         # creative settings differ.
                         music_source=music_source,
                         playlist_state=playlist_state,
+                        # [FORK] UX-RENDER-ACTIVITY V1: the batch's ONE reporter, shared by every
+                        # candidate -- which is what makes the total clock span the whole batch.
+                        activity=activity,
                         lifecycle=lifecycle)
             try:
-                for video, status, state, _a_report, _s_report, _invocation_id in candidate_stream:
+                for (video, status, state, _a_report, _s_report, _invocation_id,
+                     candidate_activity) in candidate_stream:
                     last_status = status or ''
                     if video is not None:
                         last_video = video
                     # Prefix only. The inner ProgressView text is passed through untouched — no new
                     # stage, no new phase, no second progress protocol, and nothing parsed out of it.
+                    #
+                    # [FORK] UX-RENDER-ACTIVITY V1: the candidate's panel is passed through
+                    # untouched for the same reason, and it already carries `Candidate N / M`
+                    # because the reporter was told the position above. The batch composes no
+                    # second panel of its own.
                     yield (gr.skip() if video is None else video,
                            f"{prefix}\n\n{last_status}",
                            state,
                            gr.skip(),
-                           lifecycle.invocation_id)
+                           lifecycle.invocation_id,
+                           candidate_activity)
             finally:
                 candidate_stream.close()
 
@@ -7445,11 +8194,35 @@ def render_selected_variants_guarded(
     # The newest successful preview wins, and a later failure never blanks an earlier success.
     preview = outcome.latest_successful_preview()
     # The batch is fully done -- nothing left for a Cancel click to signal.
+    #
+    # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): and only HERE does the panel reach a terminal
+    # state, which is requirement 6's "do not show a terminal Completed state until the entire
+    # batch has reached its actual terminal outcome". A candidate finishing mid-batch cannot freeze
+    # the panel, because every candidate frame carries the RUNNING panel the shared reporter built
+    # and the only terminal frame is this one.
+    #
+    # The chip is read off `batch_outcome_kind` -- the batch's OWN typed terminal cause, derived
+    # above -- and never from a candidate's outcome or from the headline text. The mapping follows
+    # the batch's three-way rule exactly: a cancellation wins; a batch that stopped early carries
+    # the stopping candidate's fatal class and is Failed; and a batch that attempted its whole
+    # selection has no terminal cause of its own and is Completed, however many CANDIDATE_LOCAL
+    # failures it carries -- the summary panel is what reports those, and `outcome.headline()`
+    # beside this panel still says `1 / 2 succeeded; 1 failed`.
+    #
+    # Literals rather than `fork_render_activity.STATUS_*`, for the same exec-time namespace reason
+    # the single-render wrapper's are; tests pin each equal to the real constant.
+    if batch_outcome_kind is RenderOutcomeKind.CANCELLED:
+        batch_activity_status = 'cancelled'
+    elif batch_outcome_kind is None:
+        batch_activity_status = 'completed'
+    else:
+        batch_activity_status = 'failed'
     yield (preview if preview else gr.skip(),
            outcome.headline(),
            session_state,
            outcome.summary_text(),
-           '')
+           '',
+           _render_activity_panel(activity, batch_activity_status))
 
 
 # [FORK] Digital-Union (P V1 / P2): media library preparation.
@@ -15185,7 +15958,7 @@ def create_ui() -> gr.Blocks:
     app = gr.Blocks(title=UI_BROWSER_TITLE.format(version=FORK_VERSION, build=build_label),
                     theme='ocean',
                     css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS + BUILD_ID_CSS
-                        + BROWSE_ROW_CSS + PREP_ACTIVITY_CSS)
+                        + BROWSE_ROW_CSS + PREP_ACTIVITY_CSS + RENDER_ACTIVITY_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -15580,6 +16353,30 @@ def create_ui() -> gr.Blocks:
                                     elem_id='open-creative-settings-button')
                     with gr.Column(scale=2):
                         gr.Markdown('### 📺 Output')
+                        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the Render Activity panel,
+                        # immediately ABOVE the Status textbox -- the same placement decision
+                        # UX-PREP-VISUAL-PROGRESS made for `prep_status`, and for the same measured
+                        # reason: a sign of life below a four-line report is not within sight of
+                        # the thing the operator pressed.
+                        #
+                        # `gr.HTML` and NOT `gr.Markdown`, and that is load-bearing rather than a
+                        # preference. Measured against the served `gradio==6.19.0`, `gr.Markdown`'s
+                        # sanitizer strips every `data-*`, `role` and `aria-*` attribute and keeps
+                        # only `class` and `style`. This panel's elapsed clocks are advanced BY THE
+                        # BROWSER, and `CUT_ACTIVITY_JS` finds them through `data-job-token` /
+                        # `data-phase-token` -- through a Markdown component there would be no
+                        # tokens in the DOM and therefore no clock at all between server frames,
+                        # which is the entire complaint this item exists to answer.
+                        #
+                        # The detailed `Status` report below is KEPT exactly as it was: same
+                        # widget, same label, same `lines`/`max_lines`, same `elem_id`, same
+                        # writers. This panel answers "is it alive and how far has it got"; that
+                        # box still answers "what exactly is happening", and neither replaces the
+                        # other.
+                        render_activity = gr.HTML(
+                            value=_render_activity_idle(),
+                            elem_id='render-activity-panel',
+                        )
                         status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
                         video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
                         # [FORK] Digital-Union (Deliverable Export V1-B-S2): directly below the preview,
@@ -18226,6 +19023,23 @@ def create_ui() -> gr.Blocks:
 
         source_outputs = [source_report, confirm_btn, confirm_status, process_btn, source_state]
 
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the four controls the render interlock
+        # disables, in the ONE order both interlock handlers return them.
+        #
+        # Declared once and reused by all four registrations (a lock and a restore on each render
+        # button), because the order of a Gradio `outputs` list is the whole contract -- two copies
+        # of this list would be two chances to put Create Music Video anywhere but first, which is
+        # the position `_render_interlock_restore` special-cases to re-derive source-gate readiness.
+        #
+        # These are exactly the non-render `_RENDER_LOCK` holders this feature greys out, and the
+        # omissions are deliberate and reasoned in the `_render_interlock_lock` comment block:
+        # `cut_run_btn` and `cut_batch_start_btn` already have their own server-managed interactive
+        # state and keep their own accurate refusal instead, and the Audio Cutter holds no mutex at
+        # all. `cancel_render_btn` and `open_output_folder_btn` must stay live, and tab navigation
+        # is untouched.
+        _render_interlock_outputs = [process_btn, render_selected_variants_btn,
+                                     prep_verify_btn, sample_btn]
+
         # [FORK] R8 Commit C: `source_folder` is PREPENDED to the outputs so "Use Media Library"
         # can fill it in. Prepended rather than appended purely so the two group-visibility
         # updates stay adjacent to each other; the handler's return tuple matches this order
@@ -18622,6 +19436,35 @@ def create_ui() -> gr.Blocks:
         # by the process-global `_RENDER_LOCK`, which is the authority — `create_music_video`
         # clears one process-global processing dir per render, so two renders may never
         # overlap.
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the interlock's DISABLE half, as its own
+        # click registration. See `_render_interlock_lock` for why it is a separate event rather
+        # than part of the render's own `outputs`: the render registration below keeps its exact
+        # `fn`, `inputs`, `outputs` and emitted arity, so every positional and arity contract
+        # guarding it is untouched.
+        #
+        # **It MUST be declared FIRST, and that is measured rather than stylistic.** Declaring it
+        # after the render's chain was tried, because a dozen accepted suites locate the render
+        # registration with `next(... "<button>.click")` and would then have found it unchanged.
+        # Measured in the browser on gradio==6.19.0: with the lock declared SECOND the button was
+        # **never disabled at all** -- 121 samples at 50 ms over 6 s, `disabled` false in every
+        # one, while the render was plainly streaming (the panel reached `running` at 101 ms).
+        # Both dependencies are in the served config (`process_video_guarded` then
+        # `_render_interlock_lock_1`, both `trigger_mode: "once"`), so the second is registered and
+        # simply does not run while the first is still streaming. Declared first it lands ~60 ms
+        # before the render handler is entered. The suites were amended instead; a test that means
+        # "the render registration" should say which one it means.
+        #
+        # No `concurrency_id` and `concurrency_limit=None`: this must NEVER queue behind the render
+        # it is disabling controls for -- the measured S2-A R3 trap, where a shared lane leaves an
+        # event undelivered until the render finishes and then runs it against click-time values.
+        # It is pure presentation: no mutex, no lifecycle, no session state, no disk, no `cancels=`.
+        render_selected_variants_btn.click(
+            fn=_render_interlock_lock,
+            inputs=[],
+            outputs=_render_interlock_outputs + [render_activity],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
         render_selected_variants_btn.click(
             fn=render_selected_variants_guarded,
             inputs=[
@@ -18658,8 +19501,11 @@ def create_ui() -> gr.Blocks:
                 # an operator who reorders the queue mid-batch cannot reach candidate 3.
                 music_source, playlist_state,
             ],
+            # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): `render_activity` appended LAST, so
+            # every pre-existing position keeps its meaning. It is an output only -- never an
+            # input, never source or preparation state, and nothing in the pipeline reads it.
             outputs=[video_output, status_output, session_state, render_batch_summary,
-                     render_invocation_state],
+                     render_invocation_state, render_activity],
             show_progress='hidden',
             concurrency_id=RENDER_CONCURRENCY_ID,
             concurrency_limit=1,
@@ -18668,6 +19514,14 @@ def create_ui() -> gr.Blocks:
         # exactly as it carries one shared `RenderLifecycle`.
         ).then(
             fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the interlock's RESTORE half. Chained so it
+        # cannot run until the batch generator has fully returned -- which, measured on the pinned
+        # version, is after its `finally` released the mutex and after `process_video`'s finalizer
+        # joined the last candidate's worker.
+        ).then(
+            fn=_render_interlock_restore, inputs=[source_state],
+            outputs=_render_interlock_outputs,
             show_progress='hidden', concurrency_limit=None,
         )
 
@@ -19034,6 +19888,17 @@ def create_ui() -> gr.Blocks:
             concurrency_limit=None,
         )
 
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the interlock's DISABLE half for the single
+        # render, on exactly the same terms as the batch's above -- including being declared FIRST,
+        # which is measured and not stylistic. See that comment block.
+        process_btn.click(
+            fn=_render_interlock_lock,
+            inputs=[],
+            outputs=_render_interlock_outputs + [render_activity],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+
         # [FORK] Digital-Union: the live source controls are inputs to the render request, so the
         # gate validates what the widgets currently declare rather than possibly-stale gr.State.
         process_btn.click(
@@ -19092,8 +19957,12 @@ def create_ui() -> gr.Blocks:
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or
             # preparation state, and never consulted by the pipeline.
+            # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): `render_activity` appended LAST, after
+            # the control-plane invocation id, so the two report panels keep their indices and
+            # nothing that referred to a position now means something else. Output only.
             outputs=[video_output, status_output, session_state,
-                     audio_layers_report, smart_mix_report, render_invocation_state],
+                     audio_layers_report, smart_mix_report, render_invocation_state,
+                     render_activity],
             show_progress='hidden',
             # [FORK] Digital-Union (C3-R0): the same concurrency group as the batch render event,
             # so Gradio queues them together instead of giving each listener its own lane. The
@@ -19118,6 +19987,21 @@ def create_ui() -> gr.Blocks:
         # job would be worse than none.
         ).then(
             fn=_notify_drain, inputs=[], outputs=[notify_envelope],
+            show_progress='hidden', concurrency_limit=None,
+        # [FORK] Digital-Union (UX-RENDER-ACTIVITY V1): the interlock's RESTORE half. Chained, so
+        # it cannot run until this render event has fully returned -- after the wrapper's `finally`
+        # released `_RENDER_LOCK` and after `process_video`'s finalizer joined the render worker.
+        # That is what makes "stay disabled until the worker and its subprocesses have actually
+        # stopped" structural rather than hopeful, and it is why the restore is not a terminal
+        # yield: a terminal yield runs inside the `try`, before the join.
+        #
+        # `inputs=[source_state]` is exact and is the whole of what it reads: Create Music Video is
+        # restored from the source gate's own readiness, never to a blanket `True`. It writes no
+        # report panel, no state object and no activity panel -- the render's own terminal frame
+        # owns the terminal panel, and writing one here could overwrite it.
+        ).then(
+            fn=_render_interlock_restore, inputs=[source_state],
+            outputs=_render_interlock_outputs,
             show_progress='hidden', concurrency_limit=None,
         )
 

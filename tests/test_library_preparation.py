@@ -1040,6 +1040,9 @@ def test_h_preparation_functions_all_exist():
 def _click_kwargs(tree: ast.Module, button: str) -> Dict[str, ast.AST]:
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Attribute) and n.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                # presentation-only one, which is declared first on both render buttons.
+                and "fn=_render_interlock_lock" not in ast.unparse(n)
                 and getattr(n.func.value, "id", None) == button)
     return {kw.arg: kw.value for kw in call.keywords}
 

@@ -97,9 +97,17 @@ def _func(tree: ast.AST, name: str) -> ast.FunctionDef:
 
 
 def _registration(tree, widget: str, attrs=("click", "change", "input", "submit", "release")):
+    """Every registration on `widget`, EXCEPT the render interlock's presentation-only one.
+
+    [UX-RENDER-ACTIVITY V1] Same amendment, and the same reason, as the identically named helper
+    in `tests/test_creative_controls_seam.py`: the render buttons each carry a second, instant
+    `.click` that only greys out conflicting controls, it must be declared first, and it reads no
+    widget -- so an assertion against it would pass vacuously.
+    """
     return [node for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr in attrs
+            and "fn=_render_interlock_lock" not in ast.unparse(node)
             and isinstance(node.func.value, ast.Name) and node.func.value.id == widget]
 
 

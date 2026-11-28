@@ -27,6 +27,7 @@ import errno
 import hashlib
 import os
 import sys
+import types
 import uuid
 
 import pytest
@@ -1041,7 +1042,10 @@ def test_the_real_batch_continues_past_a_candidate_share_failure(tmp_path):
             session_state["last_output_path"] = inner.get("last_output_path", "")
             session_state["audio_layers_report"] = ""
             session_state["smart_mix_report"] = ""
-            yield (out["preview_path"], out["status"], session_state, "", "", "inv")
+            # [UX-RENDER-ACTIVITY V1] SEVEN elements: the gate core's projection gained the
+            # rendered activity panel, appended LAST. Matching the real arity is the point --
+            # this harness drives the SHIPPED batch loop, which unpacks it.
+            yield (out["preview_path"], out["status"], session_state, "", "", "inv", "")
 
         return stream()
 
@@ -1080,6 +1084,13 @@ def test_the_real_batch_continues_past_a_candidate_share_failure(tmp_path):
         # wrapper's terminal path raises a `NameError`, and what it says is another suite's
         # subject. It writes no component, so nothing about share publication depends on it.
         "_notify_render_batch": lambda request, outcome: None,
+        # [UX-RENDER-ACTIVITY V1] The batch wrapper builds one activity reporter and renders its
+        # own Starting/terminal frames. Stubbed for exactly the same reason as the line above: the
+        # names must exist or the wrapper raises a `NameError`, and a panel is another suite's
+        # subject. Neither stub writes a component, so share publication is unaffected.
+        "_new_render_activity": lambda: types.SimpleNamespace(
+            set_candidate=lambda position, total: None),
+        "_render_activity_panel": lambda activity, status, detail='': status,
         "Iterator": None, "Tuple": None, "VideoFilesInput": None,
     }
     exec(compile(ast.Module(body=[rfc._gui_func("render_selected_variants_guarded")],

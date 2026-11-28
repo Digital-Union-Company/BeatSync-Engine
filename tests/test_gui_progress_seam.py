@@ -372,6 +372,14 @@ def test_the_inner_render_stream_is_unchanged():
     live object: `gr.State` deep-copies and may serialize what it holds, so a `RenderLifecycle`, a
     `threading.Event` or a `Lock` must never cross this boundary. That is asserted here as part of
     the yield's shape, because this is the line where the value is produced.
+
+    **Amended again by UX-RENDER-ACTIVITY V1**, and the same way: exactly one further element, the
+    rendered activity panel, read off `state` by the same `(state or {}).get(...)` idiom the two
+    report keys already use. The property this guard exists for is untouched for the third time —
+    `process_video` still yields exactly `(video, status, state)`, so the worker thread still
+    carries nothing but `session_state`, and the panel is a plain pre-escaped `str` rather than
+    anything live. `gr.skip()` is the fallback instead of `''` because an empty string would blank
+    the `gr.HTML` rather than leave it alone.
     """
     source = open(_GUI_PATH, encoding="utf-8").read()
     assert source.count("def process_video(") == 1
@@ -380,7 +388,8 @@ def test_the_inner_render_stream_is_unchanged():
     assert "for video, status, state in render_stream:" in core, \
         "process_video's 3-value contract must be untouched"
     assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
-            "(state or {}).get(SMART_MIX_REPORT_KEY, ''), invocation_id)") in core
+            "(state or {}).get(SMART_MIX_REPORT_KEY, ''), invocation_id, "
+            "(state or {}).get(RENDER_ACTIVITY_KEY) or gr.skip())") in core
 
     # The id is derived once, as a string, and nothing live is ever yielded in its place.
     assert "invocation_id = lifecycle.invocation_id if lifecycle is not None else ''" in core
@@ -388,6 +397,10 @@ def test_the_inner_render_stream_is_unchanged():
                  "(state or {}).get(SMART_MIX_REPORT_KEY, ''), lifecycle)",
                  "lifecycle._cancel_event", "lifecycle._state_lock"):
         assert live not in core, f"a live object crosses the Gradio boundary: {live}"
+    # The activity panel is a rendered string, never the reporter itself: the same boundary rule
+    # the invocation id above is asserted against.
+    for live in ("activity)", "activity._clock", "RENDER_ACTIVITY_KEY, activity"):
+        assert ("invocation_id, " + live) not in core, live
 
 
 # ===========================================================================
@@ -556,6 +569,16 @@ def test_the_render_mutex_is_held_until_the_worker_exits():
             "AUDIO_LAYERS_REPORT_KEY": "audio_layers_report",
             "SMART_MIX_REPORT_KEY": "smart_mix_report",
             "LAST_OUTPUT_PATH_KEY": "last_output_path",
+            # [UX-RENDER-ACTIVITY V1] The wrapper builds one activity reporter and renders its own
+            # Starting/terminal frames; `process_video` parks a panel on `session_state` and the
+            # core projects it. Stubbed because the names must EXIST or the real chain dies on a
+            # `NameError` before this test can observe anything about the mutex -- which is its
+            # only subject. None of these stubs touches the lock, the worker or the generator.
+            "RENDER_ACTIVITY_KEY": "render_activity_panel",
+            "_new_render_activity": lambda: type(
+                "R", (), {"set_candidate": lambda self, position, total: None})(),
+            "_render_activity_panel": lambda activity, status, detail="": status,
+            "_publish_render_activity": lambda state, activity, view, lifecycle: None,
             "time": _time,
             "resolve_for_render": lambda *_a, **_k: type(
                 "D", (), {"allowed": True, "paths": ["v.mp4"], "message": ""})(),
@@ -582,7 +605,10 @@ def test_the_render_mutex_is_held_until_the_worker_exits():
         # pipeline work — a Cancel click needs an id on screen before there is anything to cancel.
         # So the first yield is control-plane only, and no render work may have begun yet.
         published = next(gen)
-        assert isinstance(published[-1], str) and published[-1], \
+        # [UX-RENDER-ACTIVITY V1] index -2, not -1: the activity panel is appended after the
+        # invocation id. Pinned by index rather than by "last" so the id cannot be displaced
+        # silently -- the same correction `test_render_cancellation.py` carries.
+        assert isinstance(published[-2], str) and published[-2], \
             "the first yield must publish a non-empty invocation id"
         assert not harness.started.is_set(), \
             "render work began before the invocation id was published"
@@ -641,6 +667,16 @@ def test_closing_the_batch_mid_candidate_waits_for_that_candidate_worker():
             "AUDIO_LAYERS_REPORT_KEY": "audio_layers_report",
             "SMART_MIX_REPORT_KEY": "smart_mix_report",
             "LAST_OUTPUT_PATH_KEY": "last_output_path",
+            # [UX-RENDER-ACTIVITY V1] The wrapper builds one activity reporter and renders its own
+            # Starting/terminal frames; `process_video` parks a panel on `session_state` and the
+            # core projects it. Stubbed because the names must EXIST or the real chain dies on a
+            # `NameError` before this test can observe anything about the mutex -- which is its
+            # only subject. None of these stubs touches the lock, the worker or the generator.
+            "RENDER_ACTIVITY_KEY": "render_activity_panel",
+            "_new_render_activity": lambda: type(
+                "R", (), {"set_candidate": lambda self, position, total: None})(),
+            "_render_activity_panel": lambda activity, status, detail="": status,
+            "_publish_render_activity": lambda state, activity, view, lifecycle: None,
             "time": _time, "datetime": __import__("datetime"),
             "fork_render_batch": _render_batch,
             "resolve_for_render": lambda *_a, **_k: type(

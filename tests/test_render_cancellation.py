@@ -1415,8 +1415,13 @@ def test_the_published_invocation_id_is_always_a_string_or_empty():
 
     `None` would reach the Cancel handler as a falsy non-string. `_request_cancel_if_matching`
     happens to handle it, but the state is declared as a string and keeping it one is cheaper than
-    depending on that — so the last element of every yield in these three functions must be either
+    depending on that — so the id element of every yield in these three functions must be either
     `lifecycle.invocation_id`, the derived `invocation_id` name, or a string literal.
+
+    **Amended by UX-RENDER-ACTIVITY V1**: the id is no longer the LAST element, because the
+    rendered activity panel is appended after it. It is now the second-to-last, and pinning it at
+    that index is strictly stronger than "last" was — a later append cannot quietly slide the id
+    somewhere else without this failing, whereas "last" would simply have followed it.
     """
     allowed = {"lifecycle.invocation_id", "invocation_id", "''"}
     for name in WRAPPERS + ("_process_video_guarded_unlocked",):
@@ -1427,7 +1432,7 @@ def test_the_published_invocation_id_is_always_a_string_or_empty():
             value = yielded.value
             if not isinstance(value, (ast.Tuple,)):
                 continue                      # `yield from` and non-tuple yields carry no id
-            last = ast.unparse(value.elts[-1])
+            last = ast.unparse(value.elts[-2])
             assert last in allowed, f"{name} yields {last!r} as its invocation id"
 
     core = _body(_GUI, "_process_video_guarded_unlocked")
@@ -1478,17 +1483,30 @@ def test_the_cancel_button_is_never_gated_by_the_source_confirmation():
         assert "render_invocation_state" not in block
 
 
-def test_the_render_events_gained_the_invocation_state_as_their_last_output():
-    """Positional alignment: Gradio matches a yielded tuple to `outputs` by index."""
+def test_the_render_events_carry_the_invocation_state_as_their_last_CONTROL_PLANE_output():
+    """Positional alignment: Gradio matches a yielded tuple to `outputs` by index.
+
+    **Amended by UX-RENDER-ACTIVITY V1**, which appended `render_activity` after the invocation
+    id, so the id is no longer the final element. The property this test exists for is the one
+    that matters and is unchanged: the control-plane id appears EXACTLY ONCE and at a known,
+    pinned index, so nothing can quietly displace it. Pinning the tail as a pair rather than the
+    id as "last" also says something the old form could not -- that the activity panel sits after
+    it rather than between it and the report slots.
+    """
     for button, expected_last in (("process_btn", "render_invocation_state"),
                                   ("render_selected_variants_btn", "render_invocation_state")):
         click = next(n for n in ast.walk(_tree(_GUI)) if isinstance(n, ast.Call)
                      and isinstance(n.func, ast.Attribute) and n.func.attr == "click"
+                     # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                     # presentation-only one, which is declared first on both render buttons.
+                     and "fn=_render_interlock_lock" not in ast.unparse(n)
                      and getattr(n.func.value, "id", None) == button)
         outputs = next(kw.value for kw in click.keywords if kw.arg == "outputs")
         names = [n.id for n in outputs.elts if isinstance(n, ast.Name)]
-        assert names[-1] == expected_last, f"{button} outputs end with {names[-1]}"
+        assert names[-2:] == [expected_last, "render_activity"], \
+            f"{button} outputs end with {names[-2:]}"
         assert names.count(expected_last) == 1
+        assert names.count("render_activity") == 1
 
 
 # ===========================================================================
