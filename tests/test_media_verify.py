@@ -2239,6 +2239,12 @@ def _click_keywords(tree, widget):
             continue
         if node.func.attr != "click" or not isinstance(node.func.value, ast.Name):
             continue
+        # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only
+        # one. Both render buttons now carry a second, instant `.click` that disables the
+        # conflicting controls; it has to be declared first (measured: declared second it never
+        # fires while the render generator is streaming), so a bare "first match" finds it.
+        if "fn=_render_interlock_lock" in ast.unparse(node):
+            continue
         if node.func.value.id != widget:
             continue
         return {k.arg: ast.unparse(k.value) for k in node.keywords}

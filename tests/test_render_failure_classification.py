@@ -1013,7 +1013,14 @@ def _run_batch(kinds, durables, cancel_after=None):
             session_state["smart_mix_report"] = ""
             # A successful render yields its display path, exactly as production does -- which is
             # what `preview_path` (and therefore `latest_successful_preview()`) is built from.
-            yield (durable or None, f"status {index}", session_state, "", "", "inv")
+            #
+            # [UX-RENDER-ACTIVITY V1] SEVEN elements now: the gate core's projection gained the
+            # rendered activity panel, appended LAST. The harness has to match the real arity or
+            # the batch's unpack fails -- and matching it is the point, because this suite's whole
+            # job is to drive the SHIPPED batch loop. Nothing in this file asserts on the panel;
+            # the classification, continuation and lifecycle properties it does assert are
+            # untouched, and every index it reads is unchanged.
+            yield (durable or None, f"status {index}", session_state, "", "", "inv", "")
             if cancel_after is not None and index == cancel_after:
                 # The user presses Stop as this candidate finishes. The loop head must observe it
                 # before the next candidate starts -- a `continue` must not race past it.
@@ -1055,6 +1062,14 @@ def _run_batch(kinds, durables, cancel_after=None):
         # so these cases neither touch the process-global ledger nor depend on what a notification
         # says. It still has to EXIST, or the wrapper's terminal path dies on a `NameError`.
         "_notify_render_batch": lambda request, outcome: _NOTIFIED.append(outcome),
+        # [UX-RENDER-ACTIVITY V1] The batch wrapper now builds ONE activity reporter for the whole
+        # run and renders its own Starting/terminal frames. Stubbed here for the same reason
+        # `_notify_render_batch` is: these cases are about classification and continuation, not
+        # about what a panel says -- but the names still have to EXIST, or the wrapper dies on a
+        # `NameError` before it ever reaches the behaviour under test.
+        "_new_render_activity": lambda: types.SimpleNamespace(
+            set_candidate=lambda position, total: None),
+        "_render_activity_panel": lambda activity, status, detail='': status,
         "Iterator": None, "Tuple": None, "VideoFilesInput": None,
     }
     exec(compile(ast.Module(body=[_gui_func("render_selected_variants_guarded")],

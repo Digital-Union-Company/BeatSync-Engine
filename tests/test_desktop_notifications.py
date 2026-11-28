@@ -2347,7 +2347,10 @@ def _batch_namespace(tmp_path, *, enabled=True):
             session_state["last_output_path"] = step.get("durable", "")
             session_state["audio_layers_report"] = ""
             session_state["smart_mix_report"] = ""
-            yield (None, "inner status", session_state, "", "", "inv")
+            # [UX-RENDER-ACTIVITY V1] SEVEN elements: the gate core's projection gained the
+            # rendered activity panel, appended LAST. The harness has to match the real arity or
+            # the batch's unpack fails before it can publish the notification under test.
+            yield (None, "inner status", session_state, "", "", "inv", "")
 
         return stream()
 
@@ -2372,6 +2375,13 @@ def _batch_namespace(tmp_path, *, enabled=True):
         "_clear_active_render": lambda invocation_id: None,
         "_render_batch_request_tag": lambda: "T",
         "_process_video_guarded_unlocked": guarded_unlocked,
+        # [UX-RENDER-ACTIVITY V1] The batch wrapper builds one activity reporter and renders its
+        # own Starting/terminal frames. Stubbed because the names must EXIST or the wrapper dies
+        # on a `NameError` before it can publish anything -- and a notification is this suite's
+        # subject, a panel is not. Neither stub touches the ledger.
+        "_new_render_activity": lambda: types.SimpleNamespace(
+            set_candidate=lambda position, total: None),
+        "_render_activity_panel": lambda activity, status, detail='': status,
         "Iterator": None, "Tuple": None, "VideoFilesInput": None,
     })
     exec(compile(ast.Module(body=[_func(_tree(_GUI), "render_selected_variants_guarded")],

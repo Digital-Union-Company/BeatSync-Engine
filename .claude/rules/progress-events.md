@@ -74,6 +74,22 @@ Rules that are load-bearing:
   **An uncounted active phase reports `current`/`total` as `None`, never zero** — only `counted`
   may license a determinate figure on screen, and an inherited zero denominator is what that rule
   exists to prevent.
+- **`ProgressView.completed_stages()` is the SECOND read-only projection, added for the same reason
+  (UX-RENDER-ACTIVITY V1).** It returns the stage numbers that have actually reported END,
+  ascending, as a copy — so the Render tab's activity panel can light up completed and pending
+  stage indicators without either of the two wrong alternatives: reaching into `_stages`, or
+  reading them back out of `render()`'s text. It folds nothing, mutates nothing, emits no event and
+  defines no phase.
+
+  **`finished` is the stage's own END report and nothing else.** It is never inferred from the
+  active stage number, because *"stage 5 is active, therefore 1–4 are done"* is an assumption rather
+  than a measurement — and it is exactly how a stage that was skipped would be reported as
+  completed. A test drives a run that emits 0, 1 and 5 and asserts 2–4 stay absent.
+
+  What it feeds is a **count**, explicitly labelled as one, and never a second progress bar: the
+  denominator is `len(STAGE_TITLES)`, which that panel derives from this module rather than
+  restating. There is still no overall-render percentage and no weighted stage completion anywhere.
+  → `.claude/rules/render-activity.md`
 - **Never touch a Gradio component from a worker thread.** `event_callback` only calls `queue.put`;
   the generator does all widget updates. A test asserts the callback's only method call is `put`.
 - **Stage 5 seeds the counter with cache hits**, so a fully cached run shows completion instead of

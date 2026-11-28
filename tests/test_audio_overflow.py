@@ -695,6 +695,8 @@ def click_inputs(tree, button):
     for call in ast.walk(tree):
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
                 and call.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(call)
                 and getattr(call.func.value, "id", None) == button):
             kw = next(k for k in call.keywords if k.arg == "inputs")
             return [getattr(n, "id", None) for n in kw.value.elts]

@@ -518,7 +518,11 @@ def test_no_render_or_conversion_can_begin_from_this_button():
 def _click(button: str) -> ast.Call:
     return next(n for n in ast.walk(_tree(_GUI))
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "click" and getattr(n.func.value, "id", None) == button)
+                and n.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                # presentation-only one, which is declared first on both render buttons.
+                and "fn=_render_interlock_lock" not in ast.unparse(n)
+                and getattr(n.func.value, "id", None) == button)
 
 
 def test_the_button_registration_has_zero_inputs_and_zero_outputs():
@@ -558,13 +562,21 @@ def test_the_button_is_absent_from_every_gate_collection():
 
 
 def test_no_existing_output_tuple_or_writer_matrix_changed():
-    """S2 adds a reader-only event. Every pre-existing writer list must be byte-identical."""
+    """S2 adds a reader-only event. Every pre-existing writer list must be byte-identical.
+
+    **Amended by UX-RENDER-ACTIVITY V1**, which appended `render_activity` to both render events
+    and added one further writer of it. The property S2 established is untouched and is still
+    what is asserted: **Open Output Folder writes nothing**, and `status_output` keeps exactly its
+    three writers. The render tails are now pinned as a PAIR, which is stricter than "ends with
+    the invocation state" was.
+    """
     source = _source(_GUI)
-    # the two render events keep their exact outputs, ending in the invocation state
+    # the two render events keep their exact outputs, ending in the invocation state and then the
+    # read-only activity panel
     for button in ("process_btn", "render_selected_variants_btn"):
         outputs = next(kw.value for kw in _click(button).keywords if kw.arg == "outputs")
         names = [n.id for n in outputs.elts if isinstance(n, ast.Name)]
-        assert names[-1] == "render_invocation_state", button
+        assert names[-2:] == ["render_invocation_state", "render_activity"], button
         assert BUTTON not in names, f"{button} writes the folder button"
         assert "video_output" in names and "status_output" in names, button
     # Cancel still owns exactly the status line

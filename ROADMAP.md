@@ -2441,6 +2441,69 @@ stale-input, duplicate-click, no-event interval and exception regressions.
 
 ---
 
+#### UX-RENDER-ACTIVITY — a long render looks active, and the render controls interlock · **V1 SOURCE IMPLEMENTED AND TESTED, NOT MERGED OR INSTALLED**
+
+**Problem (deployed baseline, owner report 2026-11-28).** During a long render — above all Stage 5
+against thousands of source videos — the Render tab's only sign of life is the four-line `Status`
+textbox, and **a textbox that has not changed for twenty minutes is indistinguishable from a frozen
+application.** Scan and Analyze already had this answered (UX-PREP-VISUAL-PROGRESS) and the Raw
+Cutter before them (R12); the render did not.
+
+**Desired behaviour.** A compact, permanently visible activity panel immediately above the Status
+box, carrying the lifecycle state, total elapsed, current stage/phase elapsed, the current activity
+description, a progress bar, measured current/total where they exist, completed and pending stage
+indicators, and `Candidate X / Y` during a Variant Lab batch. Truthful progress only: determinate
+when and only when the pipeline measured it, indeterminate otherwise, nothing inherited across a
+phase transition, and **no invented overall percentage, weighted stage completion, processing speed
+or ETA**. The panel must become active as soon as a render is admitted and stay visibly alive
+through long silent periods. Render controls that genuinely conflict with an active render must be
+disabled while it runs and restored from real readiness afterwards, without UI disabling ever being
+treated as an authorization or concurrency boundary.
+
+**V1 as implemented.** The same split both sibling surfaces use — *"is this running?"* answered by a
+chip, a CSS keyframe and a **browser-anchored** clock, all costing no measurement; *"how far has it
+got?"* answered **only** from `ProgressView.active_measurement()`. One new pure module
+(`beatsync_fork/render_activity.py`), one new read-only `ProgressView.completed_stages()`
+projection, one `gr.HTML` panel, one reporter per top-level render event reusing the Raw Cutter's
+`ActivityClock`, and the interlock as a disable-click plus a chained restore. `process_video`'s
+3-value contract, its unbounded `status_queue.get()` and the whole inner pipeline are **unchanged**:
+the clocks are advanced by `CUT_ACTIVITY_JS`, which gained one selector token and one uniform field,
+so **no poll, timer, coordinator, worker or endpoint was added anywhere.**
+
+**Four pinned-Gradio measurements shaped the design** rather than assumptions about
+`concurrency_*` semantics (the trap this repository has already paid for once, S2-A R3). A
+same-session duplicate click in the render lane is **discarded**, so no server-side duplicate gate
+was built. A separate instant `.click` runs ~60 ms before the slow handler. A `.then()` link runs
+**after** the generator's `finally`, which is what makes "stay disabled until the worker actually
+stopped" structural. And a **cross-session** render click is **queued, not refused**, and admitted
+33 ms after the first render releases — the mutex held throughout and the two renders never
+overlapped, so it is a visibility gap rather than a safety one, and it is reported honestly as
+`Queued` instead of being closed with a new cross-session subsystem.
+
+**The interlock set is derived from the six non-blocking `_RENDER_LOCK.acquire()` callers**, not
+from sweeping the UI. Create Music Video, Render Selected Variants, Verify Sources and Sample Decode
+are disabled; the two Raw Cutter buttons are **deliberately not**, because they already have their
+own server-managed interactive state and a render event writing them would be a second authority
+over one widget — they keep their own accurate refusal instead. The Audio Cutter holds no mutex at
+all, and source confirmation cannot reach a render in flight.
+
+**One real hole was found and closed on the way:** Scan and Confirm take no mutex, so
+re-confirming sources mid-render re-enabled Create Music Video from a completely unrelated handler.
+`_source_ui_updates` — the one authority over that button — now also asks whether a render is
+active.
+
+**Deliberately NOT done in V1, and recorded rather than claimed:** the `Cancelling` chip lags the
+status line by one pipeline frame (Cancel's `outputs` stay exactly `[status_output]`; widening them
+would have reset the elapsed clock, which is the one thing the brief forbids); an abandoned render
+leaves its panel reading `Running` in that browser page until it is replaced; the cross-session
+queued render is reported, not refused; and reduced motion was verified by stylesheet inspection
+rather than by emulation.
+
+**Status (2026-11-28):** **SOURCE IMPLEMENTED AND TESTED. NOT MERGED, NOT INSTALLED, NOT OWNER
+ACCEPTED.** This roadmap entry does not authorise a merge, a deployment or any production change.
+
+---
+
 ## Status summary
 
 Four different things are distinguished deliberately below, because conflating them is how a

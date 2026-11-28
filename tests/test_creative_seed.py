@@ -495,6 +495,9 @@ def test_the_seed_is_a_render_request_input():
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         and node.func.attr == "click" and isinstance(node.func.value, ast.Name)
+        # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only
+        # one, which is declared first on both render buttons.
+        and "fn=_render_interlock_lock" not in ast.unparse(node)
         and node.func.value.id == "process_btn"
     )
     inputs = [n.id for n in next(kw.value for kw in click.keywords if kw.arg == "inputs").elts

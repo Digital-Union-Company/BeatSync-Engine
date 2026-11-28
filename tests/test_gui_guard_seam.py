@@ -248,6 +248,8 @@ def test_gui_click_inputs_include_live_source_controls():
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "click"
+        # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+        and "fn=_render_interlock_lock" not in ast.unparse(node)
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "process_btn"
     ]
@@ -297,6 +299,8 @@ def test_gui_guarded_signature_matches_the_click_inputs():
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "click"
+        # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+        and "fn=_render_interlock_lock" not in ast.unparse(node)
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "process_btn"
     )
@@ -1708,6 +1712,8 @@ def test_v2_generate_inputs_are_the_instruction_plus_the_live_prep_declaration()
     call = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and getattr(node.func.value, "id", None) == "generate_director_btn")
     kwargs = {kw.arg: kw.value for kw in call.keywords}
     inputs = [ast.unparse(item) for item in kwargs["inputs"].elts]
@@ -1722,6 +1728,8 @@ def test_v2_generate_outputs_are_unchanged_and_write_no_execution_widget():
     call = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and getattr(node.func.value, "id", None) == "generate_director_btn")
     kwargs = {kw.arg: kw.value for kw in call.keywords}
     outputs = [ast.unparse(item) for item in kwargs["outputs"].elts]
@@ -1733,6 +1741,8 @@ def test_v2_apply_input_and_outputs_are_unchanged():
     call = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and getattr(node.func.value, "id", None) == "apply_director_btn")
     kwargs = {kw.arg: kw.value for kw in call.keywords}
     assert [ast.unparse(item) for item in kwargs["inputs"].elts] == ["director_proposal_state"]
@@ -1748,6 +1758,8 @@ def test_v2_generate_does_not_write_prep_or_source_state():
     call = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and getattr(node.func.value, "id", None) == "generate_director_btn")
     outputs = ast.unparse(next(kw.value for kw in call.keywords if kw.arg == "outputs"))
     for forbidden in ("prep_state", "prep_outputs", "prep_report", "prep_status",

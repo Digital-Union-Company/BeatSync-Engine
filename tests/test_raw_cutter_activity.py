@@ -571,8 +571,16 @@ def test_the_tick_runs_about_once_a_second_and_only_once_per_page(tick_js):
 
 def test_the_tick_selects_by_class_because_two_modes_render_the_same_markup(tick_js):
     """Single Video and Folder Batch write this panel into two components, so an id would be
-    ambiguous by construction."""
-    assert 'querySelectorAll(".bs-cut-activity")' in tick_js
+    ambiguous by construction.
+
+    **Amended by UX-RENDER-ACTIVITY V1**, which added ONE token to the selector so the Render
+    tab's activity panel is ticked by this same already-authorised installer rather than by a
+    second one. The property this test exists for is untouched and is now true of two surfaces
+    instead of one. The cutter class is still named, so the cutter panels are still selected; the
+    render panel deliberately does NOT carry `bs-cut-activity`, so the comma is load-bearing.
+    """
+    assert 'querySelectorAll(".bs-cut-activity, .bs-render-activity")' in tick_js
+    assert ".bs-cut-activity" in tick_js
     assert "getElementById" not in tick_js
 
 

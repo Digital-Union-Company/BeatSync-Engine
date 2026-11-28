@@ -504,6 +504,8 @@ def test_the_controls_ride_at_the_end_of_the_positional_contract(gui_tree: ast.M
     for call in ast.walk(gui_tree):
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
                 and call.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only one.
+                and "fn=_render_interlock_lock" not in ast.unparse(call)
                 and getattr(call.func.value, "id", None) == "process_btn"):
             inputs = [n.id for n in next(kw for kw in call.keywords
                                          if kw.arg == "inputs").value.elts

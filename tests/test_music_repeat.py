@@ -72,6 +72,9 @@ def _click_kwargs(path: str, button: str) -> dict:
     call = next(node for node in ast.walk(_tree(path))
                 if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute) and node.func.attr == "click"
+                # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's
+                # presentation-only one, which is declared first on both render buttons.
+                and "fn=_render_interlock_lock" not in ast.unparse(node)
                 and isinstance(node.func.value, ast.Name) and node.func.value.id == button)
     return {kw.arg: kw.value for kw in call.keywords}
 

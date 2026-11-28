@@ -2611,6 +2611,12 @@ def _p2_click_keywords(tree, widget, attr="click"):
             continue
         if node.func.value.id != widget:
             continue
+        # [UX-RENDER-ACTIVITY V1] the RENDER registration, not the interlock's presentation-only
+        # one. Both render buttons now carry a second, instant `.click` that disables the
+        # conflicting controls; it has to be declared first (measured: declared second it never
+        # fires while the render generator is streaming), so a bare "first match" finds it.
+        if "fn=_render_interlock_lock" in ast.unparse(node):
+            continue
         return {keyword.arg: ast.unparse(keyword.value) for keyword in node.keywords}
     raise AssertionError(f"{widget}.{attr}(...) not found")
 
@@ -2945,9 +2951,21 @@ def test_the_unrelated_render_and_source_wiring_is_untouched(p2_gui_tree):
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
               and n.func.attr == "click" and isinstance(n.func.value, ast.Name)
               and n.func.value.id == "process_btn"]
-    assert len(clicks) == 1, "exactly one process_btn.click registration"
-    keywords = {keyword.arg for keyword in clicks[0].keywords}
+    # [UX-RENDER-ACTIVITY V1] TWO registrations now, and the pair is pinned by `fn` rather than by
+    # a count, which says more than the count did. The second is the interlock's instant,
+    # presentation-only disable half: it greys out the four controls that genuinely conflict with
+    # a render and writes the activity panel. It must be declared FIRST -- measured on
+    # gradio==6.19.0, declared second it never fires at all while the render generator is
+    # streaming. It takes NO inputs, no mutex, no lifecycle and no concurrency lane, so it cannot
+    # reach the render request; this suite's subject (that Sample Decode leaked nothing into the
+    # render wiring) is checked against the RENDER registration below, exactly as before.
+    by_fn = [next(ast.unparse(k.value) for k in c.keywords if k.arg == "fn") for c in clicks]
+    assert by_fn == ["_render_interlock_lock", "process_video_guarded"], by_fn
+    render_click = clicks[1]
+    keywords = {keyword.arg for keyword in render_click.keywords}
     assert "concurrency_id" in keywords and "inputs" in keywords and "outputs" in keywords
+    # The interlock half reads nothing at all, which is why it cannot carry a sample widget.
+    assert next(ast.unparse(k.value) for k in clicks[0].keywords if k.arg == "inputs") == "[]"
     # Read the keywords from the AST: the render registration carries dozens of inputs, so a text
     # window around the call name is not a reliable way to find the end of it.
     render_wiring = " ".join(_p2_click_keywords(p2_gui_tree, "process_btn").values())
@@ -2965,8 +2983,13 @@ def test_the_render_holder_marks_do_not_disturb_the_generator_contracts(p2_gui_t
     The render wrappers stream fixed-width tuples to Gradio. A holder mark that became part of a
     yield -- or that shifted one -- would change the output contract, so the yield shapes are
     asserted directly.
+
+    [UX-RENDER-ACTIVITY V1] 7 and 6: the activity panel is appended LAST to both render
+    projections. The property this test exists for is untouched -- the holder marks are still
+    standalone statements that add, move or reshape no yield -- and a FIXED width is still what is
+    asserted, which is what keeps the Gradio output contract pinned.
     """
-    for name, width in (("process_video_guarded", 6), ("_render_selected_variants", 5)):
+    for name, width in (("process_video_guarded", 7), ("_render_selected_variants", 6)):
         try:
             func = _func(p2_gui_tree, name)
         except AssertionError:
